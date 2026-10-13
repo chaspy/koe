@@ -4,6 +4,14 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.2.3 — 2026-10-14
+
+### macOS
+- Fixed: under heavy load (load average 10–60) Enter was still absorbed by the terminal about 3% of the time. Koe now waits according to both the load and the text length (up to 2 s), and skips Enter if another app came to the front meanwhile.
+
+### Windows
+- No changes.
+
 ## 0.2.2 — 2026-10-13
 
 ### macOS

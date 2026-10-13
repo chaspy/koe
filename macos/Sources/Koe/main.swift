@@ -1803,10 +1803,13 @@ enum ConfigImport {
 // MARK: - Typing into the frontmost app
 
 enum Typist {
-    static func enterDelay() -> Double {
+    // 貼った文を TUI が取り込み終える前に Enter が来ると、Enter が貼り付けの一部（改行）として吸われる。
+    // 取り込みにかかる時間は文の長さと Mac の負荷で伸びる（負荷 40〜60 で 0.8 秒でも間に合わなかった）ので、両方に合わせて待つ。最大 2 秒
+    static func enterDelay(chars: Int) -> Double {
         var load = [Double](repeating: 0, count: 3)
         let l = getloadavg(&load, 3) > 0 ? load[0] : 0
-        return l >= 15 ? 0.8 : l >= 8 ? 0.5 : 0.25
+        let base = 0.25 + min(0.25, Double(chars) / 400)
+        return min(2.0, base * (1 + max(0, l - 4) / 10))
     }
 
     static func pasteAndMaybeEnter(_ text: String, enter: Bool) {
@@ -1819,7 +1822,12 @@ enum Typist {
         if enter {
             // 貼り付け直後の Enter は TUI 側で貼り付けの一部として扱われることがあるので少し待つ。
             // Mac が重いと貼り付けの取り込みが遅れ、0.25 秒では Enter が貼り付けに吸われる（負荷 20 で実際に起きた）ので、負荷に応じて待ちを延ばす
-            DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay()) { postKey(36, flags: []) }
+            let app = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay(chars: text.count)) {
+                // 待っている間に別のアプリに移っていたら送らない（貼った先でないところで Enter を押さない）
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app else { return Events.log("enter_skipped", ["reason": "app_changed"]) }
+                postKey(36, flags: [])
+            }
         }
         // 元のクリップボードを戻す
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
