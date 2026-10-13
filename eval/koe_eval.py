@@ -356,17 +356,61 @@ def cmd_set_comm(a):
 
 
 def cmd_comm(a):
-    since = (datetime.now() - timedelta(days=a.days)).strftime("%Y-%m-%dT%H-%M-%S")
-    recs = [r for r in load_records() if r.get("communication") and r["id"] >= since]
+    """伝達: 直近 a.last 件の判定済み（unclear は除く）で、誤解したまま作業が進んだ割合と、言い直し・聞き返しが要った割合"""
+    import math
+    from collections import Counter
+    recs = [r for r in load_records() if r.get("communication") in ("understood", "corrected")][-a.last:]
     if not recs:
         sys.exit("伝達の判定が付いた発話がありません")
-    from collections import Counter
-    c = Counter(r["communication"] for r in recs)
-    judged = c["understood"] + c["corrected"]
-    for k in COMM:
-        print(f"  {k:<11} {c[k]}")
-    if judged:
-        print(f"\n  伝達成功率 {c['understood'] / judged:.1%}（訂正が要った {c['corrected']}/{judged}、unclear は除く）")
+    n = len(recs)
+    imp = Counter(r.get("communication_impact") or "redo" for r in recs if r["communication"] == "corrected")
+    unclear = sum(1 for r in load_records() if r.get("communication") == "unclear")
+    def wilson(k):
+        z = 1.96; p = k / n; d = 1 + z * z / n
+        c = p + z * z / (2 * n); r = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+        return max(0, (c - r) / d), (c + r) / d
+    print(f"  直近 {n} 件（{recs[0]['id'][:10]} 〜 {recs[-1]['id'][:10]}、判定できなかった unclear は除く）")
+    for key, label in (("misacted", "誤解したまま作業が進んだ"), ("redo", "言い直し・聞き返しが要った"), ("dropped", "一部が落ちたが言い直さず進んだ")):
+        k = imp[key]; lo, hi = wilson(k)
+        print(f"  {label:<18} {k:>4} 件  {k / n:6.1%}  （95% の範囲 {lo:.1%}〜{hi:.1%}）")
+    ok = n - sum(imp.values())
+    print(f"\n  問題なく伝わった {ok / n:.1%}（{ok}/{n}）。目安: 誤解したまま作業 1% 未満、言い直し 5% 未満")
+
+
+def cmd_perf(a):
+    """速さ: 離してから貼り付けまで（release_to_paste_ms）と内訳（録り足し stop_ms・文字起こし transcribe_ms）を日ごとに。
+    Mac の負荷（load1）が高いとき・裏で改善ループが動いていたときと分けても出す"""
+    import statistics as st
+    from collections import defaultdict
+    since = (datetime.now() - timedelta(days=a.days)).strftime("%Y-%m-%dT%H-%M-%S")
+    recs = [r for r in load_records() if r["id"] >= since and r.get("pasted") and r.get("transcribe_ms")]
+    def q(v, p):
+        v = sorted(v)
+        return v[min(len(v) - 1, int(len(v) * p))] if v else None
+    def fmt(v):
+        return f"{st.median(v):>5.0f} / {q(v, .9):>5.0f}" if v else "    - /     -"
+    day = defaultdict(list)
+    for r in recs:
+        day[r["id"][:10]].append(r)
+    print("  日付    件数  離して→貼る(中央/p90 ms)  録り足し       文字起こし     文字起こし ms/音声秒")
+    for d, rs in sorted(day.items()):
+        e2e = [r["release_to_paste_ms"] for r in rs if r.get("release_to_paste_ms")]
+        stop = [r["stop_ms"] for r in rs if r.get("stop_ms")]
+        tr = [r["transcribe_ms"] for r in rs]
+        rate = [r["transcribe_ms"] / max(r.get("voiced_seconds") or r.get("audio_seconds") or 1, 0.5) for r in rs]
+        print(f"  {d[5:]}  {len(rs):>5}  {fmt(e2e):>22}  {fmt(stop):>13}  {fmt(tr):>13}  {st.median(rate):>6.0f}")
+    timed = [r for r in recs if r.get("release_to_paste_ms")]
+    if timed:
+        print("\n  条件別（離して→貼る、中央/p90 ms）")
+        groups = {
+            "Mac の負荷 < 8": [r for r in timed if (r.get("load1") or 0) < 8],
+            "Mac の負荷 >= 8": [r for r in timed if (r.get("load1") or 0) >= 8],
+            "改善ループが裏で動いていた": [r for r in timed if r.get("improve_running")],
+        }
+        for k, rs in groups.items():
+            print(f"  {k:<16} {len(rs):>4} 件  {fmt([r['release_to_paste_ms'] for r in rs])}")
+    else:
+        print("\n  離して→貼るの計測は、計測を入れた版から記録される")
 
 
 def cmd_trend(a):
@@ -609,6 +653,9 @@ def main():
     s.add_argument("--days", type=int, default=7)
     s.set_defaults(func=cmd_misses)
 
+    s = sub.add_parser("perf")
+    s.add_argument("--days", type=int, default=14)
+    s.set_defaults(func=cmd_perf)
     s = sub.add_parser("trend")
     s.add_argument("--days", type=int, default=14)
     s.add_argument("--json", action="store_true")
@@ -634,7 +681,8 @@ def main():
     s.set_defaults(func=cmd_set_comm)
 
     s = sub.add_parser("comm")
-    s.add_argument("--days", type=int, default=14)
+    s.add_argument("--last", type=int, default=300)
+    s.add_argument("--days", type=int, default=7)  # 互換用（使わない）
     s.set_defaults(func=cmd_comm)
 
     s = sub.add_parser("set-draft")

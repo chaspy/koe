@@ -1,0 +1,5 @@
+# build outputs and downloaded whisper.cpp binaries (build.sh)
+/dist/
+/.cache/
+*.exe
+*.dll

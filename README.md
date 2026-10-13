@@ -12,12 +12,33 @@ Local voice input for macOS using [whisper.cpp](https://github.com/ggerganov/whi
 - **Koe.app**: menu bar app. Hold a key to talk, release to paste into any app.
 - **whisper-ja-toggle**: the original toggle-style CLI.
 
+## Platforms
+
+Both are built from the same code at the same version and attached to the same GitHub Release.
+
+| | macOS (Apple silicon) | Windows x64 (preview) |
+|---|---|---|
+| Hold a key to talk, paste on release, Enter only in terminals | ✅ right ⌘ (or ⌥ / ⌃ / fn) | ✅ right Alt (or right Ctrl) |
+| Term packs, personal glossary, note for the receiving AI | ✅ | ✅ |
+| Retry on hallucination, previous utterance as context, history | ✅ | ✅ |
+| In-app update | ✅ from 0.2.0 | ✅ from 0.2.0 |
+| Improvement loop (glossary grows by itself) | ✅ | not yet |
+| Lock recording, line breaks, low-level hint, fallback mic | ✅ | not yet |
+| Speech model | large-v3-turbo on the GPU (Metal) | large-v3-turbo q5_0 on the CPU |
+
+The Windows version is documented in [windows/README-windows.md](windows/README-windows.md).
+
 ## Koe.app (macOS menu bar, push to talk)
 
 `macos/` contains a menu bar app that works from any app, not just a terminal. Requires whisper.cpp (see [Setup whisper.cpp](#setup-whispercpp)).
 
 - Hold **right ⌘** to record, release to transcribe. The text is pasted into the focused field and Enter is sent (toggle in the menu).
 - Pressing any other key while holding right ⌘ cancels (so ⌘ shortcuts keep working).
+- The key can be changed in the menu (押して話すキー): right ⌘ / right ⌥ / right ⌃ / fn. On US keyboards right ⌘ may clash with ⌘+Space or ⌘+Return.
+- Enter is sent only to terminals (iTerm, Terminal, Ghostty, …). In other apps the text is only pasted.
+- **Lock recording**: tap the key twice quickly to record hands-free (e.g. taking notes while talking); tap once more to stop. The text keeps line breaks, is saved to `~/Documents/Koe/<date-time>.txt`, copied to the clipboard and opened. Typing or clicking does not stop it. Lock recordings are never sent to the improvement loop.
+- **Line breaks** (menu, off by default): break lines at whisper's segment boundaries when pasting into non-terminal apps such as Google Docs.
+- If your voice is recorded too quietly (below about −45 dB), Koe tells you to raise the input volume.
 - The mic stays open in the background and keeps the last 0.5 s, so the first word is not cut off. Recording also continues 0.4 s after release. Turn this off from the menu if you do not want the mic indicator always on.
 - Plays a short marimba tone on start and stop (toggle in the menu).
 - Muted headsets: many meeting-certified headsets and speakerphones mute in hardware when you mute in the meeting app, so the OS only receives digital silence. Choose the microphone from the menu (マイク). Pick a mic other than the one your meeting app uses and Koe never goes silent. In 自動 (default), Koe uses the system default mic, detects hardware mute (near-zero signal for 1 s) and records from another microphone while it lasts; the menu shows which one (`fallbackMicName` if set, otherwise another USB mic such as a webcam, then the built-in mic). A fallback that is also silent (e.g. a closed MacBook lid) is skipped. If you have only one microphone there is nothing to fall back to. If you listen to the meeting on speakers, the fallback mic may pick up other people's voices; headphones avoid that.
