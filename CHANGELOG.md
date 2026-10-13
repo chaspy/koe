@@ -4,6 +4,10 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+### macOS
+- Fixed: pressing the key again within 0.25 s of releasing it (while Koe was still recording the tail) erased the previous utterance. The previous one is now finished first.
+- Fixed: a mouse click while speaking cancelled the recording silently. Only clicks within the first second count as a ⌘+click shortcut now.
+
 ## 0.2.1 — 2026-10-13
 
 ### macOS

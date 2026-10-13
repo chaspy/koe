@@ -1054,7 +1054,13 @@ final class Recorder {
         }
     }
 
+    // 離した後の録り足し（tailSeconds）が終わっていない録音。この間に次の押下が来たら、先に確定させる
+    private var pendingStop: (id: Int, done: (Capture) -> Void)?
+    private var stopSeq = 0
+
     func start() -> Bool {
+        // 前の録音の録り足し中に押された: 録り足しを切り上げて前の録音を先に確定する（以前はここで前の録音を消していた）
+        if let p = pendingStop { pendingStop = nil; finalize(p.done) }
         // 主のマイクから 1 秒以上音が来ていなければエンジンが止まっているので張り直す
         lock.lock(); let stale = running && Date().timeIntervalSince(lastBufferAt) > 1.0; lock.unlock()
         if stale { restart(reason: "stalled") }
@@ -1070,7 +1076,18 @@ final class Recorder {
     }
 
     func stop(_ done: @escaping (Capture) -> Void) {
+        stopSeq += 1
+        let id = stopSeq
+        pendingStop = (id, done)
         DispatchQueue.main.asyncAfter(deadline: .now() + tailSeconds) {
+            guard let p = self.pendingStop, p.id == id else { return }  // 次の押下で先に確定済み
+            self.pendingStop = nil
+            self.finalize(p.done)
+        }
+    }
+
+    private func finalize(_ done: @escaping (Capture) -> Void) {
+        do {
             self.lock.lock()
             self.recording = false
             let takes = self.tracks.map { ($0.source.name, $0.samples) }
@@ -2221,7 +2238,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         case .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
             // ⌘+クリック・⌘+スクロールはショートカット操作。黙って取り消す
-            if hotkeyDown { cancel(reason: "mouse", silent: true) }
+            // ⌘+クリックは押してすぐのクリック。話している途中（1 秒以上）のクリックでは取り消さない（話した分が消えていた）
+            if hotkeyDown, let u = current, Date().timeIntervalSince(u.pressedAt) < 1.0 { cancel(reason: "mouse", silent: true) }
         default: break
         }
     }

@@ -471,6 +471,83 @@ def cmd_trend(a):
         print(json.dumps(rows, ensure_ascii=False))
 
 
+def cmd_daily(a):
+    """日ごとの振り返り（入力・伝達の困り具合・速さ・辞書の育ち）を Markdown で出し、reports/daily-<日付>.md に保存する。
+    発話の本文は書かない（判定の理由メモだけ）"""
+    import statistics as st
+    from collections import Counter, defaultdict
+    now = datetime.now()
+    since = now - timedelta(days=a.days)
+    day = defaultdict(Counter)
+    lat = defaultdict(list)
+    added = defaultdict(list)
+    notes = defaultdict(list)
+    path = HISTORY.parent / "events.jsonl"
+    for line in (path.read_text().splitlines() if path.exists() else []):
+        try:
+            e = json.loads(line)
+            t = datetime.fromisoformat(e["t"].replace("Z", "+00:00")).astimezone()
+        except (json.JSONDecodeError, KeyError, ValueError):
+            continue
+        if t.replace(tzinfo=None) < since:
+            continue
+        d = t.strftime("%m/%d")
+        o = e.get("outcome")
+        if o in ("no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press"):
+            day[d]["fail"] += 1
+        elif o == "cancelled" and e.get("reason") != "mouse" and (e.get("hold_seconds") or 0) >= 1.0:
+            day[d]["fail"] += 1
+        elif o == "improve" and "辞書に追加: " in (e.get("summary") or ""):
+            w = e["summary"].split("辞書に追加: ", 1)[1]
+            if w != "なし":
+                added[d] += [x for x in w.split("、") if x]
+    for r in load_records():
+        t = _record_time(r).astimezone()
+        if t.replace(tzinfo=None) < since:
+            continue
+        d = t.strftime("%m/%d")
+        if r.get("pasted") or r.get("locked"):
+            day[d]["ok"] += 1
+        if r.get("release_to_paste_ms"):
+            lat[d].append(r["release_to_paste_ms"])
+        if r.get("autocorrected"):
+            day[d]["autocorrect"] += 1
+        c = r.get("communication")
+        if c == "understood":
+            day[d]["understood"] += 1
+        elif c == "unclear":
+            day[d]["unclear"] += 1
+        elif c == "corrected":
+            k = r.get("communication_impact") or "redo"
+            day[d][k] += 1
+            notes[d].append(f"{k}: {r.get('communication_note') or ''}")
+    def pct(k, n):
+        return f"{k / n:.1%}" if n else "-"
+    lines = [f"# Koe 日次の振り返り（{now:%Y-%m-%d %H:%M}、直近 {a.days} 日）", "",
+             "| 日付 | 押下 | ①入力された | ②判定 | 誤解したまま作業 | 言い直し・聞き返し | 一部落ち | 判定不能 | 離して→貼る 中央/p90 | 自動置き換え | 辞書に追加 |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for d in sorted(day):
+        v = day[d]
+        presses = v["ok"] + v["fail"]
+        judged = v["understood"] + v["misacted"] + v["redo"] + v["dropped"]
+        l = sorted(lat[d])
+        sp = f"{st.median(l) / 1000:.2f}s / {l[int(len(l) * .9)] / 1000:.2f}s" if l else "-"
+        lines.append(f"| {d} | {presses} | {pct(v['ok'], presses)} | {judged} | {v['misacted']} ({pct(v['misacted'], judged)}) | "
+                     f"{v['redo']} ({pct(v['redo'], judged)}) | {v['dropped']} | {v['unclear']} | {sp} | {v['autocorrect']} | {len(added[d])} |")
+    today = now.strftime("%m/%d")
+    lines += ["", "目安: ①入力された 95% 以上 / 誤解したまま作業 1% 未満 / 言い直し・聞き返し 5% 未満（直近 300 件で見る。日ごとの数字は揺れる）", ""]
+    if notes.get(today):
+        lines += [f"## 今日（{today}）伝わらなかったもの（理由メモ）", ""] + [f"- {x}" for x in notes[today]] + [""]
+    if added.get(today):
+        lines += [f"## 今日辞書に足した語（{len(added[today])}）", "", "、".join(added[today]), ""]
+    text = "\n".join(lines)
+    print(text)
+    out = HISTORY.parent / "reports" / f"daily-{now:%Y-%m-%d}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(text + "\n")
+    print(f"\n-> {out}")
+
+
 def cmd_packs(a):
     from collections import Counter, defaultdict
     since = (datetime.now() - timedelta(days=a.days)).strftime("%Y-%m-%dT%H-%M-%S")
@@ -653,6 +730,9 @@ def main():
     s.add_argument("--days", type=int, default=7)
     s.set_defaults(func=cmd_misses)
 
+    s = sub.add_parser("daily")
+    s.add_argument("--days", type=int, default=7)
+    s.set_defaults(func=cmd_daily)
     s = sub.add_parser("perf")
     s.add_argument("--days", type=int, default=14)
     s.set_defaults(func=cmd_perf)
