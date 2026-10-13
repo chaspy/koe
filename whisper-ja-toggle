@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+STATE_DIR="${WHISPER_STATE_DIR:-$HOME/Library/Caches/whisper-ja}"
+PID_FILE="$STATE_DIR/recording.pid"
+AUDIO_FILE="$STATE_DIR/recording.wav"
+APP_FILE="$STATE_DIR/frontmost_app"
+LOG_FILE="$STATE_DIR/ffmpeg.log"
+
+WHISPER_HOME="${WHISPER_CPP_HOME:-$HOME/.local/src/whisper.cpp}"
+WHISPER_CLI="$WHISPER_HOME/build/bin/whisper-cli"
+WHISPER_MODEL="${WHISPER_MODEL:-$WHISPER_HOME/models/ggml-large-v3.bin}"
+WHISPER_THREADS="${WHISPER_THREADS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}"
+WHISPER_LANGUAGE="${WHISPER_LANGUAGE:-ja}"
+WHISPER_AUTOPASTE="${WHISPER_AUTOPASTE:-0}"
+WHISPER_KEEP_AUDIO="${WHISPER_KEEP_AUDIO:-0}"
+WHISPER_ECHO_TEXT="${WHISPER_ECHO_TEXT:-0}"
+FFMPEG_BIN="${WHISPER_FFMPEG_BIN:-$(command -v ffmpeg)}"
+
+mkdir -p "$STATE_DIR"
+
+escape_applescript() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+notify() {
+  local subtitle title body
+  subtitle="$(escape_applescript "$1")"
+  body="$(escape_applescript "$2")"
+  /usr/bin/osascript -e "display notification \"$body\" with title \"Whisper JA\" subtitle \"$subtitle\"" >/dev/null 2>&1 || true
+}
+
+frontmost_app() {
+  /usr/bin/osascript <<'APPLESCRIPT'
+tell application "System Events"
+  return name of first application process whose frontmost is true
+end tell
+APPLESCRIPT
+}
+
+default_audio_device_name() {
+  system_profiler SPAudioDataType | awk '
+    /^[[:space:]]{8}[^:][^:]*:$/ {
+      name = $0
+      sub(/^[[:space:]]+/, "", name)
+      sub(/:$/, "", name)
+      current = name
+    }
+    /Default Input Device: Yes/ {
+      print current
+      exit
+    }
+  '
+}
+
+DEVICE_CACHE_FILE="$STATE_DIR/device_cache"
+DEVICE_CACHE_TTL="${WHISPER_DEVICE_CACHE_TTL:-3600}"
+
+resolve_audio_device_index_uncached() {
+  local target_name index
+  target_name="${WHISPER_AUDIO_DEVICE_NAME:-$(default_audio_device_name)}"
+  index="$(
+    "$FFMPEG_BIN" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 | awk -v target="$target_name" '
+      /AVFoundation audio devices:/ { audio = 1; next }
+      audio && /\[[0-9]+\]/ {
+        line = $0
+        name = $0
+        sub(/^.*\[/, "", line)
+        sub(/\].*$/, "", line)
+        sub(/^.*\] /, "", name)
+        if (target != "" && name == target) {
+          print line
+          exit
+        }
+        if (target == "" && first == "") {
+          first = line
+        }
+      }
+      END {
+        if (target == "" && first != "") {
+          print first
+        }
+      }
+    '
+  )"
+
+  if [ -z "$index" ]; then
+    echo "failed to resolve audio device index" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$index"
+}
+
+resolve_audio_device_index() {
+  if [ -n "${WHISPER_AUDIO_DEVICE_INDEX:-}" ]; then
+    printf '%s\n' "$WHISPER_AUDIO_DEVICE_INDEX"
+    return
+  fi
+
+  if [ -f "$DEVICE_CACHE_FILE" ]; then
+    local cache_age now cache_mtime
+    now="$(date +%s)"
+    cache_mtime="$(stat -f %m "$DEVICE_CACHE_FILE" 2>/dev/null || echo 0)"
+    cache_age=$(( now - cache_mtime ))
+    if [ "$cache_age" -lt "$DEVICE_CACHE_TTL" ]; then
+      cat "$DEVICE_CACHE_FILE"
+      return
+    fi
+  fi
+
+  local index
+  index="$(resolve_audio_device_index_uncached)" || return 1
+  printf '%s\n' "$index" > "$DEVICE_CACHE_FILE"
+  printf '%s\n' "$index"
+}
+
+recording_pid() {
+  if [ -f "$PID_FILE" ]; then
+    cat "$PID_FILE"
+  fi
+}
+
+recording_command() {
+  local pid
+  pid="$1"
+  ps -p "$pid" -o command= 2>/dev/null || true
+}
+
+recording_process_matches() {
+  local pid command
+  pid="$1"
+  command="$(recording_command "$pid")"
+
+  [ -n "$command" ] || return 1
+  printf '%s' "$command" | grep -F "$FFMPEG_BIN" >/dev/null 2>&1 || return 1
+  printf '%s' "$command" | grep -F "$AUDIO_FILE" >/dev/null 2>&1 || return 1
+}
+
+find_related_pids() {
+  [ -e "$AUDIO_FILE" ] || return 0
+  /usr/sbin/lsof -t "$AUDIO_FILE" 2>/dev/null | awk -v self="$$" '$1 != self { print $1 }'
+}
+
+has_related_processes() {
+  [ -n "$(find_related_pids)" ]
+}
+
+wait_for_process_exit() {
+  local pid attempts
+  pid="$1"
+  attempts="${2:-20}"
+
+  for _ in $(seq 1 "$attempts"); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+force_stop_process() {
+  local pid
+  pid="$1"
+
+  kill -INT "$pid" 2>/dev/null || true
+  wait_for_process_exit "$pid" 100 && return 0
+
+  kill -TERM "$pid" 2>/dev/null || true
+  wait_for_process_exit "$pid" 20 && return 0
+
+  kill -KILL "$pid" 2>/dev/null || true
+  wait_for_process_exit "$pid" 10 && return 0
+
+  return 1
+}
+
+is_recording() {
+  local pid
+  pid="$(recording_pid)"
+  if [ -z "$pid" ]; then
+    has_related_processes
+    return $?
+  fi
+
+  kill -0 "$pid" 2>/dev/null || {
+    cleanup_state
+    has_related_processes
+    return $?
+  }
+
+  if ! recording_process_matches "$pid"; then
+    cleanup_state
+    has_related_processes
+    return $?
+  fi
+
+  return 0
+}
+
+cleanup_state() {
+  rm -f "$PID_FILE" "$APP_FILE" "$LOG_FILE"
+  if [ "$WHISPER_KEEP_AUDIO" != "1" ]; then
+    rm -f "$AUDIO_FILE"
+  fi
+}
+
+start_recording() {
+  if [ ! -x "$WHISPER_CLI" ]; then
+    echo "whisper-cli not found: $WHISPER_CLI" >&2
+    return 1
+  fi
+
+  if [ ! -f "$WHISPER_MODEL" ]; then
+    echo "model not found: $WHISPER_MODEL" >&2
+    return 1
+  fi
+
+  local audio_index target_app pid
+  audio_index="$(resolve_audio_device_index)"
+  target_app="$(frontmost_app || true)"
+  printf '%s\n' "$target_app" > "$APP_FILE"
+  rm -f "$AUDIO_FILE" "$LOG_FILE"
+
+  nohup "$FFMPEG_BIN" \
+    -hide_banner \
+    -loglevel error \
+    -f avfoundation \
+    -i ":$audio_index" \
+    -ac 1 \
+    -ar 16000 \
+    -y \
+    "$AUDIO_FILE" >"$LOG_FILE" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$PID_FILE"
+
+  sleep 0.2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "recording failed to start" >&2
+    cat "$LOG_FILE" >&2 || true
+    cleanup_state
+    return 1
+  fi
+
+  notify "録音開始" "もう一度 whisper-ja-toggle で停止します"
+  printf 'recording started (pid=%s, device=%s)\n' "$pid" "$audio_index"
+}
+
+transcribe_audio() {
+  if [ ! -f "$AUDIO_FILE" ]; then
+    echo ""
+    return
+  fi
+
+  "$WHISPER_CLI" \
+    -m "$WHISPER_MODEL" \
+    -l "$WHISPER_LANGUAGE" \
+    -t "$WHISPER_THREADS" \
+    -nt \
+    -np \
+    "$AUDIO_FILE" | awk '
+      NF {
+        gsub(/^[[:space:]]+/, "", $0)
+        gsub(/[[:space:]]+$/, "", $0)
+        if ($0 != "") {
+          printf "%s%s", sep, $0
+          sep = " "
+        }
+      }
+      END {
+        if (sep != "") {
+          printf "\n"
+        }
+      }
+    '
+}
+
+paste_clipboard() {
+  local target_app escaped_app
+  target_app="$1"
+  escaped_app="$(escape_applescript "$target_app")"
+
+  (
+    /usr/bin/osascript <<APPLESCRIPT >/dev/null 2>&1 || true
+set targetApp to "${escaped_app}"
+if targetApp is not "" then
+  tell application targetApp to activate
+  delay 0.15
+end if
+tell application "System Events"
+  keystroke "v" using command down
+end tell
+APPLESCRIPT
+  ) &
+}
+
+stop_recording() {
+  local pid target_app text
+  pid="$(recording_pid)"
+  if [ -z "$pid" ]; then
+    echo "not recording" >&2
+    return 1
+  fi
+
+  if ! recording_process_matches "$pid"; then
+    cleanup_state
+    echo "stale recording state was cleared" >&2
+    return 1
+  fi
+
+  target_app="$(cat "$APP_FILE" 2>/dev/null || true)"
+
+  if ! force_stop_process "$pid"; then
+    cleanup_state
+    echo "failed to stop recording process" >&2
+    return 1
+  fi
+
+  text="$(transcribe_audio)"
+
+  if [ -z "$text" ]; then
+    notify "録音停止" "音声を認識できませんでした"
+    cleanup_state
+    echo ""
+    return 0
+  fi
+
+  printf '%s' "$text" | pbcopy
+  if [ "$WHISPER_AUTOPASTE" = "1" ]; then
+    paste_clipboard "$target_app"
+  fi
+
+  cleanup_state
+  notify "転記完了" "クリップボードへコピーしました"
+  if [ "$WHISPER_ECHO_TEXT" = "1" ]; then
+    printf '%s\n' "$text"
+  else
+    printf 'transcription copied to clipboard (%s chars)\n' "${#text}"
+  fi
+}
+
+kill_pids() {
+  local pid killed_any
+  killed_any=1
+
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    killed_any=0
+    force_stop_process "$pid" || true
+  done
+
+  return "$killed_any"
+}
+
+kill_recording() {
+  local pid related_pids
+  pid="$(recording_pid)"
+
+  if [ -n "$pid" ] && recording_process_matches "$pid"; then
+    if ! force_stop_process "$pid"; then
+      cleanup_state
+      echo "failed to kill recording process" >&2
+      return 1
+    fi
+    cleanup_state
+    notify "録音強制停止" "録音プロセスを終了しました"
+    printf 'recording killed\n'
+    return
+  fi
+
+  related_pids="$(find_related_pids)"
+  if [ -n "$related_pids" ]; then
+    # shellcheck disable=SC2086
+    kill_pids $related_pids || true
+    cleanup_state
+    notify "録音強制停止" "関連プロセスを終了しました"
+    printf 'recording killed\n'
+    return
+  fi
+
+  cleanup_state
+  echo "not recording" >&2
+  return 1
+}
+
+panic_cleanup() {
+  local related_pids
+  related_pids="$(find_related_pids)"
+  if [ -n "$related_pids" ]; then
+    # shellcheck disable=SC2086
+    kill_pids $related_pids || true
+  fi
+
+  cleanup_state
+  notify "Whisper リセット" "状態を初期化しました"
+  printf 'whisper state reset\n'
+}
+
+status_recording() {
+  if is_recording; then
+    printf 'recording\n'
+  else
+    printf 'stopped\n'
+  fi
+}
+
+do_toggle() {
+  if is_recording; then
+    stop_recording
+  else
+    start_recording
+  fi
+}
+
+loop_mode() {
+  # Pre-resolve and cache device index on startup
+  local index
+  index="$(resolve_audio_device_index)" || { echo "failed to resolve audio device" >&2; exit 1; }
+  printf 'audio device: %s (cached)\n' "$index"
+  printf '[Enter で録音開始/停止。q で終了]\n'
+
+  local line
+  while true; do
+    if is_recording; then
+      printf '\033[31m● rec\033[0m > '
+    else
+      printf '○ idle > '
+    fi
+
+    if ! read -r line; then
+      break
+    fi
+
+    case "$line" in
+      q|quit|exit) break ;;
+      status) status_recording ;;
+      kill) kill_recording || true ;;
+      panic) panic_cleanup ;;
+      *) do_toggle || true ;;
+    esac
+  done
+
+  if is_recording; then
+    printf 'stopping recording before exit...\n'
+    kill_recording || true
+  fi
+  printf 'bye\n'
+}
+
+main() {
+  local action
+  action="${1:-toggle}"
+
+  case "$action" in
+    start)
+      if is_recording; then
+        echo "already recording" >&2
+        exit 1
+      fi
+      start_recording || exit 1
+      ;;
+    stop)
+      stop_recording || exit 1
+      ;;
+    kill)
+      kill_recording || exit 1
+      ;;
+    panic)
+      panic_cleanup
+      ;;
+    status)
+      status_recording
+      ;;
+    toggle)
+      do_toggle || exit 1
+      ;;
+    loop)
+      loop_mode
+      ;;
+    *)
+      echo "usage: whisper-ja-toggle [start|stop|kill|panic|status|toggle|loop]" >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "${1:-toggle}"

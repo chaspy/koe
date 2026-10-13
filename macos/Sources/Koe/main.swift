@@ -1,0 +1,2647 @@
+import AppKit
+import AVFoundation
+import ApplicationServices
+import Carbon
+import CoreAudio
+import AudioToolbox
+import ServiceManagement
+import UniformTypeIdentifiers
+
+// MARK: - Settings
+//
+// すべて `defaults write io.github.chaspy.koe <key> <value>` で上書きできる。
+
+enum Settings {
+    static let defaults = UserDefaults.standard
+    static let home = FileManager.default.homeDirectoryForCurrentUser.path
+
+    static var whisperHome: String {
+        defaults.string(forKey: "whisperHome") ?? "\(home)/.local/src/whisper.cpp"
+    }
+    // アプリに同梱した whisper-server を優先する。無ければ自分でビルドした whisper.cpp
+    static var serverBinary: String {
+        let bundled = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/whisper-server").path
+        return FileManager.default.isExecutableFile(atPath: bundled) ? bundled : "\(whisperHome)/build/bin/whisper-server"
+    }
+    // モデルは初回起動時に Application Support へ自動でダウンロードする
+    static let modelFileName = "ggml-large-v3-turbo.bin"
+    static var modelURL: URL {
+        URL(string: defaults.string(forKey: "modelURL") ?? "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(modelFileName)")!
+    }
+    static var downloadedModel: String {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Koe/models/\(modelFileName)").path
+    }
+    static var model: String {
+        if let m = defaults.string(forKey: "model") { return m }
+        let fm = FileManager.default
+        for c in [downloadedModel, "\(whisperHome)/models/\(modelFileName)", "\(whisperHome)/models/ggml-large-v3.bin"] where fm.fileExists(atPath: c) {
+            return c
+        }
+        return downloadedModel
+    }
+    static var language: String { defaults.string(forKey: "language") ?? "ja" }
+    static var port: Int {
+        let p = defaults.integer(forKey: "port")
+        return p > 0 ? p : 18080
+    }
+    // 句読点と疑問符を付けさせるための初期プロンプト
+    static var prompt: String {
+        defaults.string(forKey: "prompt") ?? "これで合ってる？はい、承知しました。それって本当？では、次の作業に進みましょう。"
+    }
+    // 押している間だけ録音するキー。既定は右 Command (54)
+    static var hotkeyKeyCode: UInt16 {
+        let k = defaults.integer(forKey: "hotkeyKeyCode")
+        return k > 0 ? UInt16(k) : 54
+    }
+    static var autoEnter: Bool {
+        get { defaults.object(forKey: "autoEnter") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "autoEnter") }
+    }
+    // Enter を自動で送るアプリ（ターミナル系）。それ以外（Teams・Slack 等）には貼るだけで送信しない
+    static var enterApps: [String] {
+        defaults.stringArray(forKey: "enterApps") ?? [
+            "com.googlecode.iterm2", "com.apple.Terminal", "com.mitchellh.ghostty", "dev.warp.Warp-Stable",
+            "net.kovidgoyal.kitty", "org.alacritty", "io.alacritty", "com.github.wez.wezterm",
+        ]
+    }
+    static var shouldEnter: Bool {
+        guard autoEnter, let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
+        return enterApps.contains(id)
+    }
+    // これより短い押下は誤操作とみなして捨てる
+    static var minHoldSeconds: Double {
+        let v = defaults.double(forKey: "minHoldSeconds")
+        return v > 0 ? v : 0.2
+    }
+    // 録音の開始・終了で効果音を鳴らす
+    static var sounds: Bool {
+        get { defaults.object(forKey: "sounds") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "sounds") }
+    }
+    // アプリ同梱の音（start / stop）か、macOS 標準の音の名前（Ping 等）
+    static var startSound: String { defaults.string(forKey: "startSound") ?? "start" }
+    static var stopSound: String { defaults.string(forKey: "stopSound") ?? "stop" }
+    static var failSound: String { defaults.string(forKey: "failSound") ?? "fail" }
+    // 文字起こし後に LLM で整形する（OpenAI 互換エンドポイント）
+    static var llmEnabled: Bool {
+        get { defaults.object(forKey: "llmEnabled") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "llmEnabled") }
+    }
+    static var llmEndpoint: String { defaults.string(forKey: "llmEndpoint") ?? "http://localhost:11434/v1" }
+    static var llmModel: String { defaults.string(forKey: "llmModel") ?? "qwen2.5:7b" }
+    static var llmAPIKey: String? { defaults.string(forKey: "llmAPIKey") }
+    // 個人の辞書（1 行 1 語、# はコメント）。whisper の初期プロンプトと LLM 整形の両方に使う。
+    // 改善ループが履歴から自動で育てる
+    static var glossaryPath: String {
+        defaults.string(forKey: "glossaryPath")
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Koe/glossary.txt").path
+    }
+    static var glossaryTerms: [String] { Glossary.personal.map(\.term) }
+    // 組織の辞書（配布される読み取り専用の辞書）。ファイルパスか http(s) の URL
+    static var orgGlossary: String? { defaults.string(forKey: "orgGlossary") }
+    // 有効にする用語パック（packs/*.txt のファイル名）。既定は開発者向け
+    // 共有の用語パックの取り込み元（gh:owner/repo/path か https の URL）
+    static var packSources: [String] { defaults.stringArray(forKey: "packSources") ?? [] }
+    static var enabledPacks: [String] {
+        get { defaults.stringArray(forKey: "enabledPacks") ?? ["developer"] }
+        set { defaults.set(newValue, forKey: "enabledPacks") }
+    }
+    // 直前の発話（同じアプリ・3 分以内）を初期プロンプトの頭に足す。
+    // 会話の流れが分かると同音異義語・専門用語の取り違えが減る（koe_bench.py で CER 6.5% → 3.9%）
+    static var contextPrompt: Bool {
+        get { defaults.object(forKey: "contextPrompt") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "contextPrompt") }
+    }
+    static func whisperPrompt(previous: String?) -> String {
+        guard contextPrompt, let prev = previous, !prev.isEmpty else { return whisperPrompt }
+        return String(prev.suffix(150)) + " " + whisperPrompt
+    }
+
+    // whisper の初期プロンプトは 224 トークンまでなので、用語は約 120 文字ぶんだけ入れる
+    static var whisperPrompt: String {
+        let terms = Glossary.whisperTerms(limit: 120)
+        return terms.isEmpty ? prompt : "\(terms.joined(separator: "、"))。\(prompt)"
+    }
+    static var llmTimeout: Double {
+        let v = defaults.double(forKey: "llmTimeout")
+        return v > 0 ? v : 8
+    }
+    // 録音と文字起こし結果を保存して、後でモデル・プロンプトの比較評価に使う
+    static var saveHistory: Bool {
+        get { defaults.object(forKey: "saveHistory") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "saveHistory") }
+    }
+    // 比較用に、使わなかった側のマイクの録音も保存する（マイクの A/B 比較）
+    static var saveAllMics: Bool {
+        get { defaults.object(forKey: "saveAllMics") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "saveAllMics") }
+    }
+    // 既定のマイクがミュート（完全な無音）の間は別のマイクで録る
+    static var fallbackMic: Bool {
+        get { defaults.object(forKey: "fallbackMic") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "fallbackMic") }
+    }
+    static var fallbackMicName: String? { defaults.string(forKey: "fallbackMicName") }
+    // Koe が使うマイク。nil は自動（システムの既定。ミュート中は別のマイク）
+    static var micName: String? {
+        get { defaults.string(forKey: "micName") }
+        set { defaults.set(newValue, forKey: "micName") }
+    }
+    // 貼り付け後にクリップボードを元に戻すか。既定はオフ＝文字起こしが残るので、貼り付けに失敗しても ⌘V で貼り直せる
+    static var restoreClipboard: Bool {
+        get { defaults.object(forKey: "restoreClipboard") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "restoreClipboard") }
+    }
+    // 改善ループ（使うほど辞書が育ち、伝達の判定が付く）。発話を improveEndpoint に送るので既定はオフ
+    static var improveEnabled: Bool {
+        get { defaults.object(forKey: "improveEnabled") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "improveEnabled") }
+    }
+    // 改善ループの LLM。既定は Claude Code（claude -p）を呼ぶコマンド型で、追加の従量課金がかからない。
+    // improveProvider = "command"（標準入力でプロンプトを渡し、標準出力で答えを受け取る CLI）か "api"（OpenAI 互換）
+    static var improveProvider: String { defaults.string(forKey: "improveProvider") ?? "command" }
+    static var improveCommand: String { defaults.string(forKey: "improveCommand") ?? "claude -p --model sonnet" }
+    // 送り先の表示用（同意ダイアログ・メニュー）
+    static var improveTarget: String {
+        improveProvider == "api" ? "\(improveEndpoint)（\(improveModel)）" : "コマンド: \(improveCommand)"
+    }
+    static var improveEndpoint: String { defaults.string(forKey: "improveEndpoint") ?? "" }
+    static var improveModel: String { defaults.string(forKey: "improveModel") ?? "" }
+    static var improveBatch: Int {
+        let v = defaults.integer(forKey: "improveBatch")
+        return v > 0 ? v : 30
+    }
+    // 認証: improveAPIKey か、トークンを標準出力に出すコマンド improveTokenCommand（OAuth の短命トークン向け）
+    static func improveAuth() -> String? {
+        if let k = defaults.string(forKey: "improveAPIKey"), !k.isEmpty { return k }
+        guard let cmd = defaults.string(forKey: "improveTokenCommand"), !cmd.isEmpty else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", cmd]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+        try? p.run()
+        p.waitUntilExit()
+        let token = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return token?.isEmpty == false ? token : nil
+    }
+    // マイクを開きっぱなしにして押す直前の音も拾う（頭切れ防止）
+    static var warmMic: Bool {
+        get { defaults.object(forKey: "warmMic") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "warmMic") }
+    }
+}
+
+// 修飾キーの keyCode → 左右を区別できるデバイス依存フラグ
+let deviceModifierMask: [UInt16: UInt] = [
+    54: 0x10,    // right command
+    55: 0x08,    // left command
+    61: 0x40,    // right option
+    58: 0x20,    // left option
+    60: 0x04,    // right shift
+    56: 0x02,    // left shift
+    62: 0x2000,  // right control
+    59: 0x01,    // left control
+]
+
+// 無音・雑音で whisper がよく出す幻聴
+let hallucinations = [
+    "ご視聴ありがとうございました", "ご視聴ありがとうございました。",
+    "ありがとうございました", "ありがとうございました。",
+    "おやすみなさい", "おやすみなさい。",
+    "(音楽)", "(拍手)", "[音楽]", "[BLANK_AUDIO]",
+]
+
+// プロンプトに引っ張られると、同じ文を何度も繰り返すことがある（「〜しました。〜しました。〜しました。」）
+func isRepetitive(_ text: String) -> Bool {
+    let parts = text.components(separatedBy: CharacterSet(charactersIn: "。！？!?\n ")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count >= 4 }
+    var count: [String: Int] = [:]
+    for p in parts { count[p, default: 0] += 1 }
+    return (count.values.max() ?? 0) >= 3
+}
+
+// 3 回以上出た文を 1 回に減らす（プロンプトなしでやり直しても繰り返したとき）
+func collapseRepeats(_ text: String) -> String {
+    var seen: [String: Int] = [:]
+    var out = ""
+    var cur = ""
+    func flush(_ sep: String) {
+        let k = cur.trimmingCharacters(in: .whitespaces)
+        if k.count >= 4 { seen[k, default: 0] += 1 }
+        if k.count < 4 || seen[k]! == 1 { out += cur + sep }
+        cur = ""
+    }
+    for ch in text {
+        if "。！？!?\n".contains(ch) { flush(String(ch)) } else { cur.append(ch) }
+    }
+    flush("")
+    return out.trimmingCharacters(in: .whitespaces)
+}
+
+// MARK: - whisper-server
+
+final class WhisperServer {
+    private var process: Process?
+    var baseURL: URL { URL(string: "http://127.0.0.1:\(Settings.port)")! }
+
+    func start(onReady: @escaping (Result<Void, Error>) -> Void) {
+        isAlive { alive in
+            if alive { return onReady(.success(())) }
+            do {
+                try self.launch()
+                self.waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
+            } catch {
+                onReady(.failure(error))
+            }
+        }
+    }
+
+    private func launch() throws {
+        guard FileManager.default.isExecutableFile(atPath: Settings.serverBinary) else {
+            throw NSError(domain: "Koe", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "whisper-server が見つかりません: \(Settings.serverBinary)"])
+        }
+        guard FileManager.default.fileExists(atPath: Settings.model) else {
+            throw NSError(domain: "Koe", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "モデルが見つかりません: \(Settings.model)"])
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: Settings.serverBinary)
+        p.arguments = [
+            "-m", Settings.model,
+            "-l", Settings.language,
+            "--host", "127.0.0.1",
+            "--port", String(Settings.port),
+            "-t", "4",
+            "--prompt", Settings.prompt,
+        ]
+        let log = Self.logURL
+        FileManager.default.createFile(atPath: log.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: log)
+        p.standardOutput = handle
+        p.standardError = handle
+        try p.run()
+        process = p
+    }
+
+    static var logURL: URL {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("koe", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("whisper-server.log")
+    }
+
+    private func isAlive(_ done: @escaping (Bool) -> Void) {
+        var req = URLRequest(url: baseURL)
+        req.timeoutInterval = 1
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            done((resp as? HTTPURLResponse) != nil)
+        }.resume()
+    }
+
+    private func waitUntilReady(deadline: Date, onReady: @escaping (Result<Void, Error>) -> Void) {
+        isAlive { alive in
+            if alive { return onReady(.success(())) }
+            if let p = self.process, !p.isRunning {
+                return onReady(.failure(NSError(domain: "Koe", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "whisper-server が起動直後に終了しました (\(Self.logURL.path))"])))
+            }
+            if Date() > deadline {
+                return onReady(.failure(NSError(domain: "Koe", code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "whisper-server の起動がタイムアウトしました"])))
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                self.waitUntilReady(deadline: deadline, onReady: onReady)
+            }
+        }
+    }
+
+    func transcribe(wav: URL, prompt: String, done: @escaping (Result<String, Error>) -> Void) {
+        let boundary = "whisperja-\(UUID().uuidString)"
+        var body = Data()
+        func field(_ name: String, _ value: String) {
+            body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
+        }
+        field("response_format", "text")
+        field("prompt", prompt)
+        field("temperature", "0.0")
+        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
+        guard let audio = try? Data(contentsOf: wav) else {
+            return done(.failure(NSError(domain: "Koe", code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "録音ファイルを読めませんでした"])))
+        }
+        body.append(audio)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+
+        var req = URLRequest(url: baseURL.appendingPathComponent("inference"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 120
+        req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        URLSession.shared.dataTask(with: req) { data, _, error in
+            if let error { return done(.failure(error)) }
+            let raw = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            let text = raw
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            done(.success(text))
+        }.resume()
+    }
+
+    func stop() {
+        process?.terminate()
+        process = nil
+    }
+}
+
+// MARK: - Glossary
+//
+// 2 層: 組織の辞書（orgGlossary。配布・読み取り専用）と個人の辞書（glossaryPath。改善ループが育てる）。
+// 形式はどちらも 1 行 1 語、タブの後に別名（／区切り）を書ける。# はコメント。
+// whisper の初期プロンプトは約 120 文字しか入らないので、個人の辞書を優先し、
+// 組織の辞書からは最近の発話に出てきた語を優先して詰める。
+
+enum Glossary {
+    struct Entry { let term: String; let aliases: [String] }
+
+    static func parse(_ text: String) -> [Entry] {
+        text.split(whereSeparator: \.isNewline).compactMap { line in
+            let l = line.trimmingCharacters(in: .whitespaces)
+            guard !l.isEmpty, !l.hasPrefix("#") else { return nil }
+            let parts = l.split(separator: "\t", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            let aliases = parts.count > 1
+                ? parts[1].split(whereSeparator: { $0 == "／" || $0 == "/" }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                : []
+            return Entry(term: parts[0], aliases: aliases)
+        }
+    }
+
+    private static func read(_ path: String) -> String {
+        (try? String(contentsOfFile: (path as NSString).expandingTildeInPath, encoding: .utf8)) ?? ""
+    }
+
+    static var personal: [Entry] { parse(read(Settings.glossaryPath)) }
+
+    // 用語パック: 分野ごとの汎用の語（packs/*.txt をアプリに同梱。~/Library/Application Support/Koe/packs/ に置けば自作も使える）
+    // 別名の先頭に ~ を付けたものは紛らわしい誤変換（例: ~マジ → マージ）。置き換えず、受け取る側の AI へのメモにだけ使う
+    struct Pack { let id: String; let title: String; let url: URL }
+    static var availablePacks: [Pack] {
+        let fm = FileManager.default
+        var dirs: [URL] = []
+        if let r = Bundle.main.resourceURL { dirs.append(r.appendingPathComponent("packs")) }
+        dirs.append(fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe/packs"))
+        var seen = Set<String>(), out: [Pack] = []
+        for d in dirs {
+            for f in ((try? fm.contentsOfDirectory(at: d, includingPropertiesForKeys: nil)) ?? []).sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            where f.pathExtension == "txt" {
+                let id = f.deletingPathExtension().lastPathComponent
+                guard !seen.contains(id) else { continue }
+                seen.insert(id)
+                let first = read(f.path).split(separator: "\n").first.map(String.init) ?? id
+                let title = first.hasPrefix("#") ? first.replacingOccurrences(of: "# Koe 用語パック:", with: "").trimmingCharacters(in: .whitespaces) : id
+                out.append(Pack(id: id, title: title, url: f))
+            }
+        }
+        return out
+    }
+    static var packs: [Entry] {
+        let on = Set(Settings.enabledPacks)
+        return availablePacks.filter { on.contains($0.id) }.flatMap { parse(read($0.url.path)) }
+    }
+    static func sure(_ aliases: [String]) -> [String] { aliases.filter { !$0.hasPrefix("~") } }
+
+    // 共有の用語パックを取り込む（1 日 1 回）。packSources の各要素:
+    //   gh:owner/repo/path/to/pack.txt  … gh CLI で private リポジトリから取る（gh にログイン済みが前提）
+    //   https://…/pack.txt              … そのまま取る
+    // 取り込んだファイルは Application Support/Koe/packs/<ファイル名> に置き、enabledPacks にあれば使われる
+    static func refreshPackSources(force: Bool = false) {
+        let sources = Settings.packSources
+        guard !sources.isEmpty else { return }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe/packs")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        DispatchQueue.global(qos: .utility).async {
+            for src in sources {
+                let name = (src as NSString).lastPathComponent
+                let dest = dir.appendingPathComponent(name)
+                if !force, let m = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.modificationDate] as? Date,
+                   Date().timeIntervalSince(m) < 86400 { continue }
+                var data: Data?
+                if src.hasPrefix("gh:") {
+                    let parts = src.dropFirst(3).split(separator: "/", maxSplits: 2).map(String.init)
+                    guard parts.count == 3 else { continue }
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                    p.arguments = ["-lc", "gh api repos/\(parts[0])/\(parts[1])/contents/\(parts[2]) -H 'Accept: application/vnd.github.raw'"]
+                    let out = Pipe()
+                    p.standardOutput = out
+                    p.standardError = Pipe()
+                    try? p.run()
+                    p.waitUntilExit()
+                    if p.terminationStatus == 0 { data = out.fileHandleForReading.readDataToEndOfFile() }
+                } else if let url = URL(string: src) {
+                    data = try? Data(contentsOf: url)
+                }
+                // 中身がパックの形式（テキスト）であることだけ確かめて差し替える
+                if let d = data, let text = String(data: d, encoding: .utf8), !text.isEmpty, !text.hasPrefix("{") {
+                    try? d.write(to: dest)
+                    Events.log("pack_synced", ["source": src, "terms": parse(text).count])
+                } else {
+                    Events.log("pack_sync_failed", ["source": src])
+                }
+            }
+            DispatchQueue.main.async { exportForReceivers() }
+        }
+    }
+    static func ambiguous(_ aliases: [String]) -> [String] { aliases.filter { $0.hasPrefix("~") }.map { String($0.dropFirst()) } }
+
+    private static var orgCacheURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Koe/org_glossary.cache.txt")
+    }
+
+    static var org: [Entry] {
+        guard let src = Settings.orgGlossary, !src.isEmpty else { return [] }
+        if src.hasPrefix("http://") || src.hasPrefix("https://") { return parse(read(orgCacheURL.path)) }
+        return parse(read(src))
+    }
+
+    // URL の組織の辞書を 1 日 1 回取り直す
+    static func refreshOrgIfNeeded() {
+        guard let src = Settings.orgGlossary, let url = URL(string: src), url.scheme?.hasPrefix("http") == true else { return }
+        let attrs = try? FileManager.default.attributesOfItem(atPath: orgCacheURL.path)
+        if let m = attrs?[.modificationDate] as? Date, Date().timeIntervalSince(m) < 86400 { return }
+        URLSession.shared.dataTask(with: url) { data, resp, _ in
+            guard let data, (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
+            try? FileManager.default.createDirectory(at: orgCacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: orgCacheURL)
+        }.resume()
+    }
+
+    // 最近の発話（直近 300 件）に出てきた件数。10 分ごとに数え直す
+    private static var usage: [String: Int] = [:]
+    private static var usageAt = Date.distantPast
+    private static func usageCounts(_ entries: [Entry]) -> [String: Int] {
+        if Date().timeIntervalSince(usageAt) < 600 { return usage }
+        let texts = History.recentPasted(300).map { $0.text.lowercased() }
+        var u: [String: Int] = [:]
+        for e in entries {
+            let keys = ([e.term] + e.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }).map { $0.lowercased() }.filter { $0.count >= 2 }
+            let n = texts.reduce(0) { acc, t in acc + (keys.contains { t.contains($0) } ? 1 : 0) }
+            if n > 0 { u[e.term] = n }
+        }
+        usage = u
+        usageAt = Date()
+        return u
+    }
+
+    // 個人・組織の辞書をまとめて、最近の発話に出てきた回数が多い順に詰める。
+    // 出てこなかった個人の語はその後ろ（ファイルの並び順）。別名（誤変換された形）でも数える
+    static func whisperTerms(limit: Int) -> [String] {
+        let p = personal
+        let k = packs.filter { e in !p.contains { $0.term == e.term } }
+        let o = org.filter { e in !p.contains { $0.term == e.term } && !k.contains { $0.term == e.term } }
+        let counts = usageCounts(p + k + o)
+        let used = (p + k + o).map(\.term).filter { counts[$0] != nil }.sorted { counts[$0]! > counts[$1]! }
+        // 最近出てこなかった語は、個人の辞書（本人が育てた・入れた語）を先に、パックを後に
+        let rest = (p + k).map(\.term).filter { counts[$0] == nil }
+        var out: [String] = []
+        var length = 0
+        for t in used + rest {
+            if length + t.count > limit { continue }
+            out.append(t)
+            length += t.count + 1
+        }
+        return out
+    }
+
+    // 個人の辞書の別名は、実際に起きた誤変換の形（改善ループが記録する）。出てきたら正しい表記に置き換える。
+    // 一度覚えた誤変換は二度と出ず、直前の発話を文脈に渡すときに誤変換を引き継がない
+    static func autocorrect(_ text: String) -> String { autocorrectWithLog(text).text }
+
+    // 置き換えた内容も返す（効き目の計測用。履歴に autocorrected として残す）
+    static func autocorrectWithLog(_ text: String) -> (text: String, applied: [String]) {
+        var applied: [String] = []
+        // 「マジ>(され|し|する)」のように > の後に続く語の条件を書いた別名は、その語が続くときだけ置き換える
+        let pairs = (personal + packs).flatMap { e in sure(e.aliases).filter { $0.count >= 2 && $0 != e.term }.map { ($0, e.term) } }
+            .sorted { $0.0.count > $1.0.count }
+        var t = text
+        for (wrong, right) in pairs where t.contains(String(wrong.split(separator: ">").first ?? "")) {
+            // 長いカタカナ語・英単語の一部（「フォールバック」の「フォール」等）は置き換えない
+            let parts = wrong.split(separator: ">", maxSplits: 1).map(String.init)
+            let follow = parts.count > 1 ? "(?=\(parts[1]))" : ""
+            let pattern = "(?<![\\p{Katakana}ーA-Za-z0-9])" + NSRegularExpression.escapedPattern(for: parts[0]) + "(?![\\p{Katakana}ーA-Za-z0-9])" + follow
+            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(t.startIndex..., in: t)
+            if re.numberOfMatches(in: t, range: range) > 0 { applied.append("\(parts[0])→\(right)") }
+            t = re.stringByReplacingMatches(in: t, range: range, withTemplate: NSRegularExpression.escapedTemplate(for: right))
+        }
+        return (t, applied)
+    }
+
+    // 受け取る側の AI（Claude Code 等）に渡す「誤変換されやすい語」の一覧。
+    // 音声入力の文を受け取った AI がこれを読めば、化けた語を自分で読み替えられる（追加の費用も待ち時間もない）。
+    // 既定は Claude Code の設定フォルダ（CLAUDE.md から「@~/.claude/koe-voice-glossary.md」で読み込める）
+    static var receiverURL: URL {
+        if let p = Settings.defaults.string(forKey: "receiverGlossaryPath") { return URL(fileURLWithPath: (p as NSString).expandingTildeInPath) }
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/koe-voice-glossary.md")
+    }
+    // 全部入りの版（常時は読み込まない。意味が取れない語があったときに受け取る側が grep する）
+    static var receiverFullURL: URL {
+        receiverURL.deletingPathExtension().appendingPathExtension("full.md")
+    }
+    // 常時読み込む版は短くする（毎回の会話の文脈を食うため）。最近の発話に出た語を優先して上位だけ載せ、残りは全部入りの版へ
+    static let receiverShortRows = 20
+    static func exportForReceivers() {
+        // 個人の辞書とパックで同じ語は 1 つにまとめる（別名は合わせる）
+        var merged: [(term: String, aliases: [String])] = []
+        for e in personal + packs {
+            if let i = merged.firstIndex(where: { $0.term == e.term }) {
+                merged[i].aliases = merged[i].aliases + e.aliases.filter { !merged[i].aliases.contains($0) }
+            } else { merged.append((e.term, e.aliases)) }
+        }
+        func row(_ e: (term: String, aliases: [String])) -> String {
+            let s = sure(e.aliases).map { $0.replacingOccurrences(of: ">", with: "（直後が ") + ($0.contains(">") ? " のとき）" : "") }, amb = ambiguous(e.aliases)
+            var line = "- \(e.term)"
+            if !s.isEmpty { line += " ← \(s.joined(separator: "、"))" }
+            if !amb.isEmpty { line += "（文脈によっては「\(amb.joined(separator: "」「"))」と化ける）" }
+            return line
+        }
+        let withAliases = merged.filter { !$0.aliases.isEmpty }
+        // 最近の発話に出た語（正しい表記か化けた形）を先に。同じなら個人の辞書の順
+        let counts = usageCounts((personal + packs).filter { !$0.aliases.isEmpty })
+        let ranked = withAliases.enumerated().sorted { x, y in
+            let cx = counts[x.element.term] ?? 0, cy = counts[y.element.term] ?? 0
+            return cx != cy ? cx > cy : x.offset < y.offset
+        }.map(\.element)
+        let terms = merged.filter { $0.aliases.isEmpty }.map(\.term)
+        let orgRows = org.filter { e in !e.aliases.isEmpty && !merged.contains { $0.term == e.term } }.map { row(($0.term, $0.aliases)) }
+        let fullPath = receiverFullURL.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
+
+        var head = "# 音声入力（Koe）の誤変換メモ\n\n"
+        head += "ユーザーは音声入力（Koe・whisper）でも入力する。文字起こしの誤変換が混ざるので、意味が通らない語は音の近い語として読み替えてから解釈すること。読み替えたことは一言添える。\n\n"
+        head += "音声入力では疑問の「？」が落ちて「。」になることがある。口語の文末（〜てる、〜ない、〜だっけ、〜ってこと）が質問か断定か曖昧なときは、質問として受け取り、答えてから進めること。\n\n"
+
+        var short = head
+        short += "意味が取れない語があって下の一覧に無いときは、全部入りの一覧 `\(fullPath)` を grep してから読み替える（\(withAliases.count + orgRows.count) 語）。\n\n"
+        if !ranked.isEmpty { short += "## よく起きる誤変換（正しい表記 ← 化けた形）\n\n" + ranked.prefix(receiverShortRows).map(row).joined(separator: "\n") + "\n" }
+        try? short.write(to: receiverURL, atomically: true, encoding: .utf8)
+
+        var full = head
+        if !ranked.isEmpty { full += "## 実際に起きた誤変換（正しい表記 ← 化けた形）\n\n" + ranked.map(row).joined(separator: "\n") + "\n\n" }
+        if !orgRows.isEmpty { full += "## 組織の辞書（社内の語と別の書き方）\n\n" + orgRows.joined(separator: "\n") + "\n\n" }
+        if !terms.isEmpty { full += "## よく使う語（この表記が正しい）\n\n" + terms.joined(separator: "、") + "\n" }
+        try? full.write(to: receiverFullURL, atomically: true, encoding: .utf8)
+    }
+
+    // LLM には全語を渡す（組織の辞書は別名つき）
+    static var llmBlock: String {
+        let p = personal + packs
+        let names = Set(p.map(\.term))
+        return (p + org.filter { !names.contains($0.term) }).prefix(500).map { e in
+            let al = e.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }
+            return al.isEmpty ? e.term : "\(e.term) ← \(al.joined(separator: "／"))"
+        }.joined(separator: "\n")
+    }
+}
+
+// MARK: - Audio devices
+
+enum AudioDevices {
+    struct Device { let id: AudioDeviceID; let name: String; let transport: UInt32 }
+
+    private static func get<T>(_ obj: AudioObjectID, _ sel: AudioObjectPropertySelector,
+                               _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, _ initial: T) -> T? {
+        var a = AudioObjectPropertyAddress(mSelector: sel, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        var v = initial
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(obj, &a, 0, nil, &size, &v) == 0 ? v : nil
+    }
+
+    static func defaultInput() -> AudioDeviceID? {
+        get(AudioObjectID(kAudioObjectSystemObject), kAudioHardwarePropertyDefaultInputDevice, kAudioObjectPropertyScopeGlobal, AudioDeviceID(0))
+    }
+
+    static func inputs() -> [Device] {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(0)
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size) == 0 else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &ids) == 0 else { return [] }
+        return ids.compactMap { id in
+            var sa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+            var ss = UInt32(0)
+            guard AudioObjectGetPropertyDataSize(id, &sa, 0, nil, &ss) == 0, ss > 0 else { return nil }
+            var name: CFString = "" as CFString
+            var na = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            var ns = UInt32(MemoryLayout<CFString>.size)
+            _ = withUnsafeMutablePointer(to: &name) { AudioObjectGetPropertyData(id, &na, 0, nil, &ns, $0) }
+            let transport = get(id, kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal, UInt32(0)) ?? 0
+            return Device(id: id, name: name as String, transport: transport)
+        }
+    }
+
+    // メニューに出す実マイク（仮想・集約デバイスは除く）
+    static func selectable() -> [Device] {
+        inputs().filter { $0.transport != kAudioDeviceTransportTypeVirtual && $0.transport != kAudioDeviceTransportTypeAggregate }
+    }
+
+    // ミュート時の代わりのマイク。設定 fallbackMicName が優先。なければ USB マイク > 内蔵マイク
+    // dead は開いても無音だったマイク（蓋を閉じた MacBook の内蔵マイク等）
+    static func fallback(excluding primary: AudioDeviceID?, dead: Set<AudioDeviceID> = []) -> Device? {
+        let candidates = inputs().filter {
+            $0.id != primary && !dead.contains($0.id)
+                && $0.transport != kAudioDeviceTransportTypeVirtual && $0.transport != kAudioDeviceTransportTypeAggregate
+        }
+        if let want = Settings.fallbackMicName, let d = candidates.first(where: { $0.name.contains(want) }) { return d }
+        return candidates.first { $0.transport == kAudioDeviceTransportTypeUSB }
+            ?? candidates.first { $0.transport == kAudioDeviceTransportTypeBuiltIn }
+            ?? candidates.first
+    }
+}
+
+// MARK: - Model download
+
+// モデルが無ければダウンロードする（進捗を返す）。途中で失敗したら .part を残さず消す
+final class ModelDownloader: NSObject, URLSessionDownloadDelegate {
+    private var progress: ((Double) -> Void)?
+    private var done: ((Result<Void, Error>) -> Void)?
+    private let dest: URL
+
+    init(dest: String) { self.dest = URL(fileURLWithPath: dest) }
+
+    func start(progress: @escaping (Double) -> Void, done: @escaping (Result<Void, Error>) -> Void) {
+        self.progress = progress
+        self.done = done
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
+        session.downloadTask(with: Settings.modelURL).resume()
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData _: Int64,
+                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        if totalBytesExpectedToWrite > 0 { progress?(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)) }
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        let code = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else {
+            done?(.failure(NSError(domain: "Koe", code: 30, userInfo: [NSLocalizedDescriptionKey: "モデルのダウンロードに失敗しました (HTTP \(code))"])))
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.moveItem(at: location, to: dest)
+            done?(.success(()))
+        } catch {
+            done?(.failure(error))
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error { done?(.failure(error)) }
+    }
+}
+
+// MARK: - Recorder
+//
+// AVAudioEngine の入力を 16kHz mono Int16 に変換して溜める。
+// - 離した後も tailSeconds だけ録り続けて語尾の切れを防ぐ
+// - warm モードではマイクを開きっぱなしにし、押す直前 preRollSeconds 分も含めて頭切れを防ぐ
+// - デバイス変更・スリープ復帰でエンジンが止まる／無音しか来なくなるので、検知して張り直す
+// - 前後の無音は削ってから書き出す（無音が長いと whisper が「ご視聴ありがとうございました」を作る）
+// - Teams 認定のヘッドセット等は、会議でミュートすると本体側でマイクを切り、OS には完全な無音を流す。
+//   既定のマイクが無音になったら別のマイク（fallback）も開き、無音の間はそちらで録る
+
+struct Capture {
+    let url: URL
+    let seconds: Double        // 録れた長さ
+    let voicedSeconds: Double  // 無音を削った後の長さ。0 なら声が入っていない
+    let peak: Int              // 最大振幅。0 ならマイクから無音しか来ていない
+    let device: String         // 録ったマイク
+    var quality: [String: Any] = [:]   // 音質の指標（AudioQuality.measure）
+    var alt: (device: String, url: URL, quality: [String: Any])? = nil  // 使わなかった側のマイクの録音（比較用）
+}
+
+// 音質の客観指標（発話ごとに記録し、伝達の失敗との関係やマイクの比較に使う）
+//   level_db: 声の部分の平均 RMS（dBFS）/ noise_db: 背景（静かな窓の下位 10%）/ snr_db: 差
+//   clip_ratio: 振幅が上限付近に張り付いた割合 / brightness: 高い音の成分の比（こもるほど小さい）
+enum AudioQuality {
+    static func measure(_ pcm: [Int16]) -> [String: Any] {
+        let win = 480  // 30ms
+        guard pcm.count > win * 4 else { return [:] }
+        var rms: [Double] = []
+        var i = 0
+        while i + win <= pcm.count {
+            var sum = 0.0
+            for j in i..<i + win { let v = Double(pcm[j]); sum += v * v }
+            rms.append((sum / Double(win)).squareRoot())
+            i += win
+        }
+        let sorted = rms.sorted()
+        let noise = max(sorted[sorted.count / 10], 1)
+        let voiced = rms.filter { $0 > 330 }
+        guard !voiced.isEmpty else { return [:] }
+        let speech = voiced.reduce(0, +) / Double(voiced.count)
+        func db(_ x: Double) -> Double { (20 * log10(x / 32768) * 10).rounded() / 10 }
+        let clip = Double(pcm.filter { abs(Int($0)) >= 32000 }.count) / Double(pcm.count)
+        var e = 0.0, d = 0.0
+        for k in 1..<pcm.count { let a = Double(pcm[k]), b = Double(pcm[k - 1]); e += a * a; d += (a - b) * (a - b) }
+        return [
+            "level_db": db(speech), "noise_db": db(noise), "snr_db": ((20 * log10(speech / noise)) * 10).rounded() / 10,
+            "clip_ratio": (clip * 10000).rounded() / 10000, "brightness": e > 0 ? ((d / e) * 1000).rounded() / 1000 : 0,
+        ]
+    }
+}
+
+// 録音元の共通インターフェース（既定のマイクは AVAudioEngine、指定したマイクは AVCaptureSession で開く）
+protocol MicInput: AnyObject {
+    var name: String { get }
+    var deviceID: AudioDeviceID? { get }
+    var onChunk: (([Int16], Int) -> Void)? { get set }
+    var onConfigChange: (() -> Void)? { get set }
+    var isRunning: Bool { get }
+    func start() -> Bool
+    func stop()
+}
+
+// 指定したマイクを AVCaptureSession で開き、16kHz mono Int16 で受け取る。
+// AVAudioEngine でデバイスを指定すると、出力にも使われているデバイス（スピーカーフォン等）から音が来ないことがある
+final class CaptureMic: NSObject, MicInput, AVCaptureAudioDataOutputSampleBufferDelegate {
+    let name: String
+    let deviceID: AudioDeviceID?
+    var onChunk: (([Int16], Int) -> Void)?
+    var onConfigChange: (() -> Void)?
+    private let session = AVCaptureSession()
+    private let queue = DispatchQueue(label: "koe.capture")
+    private var observers: [Any] = []
+    var isRunning: Bool { session.isRunning }
+
+    init(deviceID: AudioDeviceID, name: String) {
+        self.deviceID = deviceID
+        self.name = name
+    }
+
+    private static func uid(of id: AudioDeviceID) -> String? {
+        var a = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceUID, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var uid: CFString = "" as CFString
+        var size = UInt32(MemoryLayout<CFString>.size)
+        let st = withUnsafeMutablePointer(to: &uid) { AudioObjectGetPropertyData(id, &a, 0, nil, &size, $0) }
+        return st == 0 ? uid as String : nil
+    }
+
+    func start() -> Bool {
+        guard let id = deviceID, let uid = CaptureMic.uid(of: id), let dev = AVCaptureDevice(uniqueID: uid),
+              let input = try? AVCaptureDeviceInput(device: dev) else { return false }
+        let output = AVCaptureAudioDataOutput()
+        output.audioSettings = [
+            AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: Recorder.sampleRate, AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false, AVLinearPCMIsBigEndianKey: false, AVLinearPCMIsNonInterleaved: false,
+        ]
+        output.setSampleBufferDelegate(self, queue: queue)
+        session.beginConfiguration()
+        guard session.canAddInput(input), session.canAddOutput(output) else { session.commitConfiguration(); return false }
+        session.addInput(input)
+        session.addOutput(output)
+        session.commitConfiguration()
+        for n in [AVCaptureSession.runtimeErrorNotification, AVCaptureSession.wasInterruptedNotification] {
+            observers.append(NotificationCenter.default.addObserver(forName: n, object: session, queue: .main) { [weak self] _ in self?.onConfigChange?() })
+        }
+        session.startRunning()
+        return session.isRunning
+    }
+
+    func stop() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers = []
+        session.stopRunning()
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        var length = 0
+        var ptr: UnsafeMutablePointer<CChar>?
+        guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &ptr) == 0,
+              let ptr else { return }
+        let count = length / MemoryLayout<Int16>.size
+        let chunk = ptr.withMemoryRebound(to: Int16.self, capacity: count) { Array(UnsafeBufferPointer(start: $0, count: count)) }
+        let peak = chunk.reduce(0) { max($0, abs(Int($1))) }
+        onChunk?(chunk, peak)
+    }
+}
+
+// 1 つの入力デバイスを開いて 16kHz mono に変換し続ける（既定のマイク用）
+final class MicSource: MicInput {
+    var isRunning: Bool { engine.isRunning }
+    let engine = AVAudioEngine()
+    let deviceID: AudioDeviceID?
+    let name: String
+    private var converter: AVAudioConverter?
+    private let outFormat: AVAudioFormat
+    private var configObserver: Any?
+    var onChunk: (([Int16], Int) -> Void)?
+    var onConfigChange: (() -> Void)?
+
+    init(deviceID: AudioDeviceID?, name: String, outFormat: AVAudioFormat) {
+        self.deviceID = deviceID
+        self.name = name
+        self.outFormat = outFormat
+    }
+
+    func start() -> Bool {
+        let input = engine.inputNode
+        if var id = deviceID, let unit = input.audioUnit {
+            AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                                 &id, UInt32(MemoryLayout<AudioDeviceID>.size))
+        }
+        let inFormat = input.outputFormat(forBus: 0)
+        guard inFormat.sampleRate > 0, let conv = AVAudioConverter(from: inFormat, to: outFormat) else { return false }
+        converter = conv
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in self?.consume(buf) }
+        do {
+            engine.prepare()
+            try engine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            return false
+        }
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            self?.onConfigChange?()
+        }
+        return true
+    }
+
+    func stop() {
+        if let o = configObserver { NotificationCenter.default.removeObserver(o) }
+        configObserver = nil
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+    }
+
+    private func consume(_ buf: AVAudioPCMBuffer) {
+        guard let conv = converter else { return }
+        let ratio = outFormat.sampleRate / buf.format.sampleRate
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * ratio) + 64
+        guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: cap) else { return }
+        var fed = false
+        var err: NSError?
+        conv.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true
+            status.pointee = .haveData
+            return buf
+        }
+        guard err == nil, let ch = out.int16ChannelData else { return }
+        let chunk = Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
+        let peak = chunk.reduce(0) { max($0, abs(Int($1))) }
+        onChunk?(chunk, peak)
+    }
+}
+
+final class Recorder {
+    static let sampleRate = 16000.0
+    let preRollSeconds = 0.5
+    let tailSeconds = 0.25
+    // 30ms 窓の RMS がこれを超えたら声とみなす（約 -40 dBFS）
+    let voiceThreshold = 330.0
+    // 部屋の雑音でも peak は数十ある。これ以下はミュート（本体で切られている）か入力停止
+    let mutedPeak = 2
+
+    // 1 つのマイクの録音バッファ
+    final class Track {
+        let source: MicInput
+        var samples: [Int16] = []
+        var preRoll: [Int16] = []
+        var lastPeakAt = Date.distantPast
+        init(_ s: MicInput) { source = s }
+    }
+
+    private let lock = NSLock()
+    private let outFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Recorder.sampleRate,
+                                          channels: 1, interleaved: true)!
+    // tracks[0] が主のマイク。自動モードでは代わりのマイクも同時に開き、離した後に声が入っている方を使う
+    private var tracks: [Track] = []
+    private var primaryDeviceID: AudioDeviceID?
+    private var recording = false
+    private var lastBufferAt = Date.distantPast
+    private var restartPending = false
+    private(set) var warm = false
+    var onRestart: ((String) -> Void)?
+    var onSourceChange: ((String) -> Void)?
+
+    private var dir: URL { WhisperServer.logURL.deletingLastPathComponent() }
+    private var running: Bool { !tracks.isEmpty }
+
+    var activeName: String {
+        lock.lock(); defer { lock.unlock() }
+        guard let p = tracks.first else { return "-" }
+        return tracks.count > 1 ? "\(p.source.name)（ミュート中は \(tracks[1].source.name)）" : p.source.name
+    }
+
+    // 主のマイクが直近 1 秒ずっと無音ならミュート中とみなす（表示用）
+    var primaryMuted: Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let p = tracks.first else { return false }
+        return Date().timeIntervalSince(p.lastPeakAt) > 1.0
+    }
+
+    var fallbackName: String? {
+        AudioDevices.fallback(excluding: primaryDeviceID ?? AudioDevices.defaultInput())?.name
+    }
+
+    func reopen() {
+        stopEngine()
+        if warm { _ = startEngine() }
+    }
+
+    func setWarm(_ on: Bool) {
+        warm = on
+        if on { _ = startEngine() } else if !isRecording { stopEngine() }
+    }
+
+    private var isRecording: Bool { lock.lock(); defer { lock.unlock() }; return recording }
+
+    private func open(_ deviceID: AudioDeviceID?, name: String, isPrimary: Bool) -> Track? {
+        let src: MicInput = deviceID.map { CaptureMic(deviceID: $0, name: name) } ?? MicSource(deviceID: nil, name: name, outFormat: outFormat)
+        let track = Track(src)
+        src.onChunk = { [weak self, weak track] chunk, peak in
+            guard let self, let track else { return }
+            self.append(chunk, peak: peak, to: track)
+        }
+        src.onConfigChange = { [weak self, weak src] in
+            guard let self, let src else { return }
+            // 既定のマイクが変わった／エンジンが止まったときだけ張り直す（他のデバイスを開いた通知は無視）
+            let defaultChanged = isPrimary && Settings.micName == nil && AudioDevices.defaultInput() != self.primaryDeviceID
+            if !src.isRunning || defaultChanged { self.scheduleRestart(reason: "config_change") }
+        }
+        return src.start() ? track : nil
+    }
+
+    private func startEngine() -> Bool {
+        if running { return true }
+        // マイクを選んでいればそれを、自動なら既定のマイクを使う
+        let fixed = Settings.micName.flatMap { want in AudioDevices.selectable().first { $0.name == want } }
+        let id = fixed?.id ?? AudioDevices.defaultInput()
+        let name = fixed?.name ?? AudioDevices.inputs().first { $0.id == id }?.name ?? "default"
+        primaryDeviceID = id
+        // 既定のマイクはデバイスを指定せずに開く（指定すると構成変更の通知が出て張り直しが連鎖する）
+        guard let primary = open(fixed?.id, name: name, isPrimary: true) else { return false }
+        var list = [primary]
+        if Settings.fallbackMic, fixed == nil, let dev = AudioDevices.fallback(excluding: id),
+           let fb = open(dev.id, name: dev.name, isPrimary: false) {
+            list.append(fb)
+        }
+        lock.lock()
+        tracks = list
+        lastBufferAt = Date()
+        lock.unlock()
+        onSourceChange?(activeName)
+        return true
+    }
+
+    private func stopEngine() {
+        lock.lock()
+        let old = tracks
+        tracks = []
+        lock.unlock()
+        old.forEach { $0.source.stop() }
+    }
+
+    private func scheduleRestart(reason: String) {
+        guard !restartPending else { return }
+        restartPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.restartPending = false
+            self.restart(reason: reason)
+        }
+    }
+
+    private func restart(reason: String) {
+        stopEngine()
+        if warm || isRecording { _ = startEngine() }
+        onRestart?(reason)
+    }
+
+    private func append(_ chunk: [Int16], peak: Int, to track: Track) {
+        lock.lock()
+        defer { lock.unlock() }
+        if track === tracks.first { lastBufferAt = Date() }
+        if peak > mutedPeak { track.lastPeakAt = Date() }
+        if recording {
+            track.samples.append(contentsOf: chunk)
+        } else {
+            track.preRoll.append(contentsOf: chunk)
+            let maxPre = Int(preRollSeconds * Recorder.sampleRate)
+            if track.preRoll.count > maxPre { track.preRoll.removeFirst(track.preRoll.count - maxPre) }
+        }
+    }
+
+    func start() -> Bool {
+        // 主のマイクから 1 秒以上音が来ていなければエンジンが止まっているので張り直す
+        lock.lock(); let stale = running && Date().timeIntervalSince(lastBufferAt) > 1.0; lock.unlock()
+        if stale { restart(reason: "stalled") }
+        if !startEngine() { return false }
+        lock.lock()
+        for t in tracks {
+            t.samples = warm ? t.preRoll : []
+            t.preRoll.removeAll()
+        }
+        recording = true
+        lock.unlock()
+        return true
+    }
+
+    func stop(_ done: @escaping (Capture) -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + tailSeconds) {
+            self.lock.lock()
+            self.recording = false
+            let takes = self.tracks.map { ($0.source.name, $0.samples) }
+            self.tracks.forEach { $0.samples.removeAll() }
+            self.lock.unlock()
+            if !self.warm { self.stopEngine() }
+            // 主のマイクに声が入っていればそれを、なければ代わりのマイクを使う
+            var chosen = takes.first ?? ("-", [])
+            var trimmed = self.trimSilence(chosen.1)
+            if trimmed.isEmpty, takes.count > 1 {
+                let alt = self.trimSilence(takes[1].1)
+                if !alt.isEmpty { chosen = takes[1]; trimmed = alt }
+            }
+            let captured = chosen.1
+            let peak = captured.reduce(0) { max($0, abs(Int($1))) }
+            // どのマイクも完全な無音ならエンジンが固まっている可能性。次に備えて張り直す
+            let allSilent = takes.allSatisfy { $0.1.reduce(0) { max($0, abs(Int($1))) } <= self.mutedPeak }
+            if allSilent && captured.count > Int(Recorder.sampleRate * 0.5) { self.restart(reason: "digital_silence") }
+            let url = self.dir.appendingPathComponent("rec-\(UUID().uuidString).wav")
+            self.writeWAV(trimmed.isEmpty ? captured : trimmed, to: url)
+            // 各マイクから届いた量（比較用の録音が保存されないときの切り分け用）
+            Events.log("tracks", ["tracks": takes.map { "\($0.0): \(String(format: "%.1f", Double($0.1.count) / Recorder.sampleRate))s peak \($0.1.reduce(0) { max($0, abs(Int($1))) })" }.joined(separator: " / ")])
+            var cap = Capture(url: url, seconds: Double(captured.count) / Recorder.sampleRate,
+                              voicedSeconds: Double(trimmed.count) / Recorder.sampleRate, peak: peak, device: chosen.0)
+            cap.quality = AudioQuality.measure(captured)
+            // 比較用に、使わなかった側のマイクの録音も残す（同じ発話のマイク違い）
+            if Settings.saveAllMics, let other = takes.first(where: { $0.0 != chosen.0 }), !other.1.isEmpty {
+                let altURL = self.dir.appendingPathComponent("rec-\(UUID().uuidString).alt.wav")
+                self.writeWAV(other.1, to: altURL)
+                cap.alt = (other.0, altURL, AudioQuality.measure(other.1))
+            }
+            done(cap)
+        }
+    }
+
+    func discard() {
+        lock.lock()
+        recording = false
+        tracks.forEach { $0.samples.removeAll() }
+        lock.unlock()
+        if !warm { stopEngine() }
+    }
+
+    private func trimSilence(_ pcm: [Int16]) -> [Int16] {
+        let win = Int(Recorder.sampleRate * 0.03)
+        guard pcm.count > win else { return [] }
+        func loud(_ i: Int) -> Bool {
+            let end = min(i + win, pcm.count)
+            var sum = 0.0
+            for j in i..<end { let v = Double(pcm[j]); sum += v * v }
+            return (sum / Double(end - i)).squareRoot() > voiceThreshold
+        }
+        guard let first = stride(from: 0, to: pcm.count, by: win).first(where: loud),
+              let last = stride(from: pcm.count - win, through: 0, by: -win).first(where: loud) else { return [] }
+        let s = max(0, first - Int(Recorder.sampleRate * 0.25))
+        let e = min(pcm.count, last + win + Int(Recorder.sampleRate * 0.3))
+        return Array(pcm[s..<e])
+    }
+
+    private func writeWAV(_ pcm: [Int16], to url: URL) {
+        var d = Data()
+        func u32(_ v: UInt32) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
+        func u16(_ v: UInt16) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 2)) }
+        let dataSize = UInt32(pcm.count * 2)
+        d.append("RIFF".data(using: .ascii)!); u32(36 + dataSize)
+        d.append("WAVE".data(using: .ascii)!)
+        d.append("fmt ".data(using: .ascii)!); u32(16); u16(1); u16(1)
+        u32(UInt32(Recorder.sampleRate)); u32(UInt32(Recorder.sampleRate) * 2); u16(2); u16(16)
+        d.append("data".data(using: .ascii)!); u32(dataSize)
+        pcm.withUnsafeBufferPointer { d.append(Data(buffer: $0)) }
+        try? d.write(to: url)
+    }
+}
+
+// MARK: - LLM cleanup
+//
+// OpenAI 互換の chat/completions に投げて文字起こしを整形する。
+// 既定は Ollama (localhost:11434)。LM Studio や LiteLLM にも同じ設定で向けられる。
+// 失敗・タイムアウト時は呼び出し側で生の文字起こしにフォールバックする。
+
+enum Cleaner {
+    // 整形の指示は Resources/cleanup_prompt.txt（評価スクリプトと共用）
+    static var systemPrompt: String {
+        guard let url = Bundle.main.url(forResource: "cleanup_prompt", withExtension: "txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
+        return text
+    }
+
+    static func prompt() -> String {
+        var p = systemPrompt
+        let block = Glossary.llmBlock
+        if !block.isEmpty {
+            p += "\n\n以下は固有名詞・社内用語の一覧です（「表記 ← 読み・別名」）。音が近い語はこの表記に直してください。\n\(block)"
+        }
+        return p
+    }
+
+    static func clean(_ text: String, done: @escaping (Result<String, Error>) -> Void) {
+        request(messages: [
+            ["role": "system", "content": prompt()],
+            ["role": "user", "content": "<transcript>\(text)</transcript>"],
+        ], timeout: Settings.llmTimeout, done: done)
+    }
+
+    // モデルをメモリに載せておくための空打ち
+    static func warmUp() {
+        request(messages: [["role": "user", "content": "ok"]], timeout: 120, maxTokens: 1) { _ in }
+    }
+
+    private static func request(messages: [[String: String]], timeout: Double, maxTokens: Int? = nil,
+                                done: @escaping (Result<String, Error>) -> Void) {
+        guard let url = URL(string: Settings.llmEndpoint)?.appendingPathComponent("chat/completions") else {
+            return done(.failure(NSError(domain: "Koe", code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "LLM エンドポイントが不正です"])))
+        }
+        var body: [String: Any] = [
+            "model": Settings.llmModel,
+            "messages": messages,
+            "temperature": 0,
+            "stream": false,
+        ]
+        if let maxTokens { body["max_tokens"] = maxTokens }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let key = Settings.llmAPIKey { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        URLSession.shared.dataTask(with: req) { data, resp, error in
+            if let error { return done(.failure(error)) }
+            guard let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let choices = json["choices"] as? [[String: Any]],
+                  let message = choices.first?["message"] as? [String: Any],
+                  let content = message["content"] as? String else {
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                return done(.failure(NSError(domain: "Koe", code: 11,
+                    userInfo: [NSLocalizedDescriptionKey: "LLM の応答を読めませんでした (HTTP \(code))"])))
+            }
+            // 思考モデルの <think> ブロックは捨てる
+            let cleaned = content
+                .replacingOccurrences(of: "(?s)<think>.*?</think>", with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            done(.success(cleaned))
+        }.resume()
+    }
+}
+
+// MARK: - History
+//
+// ~/Library/Application Support/Koe/history/YYYY-MM-DD/<id>.wav + <id>.json
+// json の reference は空で保存し、評価時に正解テキストを入れる（eval/koe_eval.py）
+
+enum History {
+    static var dir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Koe/history", isDirectory: true)
+    }
+
+    static func newID() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH-mm-ss-SSS"
+        return f.string(from: Date())
+    }
+
+    // ② 直近 days 日の伝達判定（改善ループが付ける）
+    static func communication(days: Int) -> (ok: Int, judged: Int) {
+        let fm = FileManager.default
+        let names = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted().suffix(days)
+        var ok = 0, ng = 0
+        for d in names {
+            let u = dir.appendingPathComponent(d)
+            for f in (try? fm.contentsOfDirectory(atPath: u.path)) ?? [] where f.hasSuffix(".json") {
+                guard let data = try? Data(contentsOf: u.appendingPathComponent(f)),
+                      let r = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let c = r["communication"] as? String else { continue }
+                if c == "understood" { ok += 1 } else if c == "corrected" { ng += 1 }
+            }
+        }
+        return (ok, ok + ng)
+    }
+
+    // 直近 n 件の貼り付けたテキスト（古い順）
+    static func recentPasted(_ n: Int) -> [(time: Date, text: String)] {
+        let fm = FileManager.default
+        let days = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted().suffix(3)
+        var files: [URL] = []
+        for d in days {
+            let u = dir.appendingPathComponent(d)
+            files += ((try? fm.contentsOfDirectory(atPath: u.path)) ?? []).filter { $0.hasSuffix(".json") }.map { u.appendingPathComponent($0) }
+        }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH-mm-ss-SSS"
+        return files.sorted { $0.lastPathComponent < $1.lastPathComponent }.suffix(n * 2).compactMap { url in
+            guard let data = try? Data(contentsOf: url),
+                  let r = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let text = r["pasted"] as? String, !text.isEmpty,
+                  let id = r["id"] as? String, let t = f.date(from: id) else { return nil }
+            return (t, text)
+        }.suffix(n).map { $0 }
+    }
+
+    static func save(id: String, wav: URL, record: [String: Any], alt: URL? = nil) {
+        let day = dir.appendingPathComponent(String(id.prefix(10)), isDirectory: true)
+        try? FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
+        var rec = record
+        if let alt {
+            try? FileManager.default.moveItem(at: alt, to: day.appendingPathComponent("\(id).alt.wav"))
+            rec["alt_audio"] = "\(id).alt.wav"
+        }
+        rec["id"] = id
+        rec["audio"] = "\(id).wav"
+        rec["reference"] = NSNull()
+        try? FileManager.default.moveItem(at: wav, to: day.appendingPathComponent("\(id).wav"))
+        if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: day.appendingPathComponent("\(id).json"))
+        }
+    }
+}
+
+// MARK: - Improvement loop
+//
+// 使うほど良くなる仕組み。新しい発話が improveBatch 件たまったら、録音していないときに動く。
+// 1. Claude Code のセッション記録（~/.claude/projects）から、発話ごとに「実際に送った文・Claude の返答・次の発話」を引く
+// 2. OpenAI 互換の LLM に渡し、誤変換された語（→正しい表記）と伝達の判定を JSON で受け取る
+// 3. 語は 2 回以上（本人の明示的な訂正なら 1 回）出てきたら、誤変換された形を別名にして個人の辞書に足す
+// 4. 伝達の判定は履歴の json に書く（koe_eval.py trend で推移を見る）
+// 発話は improveEndpoint にだけ送る。既定はオフ。
+
+enum SessionLog {
+    struct Human { let time: Date; let text: String; let reply: String; let next: String }
+
+    private static func text(of content: Any?) -> String {
+        if let s = content as? String { return s }
+        if let arr = content as? [[String: Any]] {
+            if arr.contains(where: { $0["type"] as? String == "tool_result" }) { return "" }
+            return arr.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }.joined(separator: "\n")
+        }
+        return ""
+    }
+
+    private static let iso: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    // since 以降に更新されたセッション記録から、人の発話と直後の返答・次の発話を取り出す
+    static func load(since: Date) -> [Human] {
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let fm = FileManager.default
+        var out: [Human] = []
+        for dir in (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+            for f in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] where f.pathExtension == "jsonl" {
+                let m = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                guard m >= since, let data = try? String(contentsOf: f, encoding: .utf8) else { continue }
+                // (時刻, 種類, テキスト)。種類 0=Claude の返答 1=入力欄から送った発話 2=Claude の作業中に送った発話（キュー）
+                var events: [(Date, Int, String)] = []
+                for line in data.split(separator: "\n") {
+                    guard let d = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                          let type = d["type"] as? String, let ts = d["timestamp"] as? String,
+                          let t = iso.date(from: ts) ?? ISO8601DateFormatter().date(from: ts) else { continue }
+                    if type == "queue-operation" {
+                        if d["operation"] as? String == "enqueue", let c = d["content"] as? String, !c.isEmpty { events.append((t, 2, c)) }
+                    } else if type == "user" {
+                        let s = text(of: (d["message"] as? [String: Any])?["content"]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !s.isEmpty, !s.hasPrefix("<"), !s.hasPrefix("Another Claude session"), d["isMeta"] as? Bool != true { events.append((t, 1, s)) }
+                    } else if type == "assistant" {
+                        let s = text(of: (d["message"] as? [String: Any])?["content"])
+                        if !s.isEmpty { events.append((t, 0, s)) }
+                    }
+                }
+                // 返答は、次に入力欄から送るまでの Claude の発言を全部（作業中に送った発話はまたぐ）
+                for (i, e) in events.enumerated() where e.1 != 0 && e.0 >= since {
+                    var reply = "", next = ""
+                    for e2 in events[(i + 1)...] {
+                        if e2.1 != 0, next.isEmpty { next = e2.2 }
+                        if e2.1 == 1 { break }
+                        if e2.1 == 0 { reply += e2.2 + "\n" }
+                    }
+                    out.append(Human(time: e.0, text: e.2, reply: String(reply.prefix(400)), next: String(next.prefix(200))))
+                }
+            }
+        }
+        return out
+    }
+
+    static func normalize(_ s: String) -> String {
+        String(s.unicodeScalars.filter { !CharacterSet.whitespacesAndNewlines.contains($0) && !CharacterSet.punctuationCharacters.contains($0) })
+    }
+
+    // 発話の時刻から 20 秒以内（貼り付けは数秒で届く。広げると手で貼り直した発言と誤一致する）に、同じ文面（先頭か末尾の 12 文字が含まれる）で送られた人の発話
+    static func match(_ text: String, at time: Date, in humans: [Human]) -> Human? {
+        let n = normalize(text)
+        guard n.count >= 4 else { return nil }
+        let head = String(n.prefix(12)), tail = String(n.suffix(12))
+        return humans.first { h in
+            h.time >= time.addingTimeInterval(-5) && h.time <= time.addingTimeInterval(20)
+                && { let s = normalize(h.text); return s.contains(head) || s.contains(tail) }()
+        }
+    }
+}
+
+final class Improver {
+    private(set) var running = false
+    private(set) var lastRun: String?
+    var onFinish: ((String) -> Void)?
+
+    private var koeDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe")
+    }
+
+    // 改善に使っていない発話（直近 7 日）。judgeOnly のときは、語は拾ったが伝達の判定が付いていない発話（判定を 2 回まで試す）
+    private func unscanned(judgeOnly: Bool = false) -> [(URL, [String: Any])] {
+        let fm = FileManager.default
+        let hist = History.dir
+        let days = ((try? fm.contentsOfDirectory(atPath: hist.path)) ?? []).sorted().suffix(7)
+        var out: [(URL, [String: Any])] = []
+        for d in days {
+            let dir = hist.appendingPathComponent(d)
+            for f in ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted() where f.hasSuffix(".json") {
+                let url = dir.appendingPathComponent(f)
+                guard let data = try? Data(contentsOf: url),
+                      let r = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      r["dropped"] as? Bool != true,
+                      let raw = r["raw"] as? String, !raw.isEmpty else { continue }
+                if judgeOnly {
+                    guard r["glossary_scanned"] as? Bool == true, r["communication"] == nil, r["pasted"] is String,
+                          (r["judge_attempts"] as? Int ?? 0) < 2 else { continue }
+                } else if r["glossary_scanned"] as? Bool == true { continue }
+                out.append((url, r))
+            }
+        }
+        return out
+    }
+
+    var pendingCount: Int { unscanned().count }
+
+    func runIfNeeded(force: Bool = false) {
+        guard Settings.improveEnabled, !running else { return }
+        if Settings.improveProvider == "api" && Settings.improveEndpoint.isEmpty { return }
+        var items = unscanned()
+        var judgeOnly = false
+        if !(force ? !items.isEmpty : items.count >= Settings.improveBatch) {
+            // 新しい発話が溜まっていなければ、判定が抜けた発話を判定だけやり直す
+            items = unscanned(judgeOnly: true)
+            judgeOnly = true
+            guard !items.isEmpty else { return }
+        }
+        running = true
+        let batch = judgeOnly ? Array(items.suffix(30)) : Array(items.suffix(60))
+        DispatchQueue.global(qos: .utility).async {
+            let summary: String
+            do { summary = try self.run(batch, judgeOnly: judgeOnly) } catch { summary = "失敗: \(error.localizedDescription)" }
+            DispatchQueue.main.async {
+                self.running = false
+                self.lastRun = summary
+                Events.log("improve", ["summary": summary])
+                self.onFinish?(summary)
+            }
+        }
+    }
+
+    private static let idFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd'T'HH-mm-ss-SSS"
+        return f
+    }()
+
+    private func run(_ items: [(URL, [String: Any])], judgeOnly: Bool = false) throws -> String {
+        let times = items.compactMap { ($0.1["id"] as? String).flatMap { Improver.idFormat.date(from: $0) } }
+        let humans = SessionLog.load(since: (times.min() ?? Date()).addingTimeInterval(-3600))
+        var lines: [String] = []
+        for (i, (_, r)) in items.enumerated() {
+            let raw = r["raw"] as? String ?? ""
+            var line = "[\(i)] 文字起こし: \(raw)"
+            if let t = (r["id"] as? String).flatMap({ Improver.idFormat.date(from: $0) }),
+               let h = SessionLog.match(r["pasted"] as? String ?? raw, at: t, in: humans) {
+                if SessionLog.normalize(h.text) != SessionLog.normalize(raw) { line += "\n  実際に送った文: \(h.text.prefix(300))" }
+                line += "\n  Claude の返答: \(h.reply.isEmpty ? "（なし）" : h.reply)"
+                line += "\n  次の発話: \(h.next.isEmpty ? "（なし）" : h.next)"
+            } else {
+                line += "\n  （Claude Code のセッション記録なし）"
+            }
+            lines.append(line)
+        }
+        let known = (Glossary.personal + Glossary.org).map(\.term).prefix(400).joined(separator: "、")
+        let system = Improver.prompt
+        let user = "既に辞書にある語: \(known)\n\n" + lines.joined(separator: "\n\n")
+        func ask() throws -> [String: Any] {
+            let content = Settings.improveProvider == "api"
+                ? try LLM.chat(endpoint: Settings.improveEndpoint, model: Settings.improveModel, auth: Settings.improveAuth(),
+                               system: system, user: user, timeout: 180)
+                : try LLM.command(Settings.improveCommand, prompt: system + "\n\n---\n\n" + user, timeout: 300)
+            // 解析に失敗したときの調査用に、直近の応答をローカルに残す
+            try? content.write(to: koeDir.appendingPathComponent("improve_last_response.txt"), atomically: true, encoding: .utf8)
+            guard let s = content.firstIndex(of: "{"), let e = content.lastIndex(of: "}"),
+                  let json = try? JSONSerialization.jsonObject(with: Data(content[s...e].utf8)) as? [String: Any] else {
+                throw NSError(domain: "Koe", code: 20, userInfo: [NSLocalizedDescriptionKey: "改善ループの応答を読めませんでした"])
+            }
+            return json
+        }
+        // LLM が judgements を丸ごと省くことがある。1 回だけ聞き直し、それでも無ければ処理済みにせず次回に回す
+        var json = try ask()
+        if (json["judgements"] as? [Any])?.isEmpty ?? true { json = try ask() }
+        if (json["judgements"] as? [Any])?.isEmpty ?? true {
+            if judgeOnly {
+                for (url, r) in items {
+                    var rec = r
+                    rec["judge_attempts"] = (r["judge_attempts"] as? Int ?? 0) + 1
+                    if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: url) }
+                }
+            }
+            throw NSError(domain: "Koe", code: 21, userInfo: [NSLocalizedDescriptionKey: "改善ループの応答に伝達の判定がありませんでした（次回やり直す）"])
+        }
+        // 伝達の判定を履歴に書く
+        var judged = 0, failed = 0
+        let judgements = json["judgements"] as? [[String: Any]] ?? []
+        var byIndex: [Int: [String: Any]] = [:]
+        for j in judgements { if let i = j["i"] as? Int { byIndex[i] = j } }
+        for (i, (url, r)) in items.enumerated() {
+            var rec = r
+            if let j = byIndex[i], let label = Improver.label(j) {
+                rec["communication"] = label
+                rec["communication_note"] = j["reason"] as? String ?? ""
+                judged += 1
+                if label == "corrected" { failed += 1 }
+            }
+            rec["glossary_scanned"] = true
+            if judgeOnly { rec["judge_attempts"] = (r["judge_attempts"] as? Int ?? 0) + 1 }
+            if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: url) }
+        }
+        // 語を候補に積み、条件を満たしたら個人の辞書へ（判定のやり直しでは、語は前回数えたので数えない）
+        if judgeOnly { return "判定のやり直し \(items.count) 件（判定 \(judged)、伝わらなかった \(failed)）" }
+        let added = mergeTerms(json["terms"] as? [[String: Any]] ?? [])
+        return "\(items.count) 件を処理（判定 \(judged)、伝わらなかった \(failed)）。辞書に追加: \(added.isEmpty ? "なし" : added.joined(separator: "、"))"
+    }
+
+    // ラベルは LLM に直接選ばせず、段階ごとの答えから決める（LLM は「読み替えた」と書きながら corrected を付けがち）
+    static func label(_ j: [String: Any]) -> String? {
+        if j["unknown"] as? Bool == true { return "unclear" }
+        if let err = j["error"] as? Bool {
+            if !err { return "understood" }
+            return j["read_ok"] as? Bool == true ? "understood" : "corrected"
+        }
+        if let l = j["label"] as? String, ["understood", "corrected", "unclear"].contains(l) { return l }
+        return nil
+    }
+    private func mergeTerms(_ terms: [[String: Any]]) -> [String] {
+        let candURL = koeDir.appendingPathComponent("glossary_candidates.json")
+        var cand = (try? JSONSerialization.jsonObject(with: Data(contentsOf: candURL))) as? [String: [String: Any]] ?? [:]
+        var promote: [String: [String]] = [:]
+        for t in terms {
+            guard let right = (t["right"] as? String)?.trimmingCharacters(in: .whitespaces), (2...30).contains(right.count),
+                  let wrong = (t["wrong"] as? String)?.trimmingCharacters(in: .whitespaces), !wrong.isEmpty, wrong != right,
+                  // 語ではなく文・注記になっているもの（「(聞き取り不能)」「〜、〜のやつ」）は辞書に入れない
+                  wrong.count <= 15, !wrong.contains("、"), !right.contains("("), !right.contains("（") else { continue }
+            var c = cand[right] ?? ["count": 0, "wrongs": [String]()]
+            // 人の名前・呼び名は個人の辞書にだけ使い、共有パックへの提案には回さない印
+            if t["kind"] as? String == "person" { c["person"] = true }
+            c["count"] = (c["count"] as? Int ?? 0) + 1
+            var wrongs = c["wrongs"] as? [String] ?? []
+            if !wrongs.contains(wrong) { wrongs.append(wrong) }
+            c["wrongs"] = wrongs
+            if t["explicit"] as? Bool == true { c["explicit"] = true }
+            cand[right] = c
+            // 本人が正しい表記を示した語は確かな置き換え、回数だけで上げた語は「~」（受け取る AI へのメモだけ。勝手に置き換えない）
+            let sure = c["explicit"] as? Bool == true
+            if (c["count"] as? Int ?? 0) >= 2 || sure { promote[right] = wrongs.map { sure ? $0 : "~" + $0 } }
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: cand, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: candURL) }
+        guard !promote.isEmpty else { return [] }
+        // 個人の辞書を更新（既にある語は別名を足す。上限 300 語。whisper に渡すのは最近使った語だけなので、辞書は大きくてよい）
+        let path = (Settings.glossaryPath as NSString).expandingTildeInPath
+        var lines = ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "# Koe 個人の辞書（改善ループが自動で育てる。不要な語は消してよい）\n")
+            .split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var added: [String] = []
+        for (term, wrongs) in promote {
+            if let i = lines.firstIndex(where: { $0.split(separator: "\t").first.map(String.init)?.trimmingCharacters(in: .whitespaces) == term }) {
+                let e = Glossary.parse(lines[i]).first
+                let merged = Array(Set((e?.aliases ?? []) + wrongs)).sorted()
+                lines[i] = term + "\t" + merged.joined(separator: "／")
+            } else if Glossary.personal.count + added.count < 300 {
+                lines.insert(term + "\t" + wrongs.joined(separator: "／"), at: min(1, lines.count))
+                added.append(term)
+            }
+        }
+        try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
+        Glossary.exportForReceivers()
+        return added
+    }
+
+    static let prompt = """
+    あなたは音声入力アプリの改善係です。音声認識（whisper）で文字起こしして AI エージェント（Claude Code 等）に送った発話の一覧が渡されます。各発話には、分かる場合は実際に送った文・Claude の返答・本人の次の発話が付いています。
+    次の 2 つを JSON だけで返してください。
+
+    1. terms: 誤変換された語と正しい表記
+       - 技術用語・英字略語・サービス名・社内用語・プロダクト名、人の名前・呼び名（ハンドル名・あだ名）が対象。普通の日本語の言い回しは対象外
+       - 人の名前・呼び名には kind: "person"、それ以外は kind: "term" を付ける（人の名前は本人の Mac の個人の辞書にだけ入り、共有されない）
+       - wrong は文字起こしに実際に含まれる文字列。right は正しい表記（2〜30 文字）
+       - 本人の次の発話や送った文の手直しで正しい表記が明示されているか、Claude が「〜と読みました」「〜のことですか？」と読み替えて本人が否定していなければ explicit: true
+       - 確信がなければ出さない。既に辞書にある語でも、新しい誤変換の形が見つかれば出す
+    2. judgements: 各発話について、次の 3 つに true / false で答える
+       - error: 文字起こしに、意味を変える誤り（誤変換・欠け・幻聴の繰り返し）があるか。Claude の答えの良し悪し・本人の反論や不満は関係ない
+       - read_ok: error が true のとき、Claude が正しい意味に読み替えて応じたか（「〜と読み替えました」と添えた場合も true）。違う意味で動いた／意味を確認する質問をした／その部分を無視した／本人が誤った語を言い直した、なら false
+       - unknown: 返答も次の発話もなく判断できないときだけ true
+       - reason は 30 文字以内。発話の本文は写さない
+       - judgements は、すべての発話 [0]〜[最後] について 1 件ずつ必ず出す（terms が空でも省かない）
+
+    {"terms": [{"wrong": "...", "right": "...", "kind": "term", "explicit": false}], "judgements": [{"i": 0, "error": false, "read_ok": true, "unknown": false, "reason": "..."}]}
+    """
+}
+
+// OpenAI 互換の chat/completions、またはコマンド（標準入力→標準出力）を同期で呼ぶ（バックグラウンドから使う）
+enum LLM {
+    static func command(_ cmd: String, prompt: String, timeout: Double) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", cmd]  // ログインシェルで PATH を通す（claude などは ~/.local/bin にある）
+        let input = Pipe(), output = Pipe(), errput = Pipe()
+        p.standardInput = input
+        p.standardOutput = output
+        p.standardError = errput
+        try p.run()
+        input.fileHandleForWriting.write(Data(prompt.utf8))
+        try? input.fileHandleForWriting.close()
+        let deadline = Date().addingTimeInterval(timeout)
+        var out = Data()
+        let reader = DispatchQueue(label: "koe.llm.read")
+        let sem = DispatchSemaphore(value: 0)
+        reader.async { out = output.fileHandleForReading.readDataToEndOfFile(); sem.signal() }
+        if sem.wait(timeout: .now() + max(1, deadline.timeIntervalSinceNow)) == .timedOut {
+            p.terminate()
+            throw NSError(domain: "Koe", code: 25, userInfo: [NSLocalizedDescriptionKey: "コマンドがタイムアウトしました: \(cmd)"])
+        }
+        p.waitUntilExit()
+        let text = String(data: out, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard p.terminationStatus == 0, !text.isEmpty else {
+            let err = String(data: errput.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw NSError(domain: "Koe", code: 26, userInfo: [NSLocalizedDescriptionKey: "コマンドが失敗しました（\(p.terminationStatus)）: \(err.prefix(200))"])
+        }
+        return text
+    }
+
+    static func chat(endpoint: String, model: String, auth: String?, system: String, user: String, timeout: Double) throws -> String {
+        guard let url = URL(string: endpoint)?.appendingPathComponent("chat/completions") else {
+            throw NSError(domain: "Koe", code: 21, userInfo: [NSLocalizedDescriptionKey: "エンドポイントが不正です"])
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = timeout
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let auth { req.setValue("Bearer \(auth)", forHTTPHeaderField: "Authorization") }
+        req.httpBody = try JSONSerialization.data(withJSONObject: [
+            "model": model, "temperature": 0, "max_tokens": 16000, "stream": false,
+            "messages": [["role": "system", "content": system], ["role": "user", "content": user]],
+        ])
+        let sem = DispatchSemaphore(value: 0)
+        var result: Result<String, Error> = .failure(NSError(domain: "Koe", code: 22))
+        URLSession.shared.dataTask(with: req) { data, resp, error in
+            defer { sem.signal() }
+            if let error { result = .failure(error); return }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let msg = (json["choices"] as? [[String: Any]])?.first?["message"] as? [String: Any],
+                  let content = msg["content"] as? String else {
+                result = .failure(NSError(domain: "Koe", code: 23, userInfo: [NSLocalizedDescriptionKey: "LLM の応答を読めませんでした (HTTP \(code))"]))
+                return
+            }
+            if content.isEmpty {
+                let reason = (json["choices"] as? [[String: Any]])?.first?["finish_reason"] as? String ?? "?"
+                result = .failure(NSError(domain: "Koe", code: 24, userInfo: [NSLocalizedDescriptionKey: "LLM の応答が空でした（finish_reason: \(reason)）"]))
+                return
+            }
+            result = .success(content)
+        }.resume()
+        sem.wait()
+        return try result.get()
+    }
+}
+
+// MARK: - Config import
+//
+// 配布用の設定ファイル（JSON）を読み込む。組織の辞書・改善ループや整形の LLM の接続先をまとめて配れる。
+// orgGlossary が相対パスなら設定ファイルからの相対で解決し、Application Support にコピーして使う。
+// MDM の構成プロファイルで同じキーを配ってもよい（UserDefaults の管理対象として効く）。
+
+enum ConfigImport {
+    static let keys: [(key: String, label: String)] = [
+        ("orgGlossary", "組織の辞書"),
+        ("improveProvider", "改善ループの方式（command / api）"), ("improveCommand", "改善ループのコマンド"),
+        ("improveEndpoint", "改善ループの送り先"), ("improveModel", "改善ループのモデル"),
+        ("improveAPIKey", "改善ループの API キー"), ("improveTokenCommand", "改善ループのトークン取得コマンド"),
+        ("improveEnabled", "改善ループを有効にする"), ("improveBatch", "改善ループの件数"),
+        ("llmEndpoint", "整形の送り先"), ("llmModel", "整形のモデル"), ("llmAPIKey", "整形の API キー"), ("llmEnabled", "整形を有効にする"),
+        ("hotkeyKeyCode", "ホットキー"), ("language", "言語"),
+        ("packFiles", "取り込む用語パック"), ("enabledPacks", "有効にする用語パック"),
+        ("packSources", "共有の用語パックの取り込み元（gh:… / https:…）"),
+    ]
+
+    static func run() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.message = "Koe の設定ファイル（JSON）を選んでください"
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try apply(from: url) } catch {
+            let a = NSAlert(error: error)
+            a.runModal()
+        }
+    }
+
+    static func apply(from url: URL) throws {
+        let data = try Data(contentsOf: url)
+        guard var cfg = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "Koe", code: 40, userInfo: [NSLocalizedDescriptionKey: "設定ファイルが JSON のオブジェクトではありません"])
+        }
+        let known = Set(keys.map(\.key))
+        let unknown = cfg.keys.filter { !known.contains($0) }.sorted()
+        cfg = cfg.filter { known.contains($0.key) }
+        // 組織の辞書が相対パスなら、設定ファイルと同じフォルダから取り込む
+        var glossaryFile: URL?
+        if let g = cfg["orgGlossary"] as? String, !g.hasPrefix("http"), !g.hasPrefix("/"), !g.hasPrefix("~") {
+            glossaryFile = url.deletingLastPathComponent().appendingPathComponent(g)
+        }
+        var lines: [String] = []
+        for (key, label) in keys {
+            guard let v = cfg[key] else { continue }
+            let shown = key.hasSuffix("APIKey") ? "（設定あり・非表示）" : "\(v)"
+            lines.append("・\(label): \(shown)")
+        }
+        let a = NSAlert()
+        a.messageText = "この設定を読み込みますか？"
+        var info = lines.joined(separator: "\n")
+        if let cmd = cfg["improveTokenCommand"] as? String, !cmd.isEmpty {
+            info += "\n\n⚠️ トークン取得コマンドは、この Mac 上でそのまま実行されます。配布元を信頼できる場合だけ読み込んでください:\n\(cmd)"
+        }
+        if let cmd = cfg["improveCommand"] as? String, !cmd.isEmpty {
+            info += "\n\n⚠️ 改善ループのコマンドは、この Mac 上でそのまま実行されます:\n\(cmd)"
+        }
+        if cfg["improveEnabled"] as? Bool == true {
+            info += "\n\n⚠️ 改善ループが有効になり、発話の文字起こしとセッション記録の該当部分が送られます。"
+        }
+        if !unknown.isEmpty { info += "\n\n（使わないキー: \(unknown.joined(separator: ", "))）" }
+        a.informativeText = info
+        a.addButton(withTitle: "読み込む")
+        a.addButton(withTitle: "やめる")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+
+        // 用語パック（設定ファイルからの相対パス）を Application Support/Koe/packs に取り込む
+        if let files = cfg["packFiles"] as? [String] {
+            let packsDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe/packs")
+            try FileManager.default.createDirectory(at: packsDir, withIntermediateDirectories: true)
+            for f in files {
+                let src = url.deletingLastPathComponent().appendingPathComponent(f)
+                let dest = packsDir.appendingPathComponent(src.lastPathComponent)
+                try? FileManager.default.removeItem(at: dest)
+                try FileManager.default.copyItem(at: src, to: dest)
+            }
+            cfg.removeValue(forKey: "packFiles")
+        }
+        if let src = glossaryFile {
+            let dest = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Koe/org_glossary.txt")
+            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: src, to: dest)
+            cfg["orgGlossary"] = dest.path
+        }
+        for (k, v) in cfg { UserDefaults.standard.set(v, forKey: k) }
+        Glossary.refreshOrgIfNeeded()
+        Glossary.refreshPackSources(force: true)
+        Glossary.exportForReceivers()
+        Events.log("config_imported", ["keys": cfg.keys.sorted().joined(separator: ",")])
+    }
+}
+
+// MARK: - Typing into the frontmost app
+
+enum Typist {
+    static func pasteAndMaybeEnter(_ text: String, enter: Bool) {
+        let pb = NSPasteboard.general
+        let previous = pb.string(forType: .string)
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+
+        postKey(9, flags: .maskCommand) // ⌘V
+        if enter {
+            // 貼り付け直後の Enter は TUI 側で貼り付けの一部として扱われることがあるので少し待つ
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { postKey(36, flags: []) }
+        }
+        // 元のクリップボードを戻す
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard Settings.restoreClipboard, let previous else { return }
+            if pb.string(forType: .string) == text {
+                pb.clearContents()
+                pb.setString(previous, forType: .string)
+            }
+        }
+    }
+
+    private static func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
+        let src = CGEventSource(stateID: .combinedSessionState)
+        let down = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)
+        let up = CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)
+        down?.flags = flags
+        up?.flags = flags
+        down?.post(tap: .cghidEventTap)
+        up?.post(tap: .cghidEventTap)
+    }
+}
+
+// MARK: - Icon
+//
+// メニューバーのアイコン: 吹き出しの「o」（ロゴの o と同じ形）。録音中は塗りつぶす
+
+enum KoeIcon {
+    static func make(filled: Bool) -> NSImage {
+        let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSColor.black.set()
+            let w: CGFloat = 2.3
+            let ring = NSRect(x: 1.8, y: 3.25, width: 14.4, height: 13.3)
+            let tail = NSBezierPath()
+            tail.move(to: NSPoint(x: 3.6, y: 6.8))
+            tail.line(to: NSPoint(x: 2.2, y: 0.7))
+            tail.line(to: NSPoint(x: 8.1, y: 4.0))
+            tail.close()
+            tail.fill()
+            if filled {
+                NSBezierPath(ovalIn: ring).fill()
+                NSGraphicsContext.current?.compositingOperation = .destinationOut
+            } else {
+                let p = NSBezierPath(ovalIn: ring.insetBy(dx: w / 2, dy: w / 2))
+                p.lineWidth = w
+                p.stroke()
+            }
+            for (x, h) in [(6.5, 2.9), (9.0, 5.4), (11.5, 2.9)] as [(CGFloat, CGFloat)] {
+                NSBezierPath(roundedRect: NSRect(x: x - 0.95, y: 9.9 - h / 2, width: 1.9, height: h), xRadius: 0.95, yRadius: 0.95).fill()
+            }
+            return true
+        }
+        img.isTemplate = true
+        return img
+    }
+    static let outline = make(filled: false)
+    static let filled = make(filled: true)
+}
+
+// MARK: - App
+
+// MARK: - Events
+//
+// 押下ごとの結果を events.jsonl に 1 行ずつ残す。貼られなかった発話（取りこぼし）を後から数えられる。
+
+enum Events {
+    static let failures: Set<String> = ["not_ready", "start_failed", "no_voice", "mic_silent", "hallucination", "error", "cancelled"]
+
+    static var url: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Koe/events.jsonl")
+    }
+
+    static func log(_ outcome: String, _ extra: [String: Any] = [:]) {
+        var e = extra
+        e["t"] = ISO8601DateFormatter().string(from: Date())
+        e["outcome"] = outcome
+        guard var line = try? JSONSerialization.data(withJSONObject: e, options: [.sortedKeys]) else { return }
+        line.append(0x0A)
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile(); h.write(line); try? h.close()
+        } else {
+            try? line.write(to: url)
+        }
+    }
+
+    // ① 今日、押したのに入力されなかった割合の逆（Koe 内で分かる分。貼った先に届いたかは koe_eval.py trend）
+    static func pasteSuccessToday() -> (ok: Int, total: Int) {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return (0, 0) }
+        var ok = 0, ng = 0
+        let f = ISO8601DateFormatter()
+        for line in text.split(separator: "\n") {
+            guard let d = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let o = d["outcome"] as? String, let t = (d["t"] as? String).flatMap(f.date(from:)),
+                  Calendar.current.isDateInToday(t) else { continue }
+            if o == "pasted" { ok += 1 }
+            else if ["no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press"].contains(o) { ng += 1 }
+            else if o == "cancelled", d["reason"] as? String != "mouse", (d["hold_seconds"] as? Double ?? 0) >= 1.0 { ng += 1 }
+        }
+        return (ok, ok + ng)
+    }
+
+    static func failuresToday() -> Int {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+        return text.split(separator: "\n").filter { line in
+            guard let d = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let o = d["outcome"] as? String, let t = d["t"] as? String,
+                  let date = ISO8601DateFormatter().date(from: t) else { return false }
+            return failures.contains(o) && Calendar.current.isDateInToday(date)
+        }.count
+    }
+}
+
+// MARK: - App
+
+// 1 回の押下〜貼り付けまで。文字起こし中に次の録音を始められるよう、発話ごとに持つ
+final class Utterance {
+    var record: [String: Any]
+    let pressedAt = Date()
+    var capture: Capture?
+    init(app: String) { record = ["app": app] }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private let server = WhisperServer()
+    private let recorder = Recorder()
+    private var statusItem: NSStatusItem!
+    private var statusLine: NSMenuItem!
+    private var missLine: NSMenuItem!
+    private var metricsLine: NSMenuItem!
+    private var enterItem: NSMenuItem!
+    private var loginItem: NSMenuItem!
+    private var monitors: [Any] = []
+    private var hotkeyDown = false
+    private var warmItem: NSMenuItem!
+    private var soundItem: NSMenuItem!
+    private var llmItem: NSMenuItem!
+    private var historyItem: NSMenuItem!
+    private var micMenu: NSMenu!
+    private var packMenu: NSMenu!
+    private var recentMenu: NSMenu!
+    private var clipboardItem: NSMenuItem!
+    // 貼った先で消えても取り戻せるよう、直近の文字起こしを持っておく
+    private var recent: [(time: Date, text: String)] = []
+    private var recentByApp: [String: (time: Date, text: String)] = [:]
+    private let improver = Improver()
+    private var improveItem: NSMenuItem!
+    private var improveNowItem: NSMenuItem!
+    private var warmUpTimer: Timer?
+
+    private var serverReady = false { didSet { render() } }
+    private var errorMessage: String? { didSet { render() } }
+    private var current: Utterance? { didSet { render() } }   // 録音中の発話
+    private var transcribing = 0 { didSet { render() } }
+    private var cleaning = 0 { didSet { render() } }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        handleSigterm()
+        buildMenu()
+        render()
+
+        requestPermissions()
+        installMonitors()
+        recorder.onRestart = { reason in Events.log("mic_restarted", ["reason": reason]) }
+        recorder.onSourceChange = { name in
+            Events.log("mic_switched", ["device": name])
+            self.render()
+        }
+        recorder.setWarm(Settings.warmMic)
+        recent = History.recentPasted(10)
+        updateLLMWarmUp()
+        watchSecureInput()
+        Glossary.refreshOrgIfNeeded()
+        Glossary.exportForReceivers()
+        Glossary.refreshPackSources()
+        improver.onFinish = { _ in self.render() }
+
+        prepareModelThenStart()
+    }
+
+    private var downloader: ModelDownloader?
+    private var downloadProgress: Double? { didSet { render() } }
+
+    // 初回はモデル（約 1.6GB）をダウンロードしてから whisper-server を起動する
+    private func prepareModelThenStart() {
+        guard !FileManager.default.fileExists(atPath: Settings.model) else { return startServer() }
+        let d = ModelDownloader(dest: Settings.model)
+        downloader = d
+        downloadProgress = 0
+        d.start(progress: { self.downloadProgress = $0 }, done: { result in
+            self.downloader = nil
+            self.downloadProgress = nil
+            switch result {
+            case .success: self.startServer()
+            case .failure(let e): self.showError(e.localizedDescription, sticky: true)
+            }
+        })
+    }
+
+    private func startServer() {
+        server.start { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success: self.serverReady = true
+                case .failure(let e): self.showError(e.localizedDescription, sticky: true)
+                }
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        server.stop()
+        writeState("stopped")
+    }
+
+    // 録音中・文字起こし中に終了を求められたら、貼り終えてから終了する（最大 20 秒）
+    private var terminating = false
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard isBusy else { return .terminateNow }
+        terminating = true
+        Events.log("quit_deferred")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { if self.terminating { NSApp.reply(toApplicationShouldTerminate: true) } }
+        return .terminateLater
+    }
+
+    private var isBusy: Bool { current != nil || transcribing > 0 || cleaning > 0 }
+
+    // make install が待機中になるまで待てるよう、状態をファイルに書く
+    private var stateURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe/state")
+    }
+    private var lastState = ""
+    private func writeState(_ s: String) {
+        guard s != lastState else { return }
+        lastState = s
+        try? s.write(to: stateURL, atomically: true, encoding: .utf8)
+    }
+
+    private var sigterm: DispatchSourceSignal?
+    private func handleSigterm() {
+        signal(SIGTERM, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        src.setEventHandler { NSApp.terminate(nil) }
+        src.resume()
+        sigterm = src
+    }
+
+    // パスワード欄や iTerm の Secure Keyboard Entry が有効な間は、他のアプリのキー入力が見えない
+    private var secureInput = false
+    private func watchSecureInput() {
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+            let on = IsSecureEventInputEnabled()
+            guard on != self.secureInput else { return }
+            self.secureInput = on
+            Events.log(on ? "secure_input" : "secure_input_off")
+            self.render()
+        }
+    }
+
+    // MARK: Permissions
+
+    private func requestPermissions() {
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        if !AXIsProcessTrustedWithOptions(opts) {
+            // 許可されるまで待ってからキー監視を張り直す
+            Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { t in
+                if AXIsProcessTrusted() {
+                    t.invalidate()
+                    self.installMonitors()
+                    self.render()
+                }
+            }
+        }
+    }
+
+    // MARK: Hotkey (push to talk)
+
+    private func installMonitors() {
+        monitors.forEach { NSEvent.removeMonitor($0) }
+        monitors = []
+        let handler: (NSEvent) -> Void = { [weak self] e in self?.handle(e) }
+        let mask: NSEvent.EventTypeMask = [.flagsChanged, .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel]
+        if let g = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: handler) {
+            monitors.append(g)
+        }
+        if let l = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { e in handler(e); return e }) {
+            monitors.append(l)
+        }
+    }
+
+    private func handle(_ e: NSEvent) {
+        let key = Settings.hotkeyKeyCode
+        switch e.type {
+        case .keyDown:
+            // ホットキーを押したまま他のキー = ショートカット操作。録音を取り消す
+            if hotkeyDown { cancel(reason: "key \(e.keyCode)") }
+        case .flagsChanged:
+            if e.keyCode == key, let mask = deviceModifierMask[key] {
+                let pressed = e.modifierFlags.rawValue & mask != 0
+                if pressed && !hotkeyDown { hotkeyDown = true; begin() }
+                else if !pressed && hotkeyDown { hotkeyDown = false; end() }
+                else if pressed && hotkeyDown {
+                    // 離したイベントを取りこぼしていた。前の録音を確定してから録り直す
+                    Events.log("missed_release")
+                    end()
+                    begin()
+                } else {
+                    // 押したイベントを取りこぼしていた（Koe には録音が残らない）
+                    Events.log("missed_press")
+                    fail("キーの押下を検知できませんでした。もう一度押してください")
+                }
+            } else if hotkeyDown {
+                // 別の修飾キーが絡んだらショートカット操作とみなす
+                cancel(reason: "modifier \(e.keyCode)")
+            }
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
+            // ⌘+クリック・⌘+スクロールはショートカット操作。黙って取り消す
+            if hotkeyDown { cancel(reason: "mouse", silent: true) }
+        default: break
+        }
+    }
+
+    private func begin() {
+        guard current == nil else { return }
+        guard serverReady else {
+            Events.log("not_ready")
+            fail("モデル読み込み中です。少し待ってから話してください")
+            return
+        }
+        let u = Utterance(app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        if recorder.start() {
+            // 開始音はマイクに入り込むので小さめに鳴らす
+            play(Settings.startSound, volume: 0.35)
+            current = u
+        } else {
+            Events.log("start_failed")
+            fail("録音を開始できませんでした（マイクの許可を確認してください）")
+        }
+    }
+
+    private func cancel(reason: String, silent: Bool = false) {
+        guard let u = current else { return }
+        current = nil
+        recorder.discard()
+        let held = Date().timeIntervalSince(u.pressedAt)
+        Events.log("cancelled", ["reason": reason, "hold_seconds": round(held * 100) / 100])
+        // 1 秒以上押してから取り消された＝話している最中に他のキーに触れた可能性が高いので知らせる
+        if held >= 1.0 && !silent { fail("他のキーに触れたので録音を取り消しました") }
+    }
+
+    private func end() {
+        guard let u = current else { return }
+        current = nil
+        let held = Date().timeIntervalSince(u.pressedAt)
+        if held < Settings.minHoldSeconds {
+            recorder.discard()
+            Events.log("too_short", ["hold_seconds": round(held * 100) / 100])
+            return
+        }
+        u.record["hold_seconds"] = round(held * 100) / 100
+        transcribing += 1
+        recorder.stop { cap in
+            // 終了音は録り足し（語尾の切れ対策）が終わってから鳴らす。録音に入れないため
+            self.play(Settings.stopSound)
+            u.capture = cap
+            u.record["audio_seconds"] = round(cap.seconds * 100) / 100
+            u.record["voiced_seconds"] = round(cap.voicedSeconds * 100) / 100
+            u.record["peak"] = cap.peak
+            u.record["device"] = cap.device
+            if !cap.quality.isEmpty { u.record["quality"] = cap.quality }
+            if let alt = cap.alt { u.record["alt_device"] = alt.device; u.record["alt_quality"] = alt.quality }
+            // 部屋の雑音でも peak は数十〜数百ある。ほぼ 0 はミュートか入力停止
+            if cap.seconds >= 0.5 && cap.peak <= 2 {
+                self.transcribing -= 1
+                self.drop(u, outcome: "mic_silent", message: "マイクから音が来ていません。マイクがミュートになっていませんか？")
+            } else if cap.voicedSeconds == 0 {
+                self.transcribing -= 1
+                // 1 秒未満で声もない押下は誤操作のことが多いので音は鳴らさない
+                self.drop(u, outcome: "no_voice", message: "声を検出できませんでした", silent: held < 1.0)
+            } else {
+                self.transcribe(u, prompt: Settings.whisperPrompt(previous: self.previousText(for: u)))
+            }
+        }
+    }
+
+    private func play(_ name: String, volume: Float = 1.0) {
+        guard Settings.sounds else { return }
+        let sound = Bundle.main.url(forResource: name, withExtension: "aiff").flatMap { NSSound(contentsOf: $0, byReference: true) }
+            ?? NSSound(named: NSSound.Name(name))
+        sound?.volume = volume
+        sound?.play()
+    }
+
+    // 取りこぼしは黙って捨てない。音とメニューで知らせる
+    private func fail(_ message: String) {
+        play(Settings.failSound)
+        showError(message)
+    }
+
+    private func showError(_ message: String, sticky: Bool = false) {
+        errorMessage = message
+        guard !sticky else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            if self.errorMessage == message { self.errorMessage = nil }
+        }
+    }
+
+    // 話していた時間から失った文字数を見積もる（履歴の中央値で約 7 文字/秒）
+    private func lossEstimate(_ u: Utterance) -> [String: Any] {
+        let held = u.record["hold_seconds"] as? Double ?? Date().timeIntervalSince(u.pressedAt)
+        return ["hold_seconds": round(held * 100) / 100, "est_lost_chars": Int(max(0, held - 0.3) * 7)]
+    }
+
+    private func drop(_ u: Utterance, outcome: String, message: String, silent: Bool = false) {
+        u.record["dropped"] = true
+        u.record["outcome"] = outcome
+        var extra = lossEstimate(u)
+        extra["voiced_seconds"] = u.record["voiced_seconds"] ?? 0
+        extra["peak"] = u.record["peak"] ?? 0
+        Events.log(outcome, extra)
+        finish(u, pasted: nil)
+        if silent { showError(message) } else { fail(message) }
+    }
+
+    private func transcribe(_ u: Utterance, prompt: String, retried: Bool = false) {
+        guard let cap = u.capture else { return }
+        let started = Date()
+        u.record["whisper_model"] = (Settings.model as NSString).lastPathComponent
+        u.record["whisper_prompt"] = prompt
+        server.transcribe(wav: cap.url, prompt: prompt) { result in
+            DispatchQueue.main.async {
+                u.record["transcribe_ms"] = Int(Date().timeIntervalSince(started) * 1000) + (u.record["transcribe_ms"] as? Int ?? 0)
+                switch result {
+                case .success(let text):
+                    let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let (t, applied) = Glossary.autocorrectWithLog(raw)
+                    u.record["raw"] = t
+                    u.record["packs"] = Settings.enabledPacks
+                    if t != raw { u.record["raw_before_autocorrect"] = raw; u.record["autocorrected"] = applied }
+                    if t.isEmpty || hallucinations.contains(t) {
+                        // 声は入っているのに決まり文句が出た＝プロンプトに引っ張られた幻聴。プロンプトなしでやり直す
+                        if !retried && cap.voicedSeconds >= 1.0 {
+                            u.record["retried_without_prompt"] = true
+                            self.transcribe(u, prompt: "", retried: true)
+                            return
+                        }
+                        self.transcribing -= 1
+                        self.drop(u, outcome: "hallucination", message: "うまく聞き取れませんでした。もう一度話してください")
+                        return
+                    }
+                    if isRepetitive(t) {
+                        // 同じ文の繰り返し＝プロンプトに引っ張られた幻聴。プロンプトなしでやり直し、それでも繰り返すなら 1 回に減らす
+                        if !retried && !prompt.isEmpty {
+                            u.record["retried_without_prompt"] = true
+                            u.record["repetition_before_retry"] = t
+                            self.transcribe(u, prompt: "", retried: true)
+                            return
+                        }
+                        u.record["repetition_collapsed"] = t
+                        let c = collapseRepeats(t)
+                        self.transcribing -= 1
+                        self.deliver(u, c)
+                        return
+                    }
+                    self.transcribing -= 1
+                    self.deliver(u, t)
+                case .failure(let e):
+                    self.transcribing -= 1
+                    u.record["error"] = e.localizedDescription
+                    var extra = self.lossEstimate(u)
+                    extra["error"] = e.localizedDescription
+                    Events.log("error", extra)
+                    self.finish(u, pasted: nil)
+                    self.fail("文字起こしに失敗: \(e.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func deliver(_ u: Utterance, _ raw: String) {
+        u.record["llm_enabled"] = Settings.llmEnabled
+        guard Settings.llmEnabled else {
+            Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter)
+            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil])
+            finish(u, pasted: raw)
+            return
+        }
+        cleaning += 1
+        u.record["llm_model"] = Settings.llmModel
+        u.record["llm_prompt"] = Cleaner.prompt()
+        let started = Date()
+        Cleaner.clean(raw) { result in
+            DispatchQueue.main.async {
+                self.cleaning -= 1
+                u.record["clean_ms"] = Int(Date().timeIntervalSince(started) * 1000)
+                var text = raw
+                switch result {
+                case .success(let cleaned) where !cleaned.isEmpty:
+                    u.record["cleaned"] = cleaned
+                    text = cleaned
+                case .success:
+                    u.record["llm_error"] = "empty response"
+                case .failure(let e):
+                    // 整形に失敗しても入力は失わない
+                    u.record["llm_error"] = e.localizedDescription
+                }
+                Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter)
+                Events.log("pasted", ["llm": true])
+                self.finish(u, pasted: text)
+            }
+        }
+    }
+
+    // 同じアプリに 3 分以内に貼った直前の発話
+    private func previousText(for u: Utterance) -> String? {
+        guard let last = recentByApp[u.record["app"] as? String ?? ""],
+              u.pressedAt.timeIntervalSince(last.time) < 180 else { return nil }
+        return last.text
+    }
+
+    private func finish(_ u: Utterance, pasted: String?) {
+        if let text = pasted {
+            recentByApp[u.record["app"] as? String ?? ""] = (Date(), text)
+            recent.append((Date(), text))
+            if recent.count > 10 { recent.removeFirst(recent.count - 10) }
+        }
+        guard let cap = u.capture else { return }
+        defer { if current == nil && transcribing == 0 { improver.runIfNeeded() } }
+        if Settings.saveHistory {
+            u.record["pasted"] = pasted ?? NSNull()
+            History.save(id: History.newID(), wav: cap.url, record: u.record, alt: cap.alt?.url)
+        } else {
+            try? FileManager.default.removeItem(at: cap.url)
+            if let a = cap.alt?.url { try? FileManager.default.removeItem(at: a) }
+        }
+        render()
+    }
+
+    // Ollama は既定 5 分でモデルを降ろすので、有効な間は定期的に空打ちして載せておく
+    private func updateLLMWarmUp() {
+        warmUpTimer?.invalidate()
+        warmUpTimer = nil
+        guard Settings.llmEnabled else { return }
+        Cleaner.warmUp()
+        warmUpTimer = Timer.scheduledTimer(withTimeInterval: 240, repeats: true) { _ in Cleaner.warmUp() }
+    }
+
+    // MARK: Menu
+
+    private func buildMenu() {
+        let menu = NSMenu()
+        statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        statusLine.isEnabled = false
+        menu.addItem(statusLine)
+        missLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        missLine.isEnabled = false
+        menu.addItem(missLine)
+        metricsLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        metricsLine.isEnabled = false
+        menu.addItem(metricsLine)
+        menu.addItem(.separator())
+
+        enterItem = NSMenuItem(title: "貼り付け後に Enter を送る（ターミナルのみ）", action: #selector(toggleEnter), keyEquivalent: "")
+        enterItem.target = self
+        menu.addItem(enterItem)
+
+        warmItem = NSMenuItem(title: "マイクを常時待機（頭切れ防止）", action: #selector(toggleWarm), keyEquivalent: "")
+        warmItem.target = self
+        menu.addItem(warmItem)
+
+        llmItem = NSMenuItem(title: "", action: #selector(toggleLLM), keyEquivalent: "")
+        llmItem.target = self
+        menu.addItem(llmItem)
+
+        improveItem = NSMenuItem(title: "使うほど賢くする（改善ループ）", action: #selector(toggleImprove), keyEquivalent: "")
+        improveItem.target = self
+        menu.addItem(improveItem)
+        improveNowItem = NSMenuItem(title: "今すぐ改善する", action: #selector(improveNow), keyEquivalent: "")
+        improveNowItem.target = self
+        menu.addItem(improveNowItem)
+
+        let recentItem = NSMenuItem(title: "最近の文字起こし（クリックでコピー）", action: nil, keyEquivalent: "")
+        recentMenu = NSMenu()
+        recentMenu.delegate = self
+        recentItem.submenu = recentMenu
+        menu.addItem(recentItem)
+
+        clipboardItem = NSMenuItem(title: "貼り付け後にクリップボードを元に戻す", action: #selector(toggleClipboard), keyEquivalent: "")
+        clipboardItem.target = self
+        menu.addItem(clipboardItem)
+
+        let packItem = NSMenuItem(title: "用語パック", action: nil, keyEquivalent: "")
+        packMenu = NSMenu()
+        packMenu.delegate = self
+        packItem.submenu = packMenu
+        menu.addItem(packItem)
+
+        let micItem = NSMenuItem(title: "マイク", action: nil, keyEquivalent: "")
+        micMenu = NSMenu()
+        micMenu.delegate = self
+        micItem.submenu = micMenu
+        menu.addItem(micItem)
+
+        historyItem = NSMenuItem(title: "録音と結果を保存（評価用）", action: #selector(toggleHistory), keyEquivalent: "")
+        historyItem.target = self
+        menu.addItem(historyItem)
+
+        soundItem = NSMenuItem(title: "録音の開始・終了で音を鳴らす", action: #selector(toggleSound), keyEquivalent: "")
+        soundItem.target = self
+        menu.addItem(soundItem)
+
+        loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem.target = self
+        menu.addItem(loginItem)
+
+        let importItem = NSMenuItem(title: "設定ファイルを読み込む…", action: #selector(importConfig), keyEquivalent: "")
+        importItem.target = self
+        menu.addItem(importItem)
+
+        let hist = NSMenuItem(title: "保存フォルダを開く", action: #selector(openHistory), keyEquivalent: "")
+        hist.target = self
+        menu.addItem(hist)
+
+        let log = NSMenuItem(title: "サーバーログを開く", action: #selector(openLog), keyEquivalent: "")
+        log.target = self
+        menu.addItem(log)
+
+        menu.addItem(.separator())
+        let info = Bundle.main.infoDictionary
+        let ver = NSMenuItem(title: "Koe \(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))", action: nil, keyEquivalent: "")
+        ver.isEnabled = false
+        menu.addItem(ver)
+        let quit = NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
+        menu.delegate = self
+        statusItem.menu = menu
+    }
+
+    @objc private func toggleEnter() {
+        Settings.autoEnter.toggle()
+        render()
+    }
+
+    @objc private func toggleWarm() {
+        Settings.warmMic.toggle()
+        recorder.setWarm(Settings.warmMic)
+        render()
+    }
+
+    @objc private func toggleLLM() {
+        Settings.llmEnabled.toggle()
+        updateLLMWarmUp()
+        render()
+    }
+
+    // サブメニューを開くたびにマイク一覧を作り直す（抜き差しに追従）
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === statusItem.menu {
+            // 計測はメニューを開いたときだけ数える（履歴を読むので重い）
+            let p1 = Events.pasteSuccessToday(), p2 = History.communication(days: 7)
+            func pct(_ a: Int, _ b: Int) -> String { b == 0 ? "-" : String(format: "%.0f%%", Double(a) / Double(b) * 100) }
+            metricsLine?.title = "今日の入力成功 \(pct(p1.ok, p1.total))（\(p1.ok)/\(p1.total)） / 7日の伝達成功 \(pct(p2.ok, p2.judged))（\(p2.ok)/\(p2.judged)）"
+            return
+        }
+        if menu === recentMenu {
+            menu.removeAllItems()
+            if recent.isEmpty {
+                let none = NSMenuItem(title: "まだありません", action: nil, keyEquivalent: "")
+                none.isEnabled = false
+                menu.addItem(none)
+            }
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm"
+            for r in recent.reversed() {
+                let short = r.text.count > 40 ? String(r.text.prefix(40)) + "…" : r.text
+                let item = NSMenuItem(title: "\(f.string(from: r.time))  \(short)", action: #selector(copyRecent(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = r.text
+                item.toolTip = r.text
+                menu.addItem(item)
+            }
+            return
+        }
+        if menu === packMenu {
+            menu.removeAllItems()
+            for p in Glossary.availablePacks {
+                let item = NSMenuItem(title: p.title, action: #selector(togglePack(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = p.id
+                item.state = Settings.enabledPacks.contains(p.id) ? .on : .off
+                menu.addItem(item)
+            }
+            return
+        }
+        guard menu === micMenu else { return }
+        menu.removeAllItems()
+        let fb = recorder.fallbackName.map { "。ミュート中は \($0)" } ?? ""
+        let auto = NSMenuItem(title: "自動（既定のマイク\(fb)）", action: #selector(selectMic(_:)), keyEquivalent: "")
+        auto.target = self
+        auto.state = Settings.micName == nil ? .on : .off
+        menu.addItem(auto)
+        menu.addItem(.separator())
+        for d in AudioDevices.selectable() {
+            let item = NSMenuItem(title: d.name, action: #selector(selectMic(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = d.name
+            item.state = Settings.micName == d.name ? .on : .off
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func importConfig() {
+        ConfigImport.run()
+        recorder.reopen()
+        render()
+    }
+
+    @objc private func toggleImprove() {
+        if !Settings.improveEnabled {
+            if Settings.improveProvider == "api" && Settings.improveEndpoint.isEmpty {
+                showError("改善ループの送り先（improveEndpoint）が設定されていません")
+                return
+            }
+            let a = NSAlert()
+            a.messageText = "改善ループをオンにしますか？"
+            a.informativeText = "発話の文字起こしと、Claude Code のセッション記録の該当部分（送った文・返答・次の発話）を、次の送り先に送って辞書を育てます。\n\n送り先: \(Settings.improveTarget)"
+            a.addButton(withTitle: "オンにする")
+            a.addButton(withTitle: "やめる")
+            NSApp.activate(ignoringOtherApps: true)
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
+        Settings.improveEnabled.toggle()
+        render()
+    }
+
+    @objc private func improveNow() {
+        improver.runIfNeeded(force: true)
+        render()
+    }
+
+    @objc private func toggleClipboard() {
+        Settings.restoreClipboard.toggle()
+        render()
+    }
+
+    @objc private func copyRecent(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        Events.log("recent_copied", ["chars": text.count])
+    }
+
+    @objc private func togglePack(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        var on = Settings.enabledPacks
+        if let i = on.firstIndex(of: id) { on.remove(at: i) } else { on.append(id) }
+        Settings.enabledPacks = on
+        Glossary.exportForReceivers()
+        Events.log("pack_toggled", ["pack": id, "on": on.contains(id)])
+    }
+
+    @objc private func selectMic(_ sender: NSMenuItem) {
+        Settings.micName = sender.representedObject as? String
+        Events.log("mic_selected", ["device": Settings.micName ?? "auto"])
+        recorder.reopen()
+        render()
+    }
+
+    @objc private func toggleHistory() {
+        Settings.saveHistory.toggle()
+        render()
+    }
+
+    @objc private func openHistory() {
+        try? FileManager.default.createDirectory(at: History.dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(History.dir)
+    }
+
+    @objc private func toggleSound() {
+        Settings.sounds.toggle()
+        render()
+    }
+
+    @objc private func toggleLogin() {
+        let svc = SMAppService.mainApp
+        do {
+            if svc.status == .enabled { try svc.unregister() } else { try svc.register() }
+        } catch {
+            showError("ログイン項目の変更に失敗: \(error.localizedDescription)")
+        }
+        render()
+    }
+
+    @objc private func openLog() {
+        NSWorkspace.shared.open(WhisperServer.logURL)
+    }
+
+    private func render() {
+        guard let button = statusItem?.button else { return }
+        var symbol = ""
+        var image: NSImage = KoeIcon.outline
+        var tint: NSColor? = nil
+        var line: String
+        if current != nil {
+            image = KoeIcon.filled; tint = .systemRed; line = "録音中…"
+        } else if let msg = errorMessage {
+            symbol = "exclamationmark.triangle"; tint = .systemYellow; line = msg
+        } else if let p = downloadProgress {
+            tint = .tertiaryLabelColor; line = String(format: "初回のみ: 音声認識モデルをダウンロード中… %.0f%%（約 1.6GB）", p * 100)
+        } else if !serverReady {
+            tint = .tertiaryLabelColor; line = "モデル読み込み中…"
+        } else if cleaning > 0 {
+            image = KoeIcon.filled; tint = .systemPurple; line = "LLM で整形中…"
+        } else if transcribing > 0 {
+            image = KoeIcon.filled; tint = .systemOrange; line = "文字起こし中…"
+        } else {
+            line = "待機中（\(keyName()) を押している間だけ録音）"
+        }
+        if secureInput && current == nil {
+            symbol = "exclamationmark.triangle"; tint = .systemYellow
+            line = "他のアプリがキー入力を保護中のため、右⌘を検知できません（パスワード欄・iTerm の Secure Keyboard Entry など）"
+        }
+        if !AXIsProcessTrusted() {
+            line = "アクセシビリティの許可が必要です（システム設定 > プライバシーとセキュリティ）"
+            tint = .systemYellow
+        }
+        button.image = symbol.isEmpty ? image : NSImage(systemSymbolName: symbol, accessibilityDescription: "Koe")
+        button.image?.accessibilityDescription = "Koe"
+        button.contentTintColor = tint
+        // 録音中は貼り付け先のアプリ名をメニューバーに出す（どこに入るかを話しながら確認できる）
+        if current != nil, let name = NSWorkspace.shared.frontmostApplication?.localizedName {
+            button.title = " → \(name)\(Settings.shouldEnter ? "" : "（送信しない）")"
+            button.imagePosition = .imageLeft
+        } else {
+            button.title = ""
+        }
+        writeState(isBusy ? "busy" : "idle")
+        if terminating && !isBusy { terminating = false; NSApp.reply(toApplicationShouldTerminate: true) }
+        statusLine?.title = line
+        missLine?.title = "マイク: \(recorder.activeName)\(recorder.primaryMuted ? " ※いまミュート中" : "")"
+
+        enterItem?.state = Settings.autoEnter ? .on : .off
+        warmItem?.state = Settings.warmMic ? .on : .off
+        soundItem?.state = Settings.sounds ? .on : .off
+        llmItem?.title = "LLM で整形（\(Settings.llmModel)）"
+        llmItem?.state = Settings.llmEnabled ? .on : .off
+        historyItem?.state = Settings.saveHistory ? .on : .off
+        clipboardItem?.state = Settings.restoreClipboard ? .on : .off
+        improveItem?.state = Settings.improveEnabled ? .on : .off
+        improveNowItem?.isEnabled = Settings.improveEnabled && !improver.running
+        improveNowItem?.title = improver.running ? "改善中…" : "今すぐ改善する" + (improver.lastRun.map { "（前回: \($0.prefix(40))）" } ?? "")
+        loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
+
+    private func keyName() -> String {
+        switch Settings.hotkeyKeyCode {
+        case 54: return "右⌘"
+        case 55: return "左⌘"
+        case 61: return "右⌥"
+        case 58: return "左⌥"
+        case 60: return "右⇧"
+        case 56: return "左⇧"
+        case 62: return "右⌃"
+        case 59: return "左⌃"
+        default: return "keyCode \(Settings.hotkeyKeyCode)"
+        }
+    }
+}
+
+// Koe.app/Contents/MacOS/Koe --autocorrect "<文>": 自動置き換えの確認用
+if let i = CommandLine.arguments.firstIndex(of: "--autocorrect"), i + 1 < CommandLine.arguments.count {
+    print(Glossary.autocorrect(CommandLine.arguments[i + 1]))
+    exit(0)
+}
+
+// Koe.app/Contents/MacOS/Koe --improve-now: 改善ループを 1 回だけ回して結果を出す（動作確認用）
+if CommandLine.arguments.contains("--improve-now") {
+    let imp = Improver()
+    let done = DispatchSemaphore(value: 0)
+    imp.onFinish = { print($0); done.signal() }
+    DispatchQueue.main.async { imp.runIfNeeded(force: true); if !imp.running { print("動いていません（improveEnabled / improveEndpoint を確認）"); done.signal() } }
+    DispatchQueue.global().async { done.wait(); exit(0) }
+    RunLoop.main.run()
+}
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.setActivationPolicy(.accessory)
+app.run()
