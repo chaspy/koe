@@ -2029,6 +2029,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var micMenu: NSMenu!
     private var hotkeyMenu: NSMenu!
     private var updateItem: NSMenuItem!
+    private var lockItem: NSMenuItem!
     private var availableUpdate: Updater.Release?
     private var packMenu: NSMenu!
     private var recentMenu: NSMenu!
@@ -2269,7 +2270,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if u.pressedAt.timeIntervalSince(lastShortTap) < 0.5 {
                 u.locked = true
                 lastShortTap = .distantPast
-                play(Settings.startSound, volume: 0.35)
+                // いつもの開始音と区別できるよう、上がる 2 音を鳴らす
+                play("lock_start", volume: 0.5)
                 Events.log("lock_started")
                 render()
                 return
@@ -2291,7 +2293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recorder.stop { cap in
             if let r = u.releasedAt { u.record["stop_ms"] = Int(Date().timeIntervalSince(r) * 1000) }
             // 終了音は録り足し（語尾の切れ対策）が終わってから鳴らす。録音に入れないため
-            self.play(Settings.stopSound)
+            self.play(u.locked ? "lock_stop" : Settings.stopSound)
             u.capture = cap
             u.record["audio_seconds"] = round(cap.seconds * 100) / 100
             u.record["voiced_seconds"] = round(cap.voicedSeconds * 100) / 100
@@ -2533,6 +2535,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(metricsLine)
         menu.addItem(.separator())
 
+        // ロック録音はキーの 2 回押しでも始められるが、気づきにくいのでメニューからも始め・止められるようにする
+        lockItem = NSMenuItem(title: "", action: #selector(toggleLock), keyEquivalent: "")
+        lockItem.target = self
+        menu.addItem(lockItem)
+        menu.addItem(.separator())
+
         enterItem = NSMenuItem(title: "貼り付け後に Enter を送る（ターミナルのみ）", action: #selector(toggleEnter), keyEquivalent: "")
         enterItem.target = self
         menu.addItem(enterItem)
@@ -2627,6 +2635,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(quit)
         menu.delegate = self
         statusItem.menu = menu
+    }
+
+    @objc private func toggleLock() {
+        if let c = current, c.locked {
+            endLocked()
+        } else if current == nil {
+            begin()
+            guard let u = current else { return }
+            u.locked = true
+            play("lock_start", volume: 0.5)
+            Events.log("lock_started", ["from": "menu"])
+        }
+        render()
     }
 
     @objc private func toggleLineBreaks() {
@@ -2847,6 +2868,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         missLine?.title = "マイク: \(recorder.activeName)\(recorder.primaryMuted ? " ※いまミュート中" : "")"
 
         enterItem?.state = Settings.autoEnter ? .on : .off
+        if current?.locked == true {
+            lockItem?.title = "ロック録音を終えてテキストに書き出す"
+        } else {
+            lockItem?.title = "ロック録音を始める（\(keyName()) を素早く 2 回でも可。もう 1 回押すと終わる）"
+        }
+        lockItem?.isEnabled = current == nil || current?.locked == true
         lineBreakItem?.state = Settings.lineBreaks ? .on : .off
         warmItem?.state = Settings.warmMic ? .on : .off
         soundItem?.state = Settings.sounds ? .on : .off

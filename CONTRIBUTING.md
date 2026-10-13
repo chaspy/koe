@@ -52,7 +52,7 @@ One version number for macOS and Windows; both are built from the same commit an
 
 - **MAJOR** (1.0.0): the first stable release, once Koe meets its v1 quality bar.
 - **MINOR** (0.x.0): new features, user-visible behavior changes, a new platform, or changes to the config or pack format. Before 1.0, breaking changes also bump MINOR and the release notes explain how to migrate.
-- **PATCH** (0.x.y): bug fixes, changes to measurement or evaluation internals, documentation.
+- **PATCH** (0.x.y): bug fixes, small improvements to an existing feature (wording, sounds, an extra way to reach it), changes to measurement or evaluation internals, documentation.
 
 If a release changes only one platform, its notes say "macOS: no changes" or "Windows: no changes".
 
