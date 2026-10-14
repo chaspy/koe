@@ -93,3 +93,40 @@ func stopKeyboardHook(tid uint32) {
 		procPostThreadMessageW.Call(uintptr(tid), wmQuit, 0, 0)
 	}
 }
+
+// startMenuHook calls fn whenever a popup menu opens in this process: the tray
+// menu, which systray opens with TrackPopupMenu without telling us. The hook is
+// out of context, so fn runs on the hook's own thread after the menu is up and
+// never delays it; fn must return quickly. Returns the hook thread id.
+func startMenuHook(fn func()) (uint32, error) {
+	type result struct {
+		tid uint32
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		cb := windows.NewCallback(func(hook, event, hwnd, idObject, idChild, thread, at uintptr) uintptr {
+			fn()
+			return 0
+		})
+		h, _, err := procSetWinEventHook.Call(eventSystemMenuPopupStart, eventSystemMenuPopupStart, 0, cb,
+			uintptr(windows.GetCurrentProcessId()), 0, wineventOutOfContext)
+		if h == 0 {
+			res <- result{0, fmt.Errorf("SetWinEventHook: %v", err)}
+			return
+		}
+		res <- result{windows.GetCurrentThreadId(), nil}
+		var m msg
+		for {
+			r, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+			if int32(r) <= 0 {
+				break
+			}
+		}
+		procUnhookWinEvent.Call(h)
+	}()
+	r := <-res
+	return r.tid, r.err
+}

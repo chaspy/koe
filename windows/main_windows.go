@@ -53,6 +53,7 @@ type App struct {
 	server *WhisperServer
 	hold   core.HoldTracker
 	hookID uint32
+	menuID uint32 // thread of the tray-menu-opened hook
 
 	ready      atomic.Bool
 	holding    atomic.Bool
@@ -79,6 +80,8 @@ type App struct {
 	usage     map[string]int
 	usageAt   time.Time
 	avail     *core.Release // newer release, if any
+	checkedAt time.Time     // when the last update check started
+	checkMu   sync.Mutex    // one update check at a time
 	updateMsg string        // update progress shown as the status
 
 	tray trayItems
@@ -128,6 +131,7 @@ func (a *App) onReady() {
 func (a *App) onExit() {
 	a.log.Printf("exit")
 	stopKeyboardHook(a.hookID)
+	stopKeyboardHook(a.menuID)
 	if a.server != nil {
 		a.server.Stop()
 	}
@@ -204,6 +208,13 @@ func (a *App) startup() {
 	}
 	a.reportPreviousUpdate()
 	go a.updateLoop()
+	if a.updateCheckOn() {
+		if tid, err := startMenuHook(func() { go a.checkUpdateOnMenu() }); err != nil {
+			a.log.Printf("menu_hook_failed %v", err)
+		} else {
+			a.menuID = tid
+		}
+	}
 	a.prepareModelAndServer()
 }
 

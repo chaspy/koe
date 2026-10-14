@@ -2067,20 +2067,28 @@ enum Updater {
         return false
     }
 
+    // GitHub の API（ログインなしは同じ IP から 1 時間 60 回まで。社内は皆同じ IP）は使わず、
+    // 「最新の Release」のページの転送先（/releases/tag/vX.Y.Z）から版を読む
+    final class NoRedirect: NSObject, URLSessionTaskDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) { completionHandler(nil) }
+    }
+    static let session = URLSession(configuration: .ephemeral, delegate: NoRedirect(), delegateQueue: nil)
+
     static func check(done: @escaping (Release?) -> Void) {
         guard Settings.defaults.object(forKey: "updateCheck") as? Bool ?? true,
-              let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else { return done(nil) }
+              let url = URL(string: "https://github.com/\(repo)/releases/latest") else { return done(nil) }
         var req = URLRequest(url: url)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.httpMethod = "HEAD"
         req.timeoutInterval = 20
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            guard let d = data, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  let tag = j["tag_name"] as? String, let page = (j["html_url"] as? String).flatMap(URL.init(string:)),
-                  let assets = j["assets"] as? [[String: Any]],
-                  let dmg = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".dmg") == true })?["browser_download_url"] as? String,
-                  let dmgURL = URL(string: dmg) else { return done(nil) }
-            let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            done(newer(v, than: current) ? Release(version: v, dmg: dmgURL, page: page) : nil)
+        session.dataTask(with: req) { _, resp, _ in
+            guard let loc = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Location"),
+                  let r = loc.range(of: "/releases/tag/v") else { return done(nil) }
+            let v = String(loc[r.upperBound...])
+            guard newer(v, than: current),
+                  let dmg = URL(string: "https://github.com/\(repo)/releases/download/v\(v)/Koe-\(v).dmg"),
+                  let page = URL(string: "https://github.com/\(repo)/releases/tag/v\(v)") else { return done(nil) }
+            done(Release(version: v, dmg: dmg, page: page))
         }.resume()
     }
 
@@ -2803,6 +2811,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateItem.target = self
         updateItem.isHidden = true
         menu.addItem(updateItem)
+        let checkItem = NSMenuItem(title: "更新を確認", action: #selector(checkUpdateNow), keyEquivalent: "")
+        checkItem.target = self
+        menu.addItem(checkItem)
         let quit = NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         menu.delegate = self
@@ -2847,6 +2858,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // サブメニューを開くたびにマイク一覧を作り直す（抜き差しに追従）
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === statusItem.menu {
+            // メニューを開いたときも、前に確かめてから 1 分以上たっていれば新しい版を確かめる（起動時と 1 日 1 回だけだと当日中に気づけない）
+            if Date().timeIntervalSince(lastUpdateCheck) > 60 { checkUpdate() }
             // 計測はメニューを開いたときだけ数える（履歴を読むので重い）
             let p1 = Events.pasteSuccessToday(), p2 = History.communication()
             func pct(_ a: Int, _ b: Int) -> String { b == 0 ? "-" : String(format: "%.0f%%", Double(a) / Double(b) * 100) }
@@ -3108,7 +3121,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for it in pressModeMenu?.items ?? [] { it.state = (it.tag == 1) == Settings.toggleMode ? .on : .off }
     }
 
-    private func checkUpdate() {
+    private var lastUpdateCheck = Date.distantPast
+    // manual: 「更新を確認」から押したとき。新しい版が無ければ「最新です」と知らせる
+    private func checkUpdate(manual: Bool = false) {
+        lastUpdateCheck = Date()
         Updater.check { r in
             DispatchQueue.main.async {
                 self.availableUpdate = r
@@ -3116,10 +3132,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateItem.title = "新しい版 v\(r.version) があります（クリックで更新）"
                     self.updateItem.isHidden = false
                     Events.log("update_available", ["version": r.version])
+                } else if manual {
+                    self.showError("最新です（v\(Updater.current)）")
                 }
             }
         }
     }
+
+    @objc private func checkUpdateNow() { checkUpdate(manual: true) }
 
     @objc private func installUpdate() {
         guard let r = availableUpdate else { return }

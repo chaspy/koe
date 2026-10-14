@@ -4,6 +4,17 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.3.2 — 2026-10-14
+
+### macOS
+- Newer releases are noticed the same day: Koe also checks when the menu is opened (if the last check was more than a minute ago), and the menu has "更新を確認" to check right away. The check reads the redirect of the latest release page instead of the GitHub API, so many users behind one office IP do not hit the API rate limit.
+
+### Windows
+- Update check also runs when the tray menu is opened, if the last check was 1 minute ago or more (in the background; the menu opens at once). New releases are noticed the same day instead of up to 24 hours later.
+- Menu → 更新を確認 checks right away and says 「最新です（vX）」 when there is no newer version. It works even with `updateCheck` off.
+- The update check no longer uses the GitHub REST API, whose limit without login (60 requests an hour per IP) is quickly used up when many people share one office IP. Koe reads the version from the redirect of `https://github.com/<repo>/releases/latest` (not followed) and offers the update only after a HEAD request confirms `releases/download/vX.Y.Z/Koe-X.Y.Z-windows-x64.zip` exists; otherwise it only logs "no windows asset".
+- koe.log's `update_check` lines show what triggered the check (`reason=start|daily|menu|manual`).
+
 ## 0.3.1 — 2026-10-14
 
 ### Windows

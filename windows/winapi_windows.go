@@ -14,6 +14,8 @@ var (
 	procSetWindowsHookExW   = user32.NewProc("SetWindowsHookExW")
 	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
 	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
+	procSetWinEventHook     = user32.NewProc("SetWinEventHook")
+	procUnhookWinEvent      = user32.NewProc("UnhookWinEvent")
 	procGetMessageW         = user32.NewProc("GetMessageW")
 	procPostThreadMessageW  = user32.NewProc("PostThreadMessageW")
 	procSendInput           = user32.NewProc("SendInput")
@@ -50,6 +52,9 @@ const (
 	wmSysKeyDown = 0x0104
 	wmSysKeyUp   = 0x0105
 	wmQuit       = 0x0012
+
+	eventSystemMenuPopupStart = 0x0006
+	wineventOutOfContext      = 0x0000
 
 	llkhfInjected = 0x10
 

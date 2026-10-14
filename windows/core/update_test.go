@@ -6,12 +6,33 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestCheckDue(t *testing.T) {
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		last time.Time
+		want bool
+	}{
+		{time.Time{}, true},
+		{now, false},
+		{now.Add(-59 * time.Second), false},
+		{now.Add(-time.Minute), true},
+		{now.Add(-3 * time.Hour), true},
+		{now.Add(time.Minute), false}, // clock went back
+	}
+	for _, c := range cases {
+		if got := CheckDue(c.last, now, MenuCheckInterval); got != c.want {
+			t.Errorf("CheckDue(%v) = %v, want %v", now.Sub(c.last), got, c.want)
+		}
+	}
+}
 
 func TestNewerVersion(t *testing.T) {
 	cases := []struct {
@@ -37,61 +58,95 @@ func TestNewerVersion(t *testing.T) {
 	}
 }
 
-const releaseJSON = `{
-  "tag_name": "v0.2.0",
-  "html_url": "https://github.com/o/r/releases/tag/v0.2.0",
-  "assets": [
-    {"name": "Koe-0.2.0.dmg", "browser_download_url": "https://example.invalid/Koe-0.2.0.dmg"},
-    {"name": "Koe-0.2.0-windows-x64.zip", "browser_download_url": "https://example.invalid/Koe-0.2.0-windows-x64.zip"}
-  ]
-}`
-
-func TestParseLatestRelease(t *testing.T) {
-	r, err := ParseLatestRelease([]byte(releaseJSON))
-	if err != nil {
-		t.Fatal(err)
+func TestTagFromLocation(t *testing.T) {
+	cases := map[string]string{
+		"https://github.com/o/r/releases/tag/v0.3.1":  "v0.3.1",
+		"https://github.com/o/r/releases/tag/v0.3.1/": "v0.3.1",
+		"/o/r/releases/tag/0.4":                       "0.4",
+		"https://github.com/o/r/releases/tag/v1%2B2":  "v1+2",
+		"https://github.com/o/r/releases":             "",
+		"https://github.com/o/r/releases/tag/":        "",
+		"https://github.com/o/r/releases/tag/a/b":     "",
+		"https://github.com/login?return_to=x":        "",
 	}
-	want := Release{Version: "0.2.0", Tag: "v0.2.0", Page: "https://github.com/o/r/releases/tag/v0.2.0",
-		AssetURL: "https://example.invalid/Koe-0.2.0-windows-x64.zip", Asset: "Koe-0.2.0-windows-x64.zip"}
-	if r != want {
-		t.Fatalf("got %#v", r)
+	for in, want := range cases {
+		u, _ := url.Parse(in)
+		tag, ok := TagFromLocation(u)
+		if tag != want || ok != (want != "") {
+			t.Errorf("TagFromLocation(%q) = %q %v, want %q", in, tag, ok, want)
+		}
 	}
-	r, err = ParseLatestRelease([]byte(`{"tag_name":"0.3","assets":[{"name":"Koe.dmg","browser_download_url":"x"}]}`))
-	if !errors.Is(err, ErrNoWindowsAsset) || r.Version != "0.3" {
-		t.Fatalf("got %#v %v", r, err)
-	}
-	if _, err := ParseLatestRelease([]byte(`{}`)); err == nil {
-		t.Fatal("want error for missing tag")
-	}
-	if _, err := ParseLatestRelease([]byte(`not json`)); err == nil {
-		t.Fatal("want error for bad json")
+	if WindowsAssetName("0.3.1") != "Koe-0.3.1-windows-x64.zip" {
+		t.Fatal(WindowsAssetName("0.3.1"))
 	}
 }
 
 func TestLatestRelease(t *testing.T) {
-	var ua string
+	var ua, method string
+	var paths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ua = r.Header.Get("User-Agent")
+		ua, method = r.Header.Get("User-Agent"), r.Method
+		paths = append(paths, r.URL.Path)
 		switch r.URL.Path {
-		case "/repos/o/r/releases/latest":
-			w.Write([]byte(releaseJSON))
-		case "/repos/o/none/releases/latest":
+		case "/o/r/releases/latest":
+			http.Redirect(w, r, "http://"+r.Host+"/o/r/releases/tag/v0.2.0", http.StatusFound)
+		case "/o/rel/releases/latest": // relative Location
+			w.Header().Set("Location", "/o/rel/releases/tag/0.4")
+			w.WriteHeader(http.StatusFound)
+		case "/o/none/releases/latest":
+			http.Redirect(w, r, "/o/none/releases", http.StatusFound)
+		case "/o/r/releases/download/v0.2.0/Koe-0.2.0-windows-x64.zip":
+			// the real one redirects to the file host; must not be followed
+			http.Redirect(w, r, "http://127.0.0.1:1/asset", http.StatusFound)
+		case "/o/rel/releases/download/0.4/Koe-0.4-windows-x64.zip":
+			w.WriteHeader(http.StatusOK)
+		case "/o/plain/releases/latest", "/o/r/releases/download/v9/Koe-9-windows-x64.zip":
+			w.WriteHeader(http.StatusOK)
+		case "/o/missing/releases/latest", "/o/none/releases/download/v1/Koe-1-windows-x64.zip":
 			http.NotFound(w, r)
 		default:
-			w.WriteHeader(http.StatusForbidden)
+			w.WriteHeader(http.StatusTooManyRequests)
 		}
 	}))
 	defer srv.Close()
 	ctx := context.Background()
 	r, err := LatestRelease(ctx, srv.URL, "o/r", "Koe-test/1")
-	if err != nil || r.Version != "0.2.0" || ua != "Koe-test/1" {
-		t.Fatalf("got %#v %v ua=%q", r, err, ua)
+	want := Release{Version: "0.2.0", Tag: "v0.2.0", Page: srv.URL + "/o/r/releases/tag/v0.2.0",
+		Asset: "Koe-0.2.0-windows-x64.zip", AssetURL: srv.URL + "/o/r/releases/download/v0.2.0/Koe-0.2.0-windows-x64.zip"}
+	if err != nil || r != want || ua != "Koe-test/1" || method != http.MethodHead {
+		t.Fatalf("got %#v %v ua=%q method=%s", r, err, ua, method)
 	}
-	if r, err := LatestRelease(ctx, srv.URL, "o/none", "x"); err != nil || r.Tag != "" {
-		t.Fatalf("no releases: got %#v %v", r, err)
+	if len(paths) != 1 {
+		t.Fatalf("redirect was followed: %v", paths)
 	}
-	if _, err := LatestRelease(ctx, srv.URL, "o/limited", "x"); err == nil || !strings.Contains(err.Error(), "403") {
-		t.Fatalf("want HTTP 403 error, got %v", err)
+	if err := WindowsAssetExists(ctx, r, "x"); err != nil {
+		t.Fatal("302 asset", err)
+	}
+	r, err = LatestRelease(ctx, srv.URL, "o/rel", "x")
+	if err != nil || r.Version != "0.4" || r.Page != srv.URL+"/o/rel/releases/tag/0.4" {
+		t.Fatalf("relative: %#v %v", r, err)
+	}
+	if err := WindowsAssetExists(ctx, r, "x"); err != nil {
+		t.Fatal("200 asset", err)
+	}
+	for _, repo := range []string{"o/none", "o/missing"} {
+		if r, err := LatestRelease(ctx, srv.URL, repo, "x"); err != nil || r.Tag != "" {
+			t.Fatalf("%s: got %#v %v", repo, r, err)
+		}
+	}
+	if _, err := LatestRelease(ctx, srv.URL, "o/plain", "x"); err == nil {
+		t.Fatal("200 without redirect must be an error")
+	}
+	if _, err := LatestRelease(ctx, srv.URL, "o/limited", "x"); err == nil || !strings.Contains(err.Error(), "429") {
+		t.Fatalf("want HTTP 429 error, got %v", err)
+	}
+	noAsset := Release{Asset: "Koe-1-windows-x64.zip", AssetURL: srv.URL + "/o/none/releases/download/v1/Koe-1-windows-x64.zip"}
+	if err := WindowsAssetExists(ctx, noAsset, "x"); !errors.Is(err, ErrNoWindowsAsset) {
+		t.Fatal("404 asset", err)
+	}
+	noAsset.AssetURL = srv.URL + "/o/other/x.zip"
+	if err := WindowsAssetExists(ctx, noAsset, "x"); err == nil || errors.Is(err, ErrNoWindowsAsset) {
+		t.Fatal("429 asset", err)
 	}
 }
 

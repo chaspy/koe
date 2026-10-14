@@ -117,6 +117,7 @@ func (a *App) setupTray() {
 	}()
 	mLog := systray.AddMenuItem("ログのフォルダを開く", a.localDir)
 	mCfg := systray.AddMenuItem("設定ファイルを開く", a.configPath())
+	mCheck := systray.AddMenuItem("更新を確認", "新しい版が出ていないか、いま確かめます")
 	systray.AddSeparator()
 	mVer := systray.AddMenuItem(a.versionLabel(), "")
 	mVer.Disable()
@@ -126,6 +127,8 @@ func (a *App) setupTray() {
 			select {
 			case <-mLog.ClickedCh:
 				_ = exec.Command("explorer.exe", a.localDir).Start()
+			case <-mCheck.ClickedCh:
+				go a.checkUpdateNow()
 			case <-mCfg.ClickedCh:
 				_ = exec.Command("notepad.exe", a.configPath()).Start()
 			case <-mQuit.ClickedCh:

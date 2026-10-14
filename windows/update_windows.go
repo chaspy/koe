@@ -43,6 +43,9 @@ func (a *App) reportPreviousUpdate() {
 	go a.updateFailedNotice(fmt.Sprintf("v%s への更新が完了しませんでした（いまは %s のままです）。", p.To, version), p.Page)
 }
 
+// updateCheckOn: automatic checks (start, daily, menu opened) are enabled.
+func (a *App) updateCheckOn() bool { return a.cfg.UpdateCheck && version != "dev" }
+
 // updateLoop checks for a newer release at start and once a day.
 func (a *App) updateLoop() {
 	defer a.recoverLog("update_check")
@@ -54,36 +57,91 @@ func (a *App) updateLoop() {
 		a.log.Printf("update_check_skipped (dev build)")
 		return
 	}
-	for {
-		a.checkUpdate()
+	for reason := "start"; ; reason = "daily" {
+		a.checkMu.Lock()
+		_, _ = a.checkUpdate(reason)
+		a.checkMu.Unlock()
 		time.Sleep(updateInterval)
 	}
 }
 
-func (a *App) checkUpdate() {
-	r, err := core.LatestRelease(context.Background(), core.GitHubAPI, a.cfg.UpdateRepo, "Koe-windows/"+version)
-	switch {
-	case errors.Is(err, core.ErrNoWindowsAsset):
-		a.log.Printf("update_check latest=%s (no windows asset)", r.Tag)
-		return
-	case err != nil:
-		a.log.Printf("update_check_failed repo=%s err=%v", a.cfg.UpdateRepo, err)
-		return
-	case r.Tag == "":
-		a.log.Printf("update_check repo=%s has no releases", a.cfg.UpdateRepo)
+// checkUpdateOnMenu runs when the tray menu opens: checks again if the last
+// check is MenuCheckInterval old, skipping if a check is already running.
+func (a *App) checkUpdateOnMenu() {
+	defer a.recoverLog("update_check")
+	if !a.checkMu.TryLock() {
 		return
 	}
-	if !core.NewerVersion(r.Version, version) {
-		a.log.Printf("update_check latest=%s current=%s (up to date)", r.Version, version)
+	defer a.checkMu.Unlock()
+	a.mu.Lock()
+	due := core.CheckDue(a.checkedAt, time.Now(), core.MenuCheckInterval)
+	a.mu.Unlock()
+	if due {
+		_, _ = a.checkUpdate("menu")
+	}
+}
+
+// checkUpdateNow is the "更新を確認" handler. It works even with updateCheck off.
+func (a *App) checkUpdateNow() {
+	defer a.recoverLog("update_check")
+	const mbInfo, mbWarn, mbForeground = 0x40, 0x30, 0x10000
+	if version == "dev" {
+		messageBox("Koe", "開発版のため更新を確認できません", mbInfo|mbForeground)
 		return
+	}
+	a.checkMu.Lock()
+	r, err := a.checkUpdate("manual")
+	a.checkMu.Unlock()
+	switch {
+	case err != nil:
+		messageBox("Koe", "更新を確認できませんでした: "+err.Error(), mbWarn|mbForeground)
+	case r != nil:
+		messageBox("Koe", fmt.Sprintf("新しい版 v%s があります（いまは v%s）。\n\nメニューの「新しい版 v%s があります（クリックで更新）」を押すと更新します。", r.Version, version, r.Version), mbInfo|mbForeground)
+	default:
+		messageBox("Koe", fmt.Sprintf("最新です（v%s）", version), mbInfo|mbForeground)
+	}
+}
+
+// checkUpdate asks GitHub for the latest release and, if it is newer, shows
+// the update item. It returns that release (nil when up to date). The caller
+// holds checkMu.
+func (a *App) checkUpdate(reason string) (*core.Release, error) {
+	a.mu.Lock()
+	a.checkedAt = time.Now()
+	a.mu.Unlock()
+	ua := "Koe-windows/" + version
+	r, err := core.LatestRelease(context.Background(), core.GitHubWeb, a.cfg.UpdateRepo, ua)
+	switch {
+	case err != nil:
+		a.log.Printf("update_check_failed reason=%s repo=%s err=%v", reason, a.cfg.UpdateRepo, err)
+		return nil, err
+	case r.Tag == "":
+		a.log.Printf("update_check reason=%s repo=%s has no releases", reason, a.cfg.UpdateRepo)
+		return nil, nil
+	}
+	if !core.NewerVersion(r.Version, version) {
+		a.log.Printf("update_check reason=%s latest=%s current=%s (up to date)", reason, r.Version, version)
+		return nil, nil
 	}
 	a.mu.Lock()
 	prev := a.avail
+	a.mu.Unlock()
+	if prev != nil && prev.Version == r.Version {
+		return prev, nil // already offered; the zip was checked then
+	}
+	// the tag can be published before the Windows zip is uploaded
+	switch err := core.WindowsAssetExists(context.Background(), r, ua); {
+	case errors.Is(err, core.ErrNoWindowsAsset):
+		a.log.Printf("update_check reason=%s latest=%s (no windows asset %s)", reason, r.Tag, r.Asset)
+		return nil, nil
+	case err != nil:
+		a.log.Printf("update_check_failed reason=%s asset=%s err=%v", reason, r.AssetURL, err)
+		return nil, err
+	}
+	a.mu.Lock()
 	a.avail = &r
 	a.mu.Unlock()
-	if prev == nil || prev.Version != r.Version {
-		a.log.Printf("update_available current=%s latest=%s asset=%s", version, r.Version, r.Asset)
-	}
+	a.log.Printf("update_available current=%s latest=%s asset=%s", version, r.Version, r.Asset)
 	t := &a.tray
 	t.mu.Lock()
 	if t.update != nil {
@@ -91,6 +149,7 @@ func (a *App) checkUpdate() {
 		t.update.Show()
 	}
 	t.mu.Unlock()
+	return &r, nil
 }
 
 // startUpdate is the tray click handler.

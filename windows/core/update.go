@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,8 +22,18 @@ const DefaultUpdateRepo = "chaspy/koe"
 // WindowsAssetSuffix identifies the Windows build among release assets.
 const WindowsAssetSuffix = "-windows-x64.zip"
 
-// GitHubAPI is the base URL of the GitHub REST API.
-const GitHubAPI = "https://api.github.com"
+// GitHubWeb is where releases are looked up (the web pages, not the REST API).
+const GitHubWeb = "https://github.com"
+
+// MenuCheckInterval: opening the tray menu checks for a new version again
+// once the last check is at least this old.
+const MenuCheckInterval = time.Minute
+
+// CheckDue reports whether a check last started at last (zero = never) is
+// due again at now.
+func CheckDue(last, now time.Time, every time.Duration) bool {
+	return last.IsZero() || now.Sub(last) >= every
+}
 
 // Release is a published version that has a Windows build.
 type Release struct {
@@ -33,7 +44,7 @@ type Release struct {
 	Asset    string // asset file name
 }
 
-// ErrNoWindowsAsset means the latest release has no Windows zip.
+// ErrNoWindowsAsset means the latest release has no Windows zip (yet).
 var ErrNoWindowsAsset = errors.New("latest release has no " + WindowsAssetSuffix + " asset")
 
 // NewerVersion reports whether a is newer than b, comparing dot-separated
@@ -69,66 +80,104 @@ func versionParts(v string) []int {
 	return out
 }
 
-// ParseLatestRelease reads the JSON of GET /repos/{repo}/releases/latest and
-// picks the asset whose name ends with WindowsAssetSuffix.
-func ParseLatestRelease(data []byte) (Release, error) {
-	var j struct {
-		TagName string `json:"tag_name"`
-		HTMLURL string `json:"html_url"`
-		Assets  []struct {
-			Name string `json:"name"`
-			URL  string `json:"browser_download_url"`
-		} `json:"assets"`
-	}
-	if err := json.Unmarshal(data, &j); err != nil {
-		return Release{}, fmt.Errorf("release json: %w", err)
-	}
-	if j.TagName == "" {
-		return Release{}, errors.New("release json: no tag_name")
-	}
-	r := Release{Tag: j.TagName, Version: strings.TrimPrefix(j.TagName, "v"), Page: j.HTMLURL}
-	for _, a := range j.Assets {
-		if strings.HasSuffix(strings.ToLower(a.Name), WindowsAssetSuffix) && a.URL != "" {
-			r.Asset, r.AssetURL = a.Name, a.URL
-			return r, nil
-		}
-	}
-	return r, ErrNoWindowsAsset
-}
-
 // ReleasePageURL is where to send the user when the update cannot be done.
 func ReleasePageURL(repo string) string {
 	return "https://github.com/" + repo + "/releases/latest"
 }
 
-// LatestRelease fetches the latest release of repo from apiBase (GitHubAPI).
+// WindowsAssetName is the Windows zip of version v ("Koe-0.3.1-windows-x64.zip").
+func WindowsAssetName(v string) string { return "Koe-" + v + WindowsAssetSuffix }
+
+// noRedirect is a client that returns 3xx responses instead of following them.
+var noRedirect = &http.Client{
+	Timeout:       20 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+func headNoRedirect(ctx context.Context, u, userAgent string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	_ = resp.Body.Close()
+	return resp, nil
+}
+
+// TagFromLocation reads the tag from the redirect of /releases/latest
+// (".../releases/tag/v0.3.1"). ok is false for any other target, e.g.
+// ".../releases" when the repository has no releases.
+func TagFromLocation(loc *url.URL) (tag string, ok bool) {
+	const marker = "/releases/tag/"
+	i := strings.Index(loc.EscapedPath(), marker)
+	if i < 0 {
+		return "", false
+	}
+	tag, err := url.PathUnescape(strings.Trim(loc.EscapedPath()[i+len(marker):], "/"))
+	if err != nil || tag == "" || strings.Contains(tag, "/") {
+		return "", false
+	}
+	return tag, true
+}
+
+// LatestRelease finds the latest release of repo on webBase (GitHubWeb) without
+// the REST API (60 requests an hour per IP without login, shared by everyone
+// behind one office address): HEAD /{repo}/releases/latest redirects to
+// /{repo}/releases/tag/{tag}, and the redirect is read, not followed.
+// AssetURL is where the Windows zip would be; check it with WindowsAssetExists.
 // A repository without releases returns (Release{}, nil) with an empty Tag.
-func LatestRelease(ctx context.Context, apiBase, repo, userAgent string) (Release, error) {
+func LatestRelease(ctx context.Context, webBase, repo, userAgent string) (Release, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	url := strings.TrimRight(apiBase, "/") + "/repos/" + repo + "/releases/latest"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	base := strings.TrimRight(webBase, "/") + "/" + repo + "/releases"
+	resp, err := headNoRedirect(ctx, base+"/latest", userAgent)
 	if err != nil {
 		return Release{}, err
 	}
-	req.Header.Set("User-Agent", userAgent) // required by the GitHub API
-	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return Release{}, err
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		return Release{}, nil
+	case resp.StatusCode < 300 || resp.StatusCode > 399:
+		return Release{}, fmt.Errorf("releases/latest: HTTP %d (expected a redirect)", resp.StatusCode)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	loc, err := resp.Location()
 	if err != nil {
-		return Release{}, err
+		return Release{}, fmt.Errorf("releases/latest: %w", err)
 	}
-	if resp.StatusCode == http.StatusNotFound {
+	tag, ok := TagFromLocation(loc)
+	if !ok {
 		return Release{}, nil
 	}
-	if resp.StatusCode != http.StatusOK {
-		return Release{}, fmt.Errorf("releases/latest: HTTP %d", resp.StatusCode)
+	v := strings.TrimPrefix(tag, "v")
+	return Release{
+		Version:  v,
+		Tag:      tag,
+		Page:     loc.String(),
+		Asset:    WindowsAssetName(v),
+		AssetURL: base + "/download/" + url.PathEscape(tag) + "/" + url.PathEscape(WindowsAssetName(v)),
+	}, nil
+}
+
+// WindowsAssetExists checks r.AssetURL with HEAD (not following the redirect
+// to the file host): 200 or a redirect is there, 404 is ErrNoWindowsAsset.
+func WindowsAssetExists(ctx context.Context, r Release, userAgent string) error {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	resp, err := headNoRedirect(ctx, r.AssetURL, userAgent)
+	if err != nil {
+		return err
 	}
-	return ParseLatestRelease(body)
+	switch {
+	case resp.StatusCode == http.StatusOK || resp.StatusCode >= 300 && resp.StatusCode <= 399:
+		return nil
+	case resp.StatusCode == http.StatusNotFound:
+		return ErrNoWindowsAsset
+	}
+	return fmt.Errorf("%s: HTTP %d", r.Asset, resp.StatusCode)
 }
 
 // ExtractZip extracts zipPath into dest, rejecting entries that would escape it.
