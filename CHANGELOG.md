@@ -4,6 +4,15 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.3.1 — 2026-10-14
+
+### Windows
+- Faster transcription of short utterances on CPU: whisper's encoder no longer processes the full 30 s window every time. Each request sends `audio_ctx` sized to the utterance (50 frames per second + 10% + 64, between 384 and 1500; 30 s or more uses the whole window), so a few seconds of speech no longer costs as much as 30 s. Menu "速さ優先（短い発話を速く。精度が少し落ちることがある）" turns it on (default) or off; `audioCtx` in config.json: `"auto"` | `0` (whole window) | a fixed number.
+- koe.log's `whisper_ok` and the diagnostics show the audio_ctx used.
+
+### macOS
+- No changes.
+
 ## 0.3.0 — 2026-10-14
 
 ### macOS

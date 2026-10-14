@@ -94,6 +94,7 @@ func (a *App) diagnosticsText() []byte {
 	}
 	w("threads = %d (config threads=%d)", threads, a.cfg.Threads)
 	w("pressMode = %s", a.pressMode())
+	w("audioCtx = %s (speed first %s)", a.audioCtxSetting(), onOff(a.audioCtxSetting() != 0))
 	w("hotkey = %s", a.hotkey())
 	w("enabledPacks = %v", a.cfg.EnabledPacks)
 	w("packSources = %v", a.cfg.PackSources)
@@ -103,7 +104,7 @@ func (a *App) diagnosticsText() []byte {
 	cfgRaw, err := os.ReadFile(a.configPath())
 	if err != nil {
 		w("(could not read: %v)", err)
-	} else if lines, err := core.RedactedConfigLines(cfgRaw, "model", "pressMode", "hotkey", "enabledPacks", "packSources", "threads"); err != nil {
+	} else if lines, err := core.RedactedConfigLines(cfgRaw, "model", "pressMode", "hotkey", "enabledPacks", "packSources", "threads", "audioCtx"); err != nil {
 		w("(invalid JSON: %v)", err)
 	} else {
 		for _, l := range lines {
@@ -147,4 +148,11 @@ func (a *App) exportDiagnostics() {
 	if err := cmd.Start(); err != nil {
 		a.log.Printf("diagnostics_explorer_failed %v", err)
 	}
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }

@@ -61,6 +61,7 @@ type App struct {
 	toggle     atomic.Bool   // press mode "toggle"; the event loop picks up changes
 	model      atomic.Value  // string: model file name / path in use (or being switched to)
 	switching  atomic.Bool   // a model switch is running
+	audioCtx   atomic.Int64  // core.AudioCtx in use; the menu "速さ優先" switches auto / 0
 	keys       chan keyEvent
 	updating   atomic.Bool
 	tail       sync.WaitGroup
@@ -149,15 +150,17 @@ func (a *App) startup() {
 	a.setHotkey(cfg.Hotkey)
 	a.toggle.Store(cfg.PressMode == core.PressToggle)
 	a.model.Store(cfg.Model)
+	a.audioCtx.Store(int64(cfg.AudioCtx))
 	a.renderHotkey()
 	a.renderPressMode()
 	a.renderModel()
+	a.renderSpeedFirst()
 	a.log.Printf("start Koe %s rev=%s windows=%d.%d.%d cpus=%d exe=%s", version, rev, v.MajorVersion, v.MinorVersion, v.BuildNumber, runtime.NumCPU(), a.exeDir)
 	si := readSysInfo()
 	a.log.Printf("system cpu=%q logical_cpus=%d ram_mb=%d ram_free_mb=%d threads=%d (config threads=%d)",
 		si.CPU, runtime.NumCPU(), si.RAMTotalMB, si.RAMFreeMB, cfg.ThreadsFor(runtime.NumCPU()), cfg.Threads)
-	a.log.Printf("config hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v",
-		cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback)
+	a.log.Printf("config hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s",
+		cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx)
 	a.log.Printf("input_devices %q", inputDevices())
 
 	if _, err := os.Stat(a.glossaryPath()); os.IsNotExist(err) {
@@ -237,6 +240,25 @@ func (a *App) changePressMode(mode string) {
 	a.log.Printf("press_mode_changed %s", mode)
 	a.wakeEventLoop()
 	a.renderPressMode()
+	a.render()
+}
+
+func (a *App) audioCtxSetting() core.AudioCtx { return core.AudioCtx(a.audioCtx.Load()) }
+
+// changeSpeedFirst is the tray handler of "速さ優先": on = audioCtx "auto",
+// off = 0 (whole window). Saves config.json and applies from the next utterance.
+func (a *App) changeSpeedFirst() {
+	v := core.AudioCtxAuto
+	if a.audioCtxSetting() != 0 {
+		v = 0
+	}
+	if err := core.SetConfigValue(a.configPath(), "audioCtx", v); err != nil {
+		a.log.Printf("audio_ctx_save_failed %v", err)
+		a.setError("設定ファイルに保存できませんでした（今回の起動中だけ切り替えます）: "+err.Error(), false)
+	}
+	a.audioCtx.Store(int64(v))
+	a.log.Printf("audio_ctx_changed %s", v)
+	a.renderSpeedFirst()
 	a.render()
 }
 
@@ -626,15 +648,17 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 	base := core.BaseURL(a.cfg.Port)
 	totalMS := int64(0)
 	entries := append(append([]core.Entry{}, personal...), packs...)
+	actx := a.audioCtxSetting().For(voiced)
+	rec["whisper_audio_ctx"] = actx
 	for attempt := 0; attempt < 2; attempt++ {
 		rec["whisper_prompt"] = prompt
 		t0 := time.Now()
-		raw, err := core.Transcribe(context.Background(), base, wav, prompt, a.cfg.TemperatureFallback)
+		raw, err := core.Transcribe(context.Background(), base, wav, prompt, a.cfg.TemperatureFallback, actx)
 		ms := time.Since(t0).Milliseconds()
 		totalMS += ms
 		rec["transcribe_ms"] = totalMS
 		if err != nil {
-			a.log.Printf("whisper_error ms=%d err=%v", ms, err)
+			a.log.Printf("whisper_error ms=%d audio_ctx=%d err=%v", ms, actx, err)
 			rec["outcome"] = "error"
 			rec["error"] = err.Error()
 			a.fail("文字起こしに失敗: " + err.Error())
@@ -644,8 +668,8 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 		t, applied := core.Autocorrect(raw, entries)
 		ratio := core.MsPerAudioSecond(ms, voiced)
 		rec["ms_per_audio_second"] = int64(ratio)
-		a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
-			ms, voiced, ratio, filepath.Base(a.modelFile()), len([]rune(t)), len([]rune(prompt)), len(applied), attempt)
+		a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
+			ms, voiced, ratio, actx, filepath.Base(a.modelFile()), len([]rune(t)), len([]rune(prompt)), len(applied), attempt)
 		rec["raw"] = t
 		if t != raw {
 			rec["raw_before_autocorrect"] = raw

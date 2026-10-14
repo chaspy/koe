@@ -286,7 +286,7 @@ func TestTranscribe(t *testing.T) {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Error(err)
 		}
-		if r.FormValue("response_format") != "text" || r.FormValue("prompt") != "プロンプト" || r.FormValue("temperature") != "0.0" || r.FormValue("temperature_inc") != "0.0" {
+		if r.FormValue("response_format") != "text" || r.FormValue("prompt") != "プロンプト" || r.FormValue("temperature") != "0.0" || r.FormValue("temperature_inc") != "0.0" || r.FormValue("audio_ctx") != "384" {
 			t.Error("fields", r.Form)
 		}
 		f, fh, err := r.FormFile("file")
@@ -304,7 +304,7 @@ func TestTranscribe(t *testing.T) {
 	if !IsAlive(srv.URL) || IsAlive("http://127.0.0.1:1") {
 		t.Fatal("alive")
 	}
-	got, err := Transcribe(context.Background(), srv.URL, EncodeWAV(make([]int16, 100)), "プロンプト", false)
+	got, err := Transcribe(context.Background(), srv.URL, EncodeWAV(make([]int16, 100)), "プロンプト", false, 384)
 	if err != nil || got != "こんにちは。 元気？" {
 		t.Fatal(got, err)
 	}
@@ -323,9 +323,12 @@ func TestTranscribe(t *testing.T) {
 	if c.ThreadsFor(32) != 6 {
 		t.Fatal("configured threads")
 	}
-	body, _, _ := BuildInferenceBody(nil, "", true)
+	body, _, _ := BuildInferenceBody(nil, "", true, 0)
 	if strings.Contains(string(body), "temperature_inc") {
 		t.Fatal("fallback on must not send temperature_inc")
+	}
+	if !strings.Contains(string(body), "name=\"audio_ctx\"\r\n\r\n0\r\n") {
+		t.Fatal("audio_ctx=0 must be sent so an earlier value does not stick")
 	}
 }
 

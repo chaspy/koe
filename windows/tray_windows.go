@@ -20,6 +20,7 @@ type trayItems struct {
 	hotkeys   map[string]*systray.MenuItem
 	modes     map[string]*systray.MenuItem
 	models    map[string]*systray.MenuItem
+	speed     *systray.MenuItem
 	lastTip   string
 	lastIcon  int
 }
@@ -102,6 +103,12 @@ func (a *App) setupTray() {
 			}
 		}()
 	}
+	t.speed = systray.AddMenuItemCheckbox("速さ優先（短い発話を速く。精度が少し落ちることがある）", "オフにすると毎回 30 秒ぶんの枠で文字起こしします（遅いが元の精度）", false)
+	go func() {
+		for range t.speed.ClickedCh {
+			a.changeSpeedFirst()
+		}
+	}()
 	mDiag := systray.AddMenuItem("診断情報を書き出す（送る用）", "デスクトップに zip を作ります（録音・文字起こしの中身は入りません）")
 	go func() {
 		for range mDiag.ClickedCh {
@@ -171,6 +178,21 @@ func (a *App) renderModel() {
 		} else {
 			mi.Uncheck()
 		}
+	}
+}
+
+// renderSpeedFirst checks "速さ優先" unless audioCtx is 0 (whole window).
+func (a *App) renderSpeedFirst() {
+	t := &a.tray
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.speed == nil {
+		return
+	}
+	if a.audioCtxSetting() != 0 {
+		t.speed.Check()
+	} else {
+		t.speed.Uncheck()
 	}
 }
 

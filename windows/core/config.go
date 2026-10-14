@@ -31,6 +31,7 @@ type Config struct {
 	// TemperatureFallback lets whisper re-decode a hard segment at higher
 	// temperatures (whisper.cpp's default). Off: one greedy pass, much faster on CPU.
 	TemperatureFallback bool     `json:"temperatureFallback"`
+	AudioCtx            AudioCtx `json:"audioCtx"` // encoder window: "auto" (sized to the utterance) | 0 (whole 30 s) | frames
 	Prompt              string   `json:"prompt"`
 	EnabledPacks        []string `json:"enabledPacks"`
 	PackSources         []string `json:"packSources"`
@@ -72,6 +73,7 @@ func DefaultConfig() Config {
 		MenuMaskKey:    true,
 		UpdateCheck:    true,
 		UpdateRepo:     DefaultUpdateRepo,
+		AudioCtx:       AudioCtxAuto,
 	}
 }
 

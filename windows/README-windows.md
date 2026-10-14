@@ -42,6 +42,7 @@ https://aka.ms/vs/17/release/vc_redist.x64.exe
   - small-q5_1（速い、約 190MB）
   - base-q5_1（とても速い、約 60MB）
   - はじめて選んだモデルはダウンロードします（進み具合はアイコンにマウスを乗せると出ます）。終わると自動で切り替わり、`config.json` の `model` にも保存されます
+- 速さ優先（短い発話を速く。精度が少し落ちることがある） … 既定オン。話した長さに合わせた枠で文字起こしするので、数秒の発話が速くなります（オフにすると毎回 30 秒ぶんの枠で処理します）。選ぶとすぐに切り替わり（再起動は不要）、`config.json` の `audioCtx` にも保存されます（オン `"auto"` / オフ `0`）
 - 診断情報を書き出す（送る用） … デスクトップに `Koe-diagnostics-<日時>.zip` を作って、エクスプローラーで表示します（下の「不具合のときに送ってほしいもの」）
 - ログのフォルダを開く
 - 設定ファイルを開く
@@ -69,6 +70,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `pressMode` | `"hold"` | 押し方。`"hold"`（押している間だけ録音）か `"toggle"`（押すたびに開始・終了） |
 | `model` | `"ggml-large-v3-turbo-q5_0.bin"` | モデルのファイル名（`%LOCALAPPDATA%\Koe\models` 内）か絶対パス。`"small-q5_1"` のような短い名前も可 |
 | `threads` | `0` | 文字起こしに使うスレッド数。`0` は自動（論理プロセッサ数、最大 16） |
+| `audioCtx` | `"auto"` | 文字起こしの枠の大きさ。`"auto"` は話した長さに合わせる（短い発話が速い。30 秒以上は全体）、`0` は毎回 30 秒ぶん全体（遅いが元の精度）、数値は固定（1 秒 = 50、最大 1500）。メニューの「速さ優先」で `"auto"` / `0` を切り替えられます |
 | `temperatureFallback` | `false` | うまく読めない区間を条件を変えて読み直すか。`true` にすると精度が少し上がることがありますが、遅くなります |
 | `enabledPacks` | `["developer"]` | 使う用語パック（`packs\*.txt` のファイル名） |
 | `packSources` | `[]` | 共有の用語パックの取り込み元。例 `["gh:owner/repo/path/pack.txt"]`（1 日 1 回、`gh` CLI で取得） |
@@ -94,7 +96,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 - `diagnostics.txt` … Koe と Windows のバージョン、CPU 名、論理プロセッサ数、メモリ、モデル、スレッド数、押し方、録音キー、用語パック、その他の設定
 - `koe.log` の最後の 2000 行、`whisper-server.log` の最後の 500 行、`update.log`（あれば）
 
-文字起こしが遅いときは、`koe.log` の `whisper_ok ms=... audio_sent=...s ms_per_audio_s=...`（音声 1 秒あたりにかかったミリ秒）と、`whisper_server system_info: ...`（CPU が使える命令 AVX / AVX2 など）を見ると原因の見当がつきます。
+文字起こしが遅いときは、`koe.log` の `whisper_ok ms=... audio_sent=...s ms_per_audio_s=... audio_ctx=...`（音声 1 秒あたりにかかったミリ秒と、使った枠の大きさ。`0` は 30 秒ぶん全体）と、`whisper_server system_info: ...`（CPU が使える命令 AVX / AVX2 など）を見ると原因の見当がつきます。
 
 zip を作れないときは、`%LOCALAPPDATA%\Koe` フォルダ（メニューの「ログのフォルダを開く」）から:
 

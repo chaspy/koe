@@ -3,8 +3,10 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -60,6 +62,75 @@ func (c Config) ThreadsFor(numCPU int) int {
 	return AutoThreads(numCPU)
 }
 
+// AudioCtx is the audioCtx setting: AudioCtxAuto, 0 (whisper's whole 30 s
+// window) or a fixed number of encoder frames (50 per second).
+//
+// whisper's encoder always processes the full 30 s window unless audio_ctx is
+// smaller, so on CPU a 3 s utterance costs as much as a 30 s one. Sizing the
+// window to the utterance makes short utterances several times faster, at a
+// small cost in accuracy.
+type AudioCtx int
+
+const (
+	AudioCtxAuto AudioCtx = -1
+	MaxAudioCtx           = 1500 // the 30 s window
+	MinAudioCtx           = 384  // below this, short utterances lose accuracy
+)
+
+// UnmarshalJSON accepts "auto" or a number. Anything else (null, a negative
+// number) is auto; MaxAudioCtx or more is 0 (the whole window).
+func (c *AudioCtx) UnmarshalJSON(b []byte) error {
+	var n *float64
+	if err := json.Unmarshal(b, &n); err != nil || n == nil || *n < 0 {
+		*c = AudioCtxAuto
+		return nil
+	}
+	*c = AudioCtx(*n)
+	if *n >= MaxAudioCtx {
+		*c = 0
+	}
+	return nil
+}
+
+func (c AudioCtx) MarshalJSON() ([]byte, error) {
+	if c == AudioCtxAuto {
+		return []byte(`"auto"`), nil
+	}
+	return []byte(strconv.Itoa(int(c))), nil
+}
+
+func (c AudioCtx) String() string {
+	if c == AudioCtxAuto {
+		return "auto"
+	}
+	return strconv.Itoa(int(c))
+}
+
+// For is the audio_ctx to send for an utterance of seconds.
+func (c AudioCtx) For(seconds float64) int {
+	if c == AudioCtxAuto {
+		return AutoAudioCtx(seconds)
+	}
+	return int(c)
+}
+
+// AutoAudioCtx sizes the encoder window to the audio: 50 frames per second
+// plus 10% and 64 frames of margin, between MinAudioCtx and MaxAudioCtx.
+// 30 s or more uses the whole window (0).
+func AutoAudioCtx(seconds float64) int {
+	if seconds >= 30 {
+		return 0
+	}
+	n := int(math.Ceil(seconds*50*1.1-1e-9)) + 64
+	if n < MinAudioCtx {
+		n = MinAudioCtx
+	}
+	if n > MaxAudioCtx {
+		n = MaxAudioCtx
+	}
+	return n
+}
+
 // BaseURL of the local whisper-server.
 func BaseURL(port int) string { return fmt.Sprintf("http://127.0.0.1:%d", port) }
 
@@ -75,13 +146,16 @@ func IsAlive(baseURL string) bool {
 }
 
 // BuildInferenceBody builds the multipart body of POST /inference
-// (response_format=text, prompt, temperature=0.0, file=audio.wav). Without
-// fallback it also sends temperature_inc=0.0 so a hard segment is decoded
-// once instead of up to six times.
-func BuildInferenceBody(wav []byte, prompt string, fallback bool) (body []byte, contentType string, err error) {
+// (response_format=text, prompt, temperature=0.0, audio_ctx, file=audio.wav).
+// Without fallback it also sends temperature_inc=0.0 so a hard segment is
+// decoded once instead of up to six times.
+//
+// audio_ctx is always sent, 0 included: v1.9.2's server writes it into its
+// global params, so a value from an earlier request would otherwise stick.
+func BuildInferenceBody(wav []byte, prompt string, fallback bool, audioCtx int) (body []byte, contentType string, err error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
-	fields := [][2]string{{"response_format", "text"}, {"prompt", prompt}, {"temperature", "0.0"}}
+	fields := [][2]string{{"response_format", "text"}, {"prompt", prompt}, {"temperature", "0.0"}, {"audio_ctx", strconv.Itoa(audioCtx)}}
 	if !fallback {
 		fields = append(fields, [2]string{"temperature_inc", "0.0"})
 	}
@@ -107,8 +181,8 @@ func BuildInferenceBody(wav []byte, prompt string, fallback bool) (body []byte, 
 }
 
 // Transcribe posts wav to /inference and returns the cleaned text.
-func Transcribe(ctx context.Context, baseURL string, wav []byte, prompt string, fallback bool) (string, error) {
-	body, ct, err := BuildInferenceBody(wav, prompt, fallback)
+func Transcribe(ctx context.Context, baseURL string, wav []byte, prompt string, fallback bool, audioCtx int) (string, error) {
+	body, ct, err := BuildInferenceBody(wav, prompt, fallback, audioCtx)
 	if err != nil {
 		return "", err
 	}

@@ -3,6 +3,7 @@ package core
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -130,6 +131,65 @@ func TestPressModeConfig(t *testing.T) {
 	c, _ = ParseConfig([]byte(`{"threads":-3}`))
 	if c.Threads != 0 || c.TemperatureFallback {
 		t.Fatal(c.Threads)
+	}
+}
+
+func TestAutoAudioCtx(t *testing.T) {
+	cases := []struct {
+		sec  float64
+		want int
+	}{
+		{0, 384}, {2, 384}, {5.81, 384}, {5.82, 385}, {10, 614}, {20, 1164},
+		{25.1, 1445}, {26.2, 1500}, {29.99, 1500}, {30, 0}, {45, 0},
+	}
+	for _, c := range cases {
+		if got := AutoAudioCtx(c.sec); got != c.want {
+			t.Errorf("AutoAudioCtx(%v) = %d, want %d", c.sec, got, c.want)
+		}
+		if got := AudioCtxAuto.For(c.sec); got != c.want {
+			t.Errorf("auto For(%v) = %d", c.sec, got)
+		}
+	}
+	if AudioCtx(0).For(3) != 0 || AudioCtx(768).For(3) != 768 {
+		t.Fatal("fixed audioCtx")
+	}
+}
+
+func TestAudioCtxConfig(t *testing.T) {
+	cases := map[string]AudioCtx{
+		`{}`:                  AudioCtxAuto,
+		`{"audioCtx":"auto"}`: AudioCtxAuto,
+		`{"audioCtx":"x"}`:    AudioCtxAuto,
+		`{"audioCtx":-5}`:     AudioCtxAuto,
+		`{"audioCtx":null}`:   AudioCtxAuto,
+		`{"audioCtx":0}`:      0,
+		`{"audioCtx":768}`:    768,
+		`{"audioCtx":1500}`:   0,
+		`{"audioCtx":4000}`:   0,
+	}
+	for in, want := range cases {
+		c, err := ParseConfig([]byte(in))
+		if err != nil || c.AudioCtx != want {
+			t.Errorf("%s: %v %v", in, c.AudioCtx, err)
+		}
+	}
+	for v, want := range map[AudioCtx]string{AudioCtxAuto: `"auto"`, 0: `0`, 768: `768`} {
+		b, _ := json.Marshal(v)
+		if string(b) != want || (v == AudioCtxAuto && v.String() != "auto") {
+			t.Errorf("marshal %d = %s", v, b)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := SetConfigValue(path, "audioCtx", AudioCtx(0)); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := LoadConfig(path)
+	if c.AudioCtx != 0 {
+		t.Fatal("saved off", c.AudioCtx)
+	}
+	SetConfigValue(path, "audioCtx", AudioCtxAuto)
+	if c, _ = LoadConfig(path); c.AudioCtx != AudioCtxAuto {
+		t.Fatal("saved auto", c.AudioCtx)
 	}
 }
 
