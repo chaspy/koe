@@ -18,6 +18,8 @@ type trayItems struct {
 	recentAll *systray.MenuItem
 	update    *systray.MenuItem
 	hotkeys   map[string]*systray.MenuItem
+	modes     map[string]*systray.MenuItem
+	models    map[string]*systray.MenuItem
 	lastTip   string
 	lastIcon  int
 }
@@ -73,6 +75,39 @@ func (a *App) setupTray() {
 			}
 		}()
 	}
+	pm := systray.AddMenuItem("押し方", "")
+	t.modes = map[string]*systray.MenuItem{}
+	for _, m := range []struct{ mode, label string }{
+		{core.PressHold, "押している間だけ録音"},
+		{core.PressToggle, "押すたびに開始・終了"},
+	} {
+		mi := pm.AddSubMenuItemCheckbox(m.label, "", false)
+		t.modes[m.mode] = mi
+		mode := m.mode
+		go func() {
+			for range mi.ClickedCh {
+				a.changePressMode(mode)
+			}
+		}()
+	}
+	mm := systray.AddMenuItem("モデル（速さ⇔精度）", "遅いと感じたら small → base の順に軽くする")
+	t.models = map[string]*systray.MenuItem{}
+	for _, c := range core.ModelChoices {
+		mi := mm.AddSubMenuItemCheckbox(c.Label, "", false)
+		t.models[c.File] = mi
+		file := c.File
+		go func() {
+			for range mi.ClickedCh {
+				go a.changeModel(file)
+			}
+		}()
+	}
+	mDiag := systray.AddMenuItem("診断情報を書き出す（送る用）", "デスクトップに zip を作ります（録音・文字起こしの中身は入りません）")
+	go func() {
+		for range mDiag.ClickedCh {
+			go a.exportDiagnostics()
+		}
+	}()
 	mLog := systray.AddMenuItem("ログのフォルダを開く", a.localDir)
 	mCfg := systray.AddMenuItem("設定ファイルを開く", a.configPath())
 	systray.AddSeparator()
@@ -102,6 +137,36 @@ func (a *App) renderHotkey() {
 	defer t.mu.Unlock()
 	for name, mi := range t.hotkeys {
 		if name == cur {
+			mi.Check()
+		} else {
+			mi.Uncheck()
+		}
+	}
+}
+
+// renderPressMode puts the check mark on the current press mode.
+func (a *App) renderPressMode() {
+	t := &a.tray
+	cur := a.pressMode()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for mode, mi := range t.modes {
+		if mode == cur {
+			mi.Check()
+		} else {
+			mi.Uncheck()
+		}
+	}
+}
+
+// renderModel puts the check mark on the model in use (none for a custom model).
+func (a *App) renderModel() {
+	t := &a.tray
+	cur := a.modelFile()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for file, mi := range t.models {
+		if file == cur {
 			mi.Check()
 		} else {
 			mi.Uncheck()

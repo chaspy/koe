@@ -286,7 +286,7 @@ func TestTranscribe(t *testing.T) {
 		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			t.Error(err)
 		}
-		if r.FormValue("response_format") != "text" || r.FormValue("prompt") != "プロンプト" || r.FormValue("temperature") != "0.0" {
+		if r.FormValue("response_format") != "text" || r.FormValue("prompt") != "プロンプト" || r.FormValue("temperature") != "0.0" || r.FormValue("temperature_inc") != "0.0" {
 			t.Error("fields", r.Form)
 		}
 		f, fh, err := r.FormFile("file")
@@ -304,16 +304,28 @@ func TestTranscribe(t *testing.T) {
 	if !IsAlive(srv.URL) || IsAlive("http://127.0.0.1:1") {
 		t.Fatal("alive")
 	}
-	got, err := Transcribe(context.Background(), srv.URL, EncodeWAV(make([]int16, 100)), "プロンプト")
+	got, err := Transcribe(context.Background(), srv.URL, EncodeWAV(make([]int16, 100)), "プロンプト", false)
 	if err != nil || got != "こんにちは。 元気？" {
 		t.Fatal(got, err)
 	}
 	args := ServerArgs(DefaultConfig(), `C:\m.bin`, 4)
-	if strings.Join(args, " ") != `-m C:\m.bin -l ja --host 127.0.0.1 --port 18080 -t 4 --prompt `+DefaultPrompt {
+	if strings.Join(args, " ") != `-m C:\m.bin -l ja --host 127.0.0.1 --port 18080 -t 4 -bs 1 -bo 1 -fa --prompt `+DefaultPrompt {
 		t.Fatal(args)
 	}
-	if AutoThreads(2) != 4 || AutoThreads(12) != 6 || AutoThreads(64) != 8 {
+	if AutoThreads(0) != 1 || AutoThreads(2) != 2 || AutoThreads(12) != 12 || AutoThreads(64) != 16 {
 		t.Fatal("threads")
+	}
+	c := DefaultConfig()
+	if c.ThreadsFor(8) != 8 {
+		t.Fatal("auto threads")
+	}
+	c.Threads = 6
+	if c.ThreadsFor(32) != 6 {
+		t.Fatal("configured threads")
+	}
+	body, _, _ := BuildInferenceBody(nil, "", true)
+	if strings.Contains(string(body), "temperature_inc") {
+		t.Fatal("fallback on must not send temperature_inc")
 	}
 }
 

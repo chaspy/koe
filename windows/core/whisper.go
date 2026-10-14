@@ -13,6 +13,16 @@ import (
 )
 
 // ServerArgs are the whisper-server command line arguments.
+// All flags exist in whisper-server v1.9.2 (examples/server/server.cpp):
+//
+//	-t      threads for the encoder / decoder
+//	-bs 1   beam size 1 = greedy decoding (the default is already greedy; explicit)
+//	-bo 1   keep 1 candidate (only matters when sampling at temperature > 0)
+//	-fa     flash attention (default on in v1.9.2; explicit so older defaults do not slow it down)
+//
+// The temperature fallback (re-decoding up to 5 times at 0.2, 0.4, ...) is
+// turned off per request with temperature_inc=0 (see BuildInferenceBody):
+// v1.9.2's server parses -nf but never applies it.
 func ServerArgs(c Config, modelPath string, threads int) []string {
 	return []string{
 		"-m", modelPath,
@@ -20,21 +30,34 @@ func ServerArgs(c Config, modelPath string, threads int) []string {
 		"--host", "127.0.0.1",
 		"--port", strconv.Itoa(c.Port),
 		"-t", strconv.Itoa(threads),
+		"-bs", "1",
+		"-bo", "1",
+		"-fa",
 		"--prompt", c.Prompt,
 	}
 }
 
-// AutoThreads picks whisper threads from the CPU count: half the logical
-// CPUs, clamped to [4, 8].
+// MaxThreads caps the automatic thread count.
+const MaxThreads = 16
+
+// AutoThreads picks whisper threads: the number of logical CPUs, capped at
+// MaxThreads.
 func AutoThreads(numCPU int) int {
-	t := numCPU / 2
-	if t < 4 {
-		t = 4
+	if numCPU < 1 {
+		return 1
 	}
-	if t > 8 {
-		t = 8
+	if numCPU > MaxThreads {
+		return MaxThreads
 	}
-	return t
+	return numCPU
+}
+
+// ThreadsFor is the configured thread count, or AutoThreads when 0 / negative.
+func (c Config) ThreadsFor(numCPU int) int {
+	if c.Threads > 0 {
+		return c.Threads
+	}
+	return AutoThreads(numCPU)
 }
 
 // BaseURL of the local whisper-server.
@@ -52,11 +75,17 @@ func IsAlive(baseURL string) bool {
 }
 
 // BuildInferenceBody builds the multipart body of POST /inference
-// (response_format=text, prompt, temperature=0.0, file=audio.wav).
-func BuildInferenceBody(wav []byte, prompt string) (body []byte, contentType string, err error) {
+// (response_format=text, prompt, temperature=0.0, file=audio.wav). Without
+// fallback it also sends temperature_inc=0.0 so a hard segment is decoded
+// once instead of up to six times.
+func BuildInferenceBody(wav []byte, prompt string, fallback bool) (body []byte, contentType string, err error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
-	for _, f := range [][2]string{{"response_format", "text"}, {"prompt", prompt}, {"temperature", "0.0"}} {
+	fields := [][2]string{{"response_format", "text"}, {"prompt", prompt}, {"temperature", "0.0"}}
+	if !fallback {
+		fields = append(fields, [2]string{"temperature_inc", "0.0"})
+	}
+	for _, f := range fields {
 		if err := w.WriteField(f[0], f[1]); err != nil {
 			return nil, "", err
 		}
@@ -78,8 +107,8 @@ func BuildInferenceBody(wav []byte, prompt string) (body []byte, contentType str
 }
 
 // Transcribe posts wav to /inference and returns the cleaned text.
-func Transcribe(ctx context.Context, baseURL string, wav []byte, prompt string) (string, error) {
-	body, ct, err := BuildInferenceBody(wav, prompt)
+func Transcribe(ctx context.Context, baseURL string, wav []byte, prompt string, fallback bool) (string, error) {
+	body, ct, err := BuildInferenceBody(wav, prompt, fallback)
 	if err != nil {
 		return "", err
 	}

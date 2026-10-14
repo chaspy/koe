@@ -1,7 +1,8 @@
 //go:build windows
 
-// Koe for Windows: hold Right Alt to record, release to transcribe with a
-// local whisper-server and paste. See README-windows.md.
+// Koe for Windows: hold Right Alt to record (or tap to start / tap to stop),
+// release to transcribe with a local whisper-server and paste. See
+// README-windows.md.
 package main
 
 import (
@@ -57,6 +58,10 @@ type App struct {
 	holding    atomic.Bool
 	hotkeyVK   atomic.Uint32 // current push-to-talk key; the event loop picks up changes
 	hotkeyName atomic.Value  // string "ralt" | "rctrl"
+	toggle     atomic.Bool   // press mode "toggle"; the event loop picks up changes
+	model      atomic.Value  // string: model file name / path in use (or being switched to)
+	switching  atomic.Bool   // a model switch is running
+	keys       chan keyEvent
 	updating   atomic.Bool
 	tail       sync.WaitGroup
 	queue      chan *utterance
@@ -142,10 +147,17 @@ func (a *App) startup() {
 	a.cfg = cfg
 	v := windows.RtlGetVersion()
 	a.setHotkey(cfg.Hotkey)
+	a.toggle.Store(cfg.PressMode == core.PressToggle)
+	a.model.Store(cfg.Model)
 	a.renderHotkey()
+	a.renderPressMode()
+	a.renderModel()
 	a.log.Printf("start Koe %s rev=%s windows=%d.%d.%d cpus=%d exe=%s", version, rev, v.MajorVersion, v.MinorVersion, v.BuildNumber, runtime.NumCPU(), a.exeDir)
-	a.log.Printf("config hotkey=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f",
-		cfg.Hotkey, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds)
+	si := readSysInfo()
+	a.log.Printf("system cpu=%q logical_cpus=%d ram_mb=%d ram_free_mb=%d threads=%d (config threads=%d)",
+		si.CPU, runtime.NumCPU(), si.RAMTotalMB, si.RAMFreeMB, cfg.ThreadsFor(runtime.NumCPU()), cfg.Threads)
+	a.log.Printf("config hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v",
+		cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback)
 	a.log.Printf("input_devices %q", inputDevices())
 
 	if _, err := os.Stat(a.glossaryPath()); os.IsNotExist(err) {
@@ -160,11 +172,12 @@ func (a *App) startup() {
 	}
 
 	vk := a.hotkeyVK.Load()
-	a.hold = core.HoldTracker{HotkeyVK: vk, MinHold: time.Duration(cfg.MinHoldSeconds * float64(time.Second))}
+	a.hold = core.HoldTracker{HotkeyVK: vk, MinHold: time.Duration(cfg.MinHoldSeconds * float64(time.Second)), Toggle: a.toggle.Load()}
 	a.rec = NewRecorder(cfg.WarmMic, a.log.Printf)
 	a.rec.Warm()
 
 	keys := make(chan keyEvent, 256)
+	a.keys = keys
 	tid, err := startKeyboardHook(keys)
 	if err != nil {
 		a.log.Printf("hook_failed %v", err)
@@ -184,11 +197,100 @@ func (a *App) startup() {
 		a.exportReceivers()
 	}()
 	if firstRun {
-		go messageBox("Koe", "Koe を起動しました。\n\n初回は音声認識モデル（約 550MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。", 0x40)
+		go messageBox("Koe", "Koe を起動しました。\n\n初回は音声認識モデル（約 550MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。\n\n文字起こしが遅いと感じたら、アイコンのメニュー「モデル（速さ⇔精度）」で small → base の順に軽くしてください。", 0x40)
 	}
 	a.reportPreviousUpdate()
 	go a.updateLoop()
 	a.prepareModelAndServer()
+}
+
+// wakeEventLoop makes the event loop apply a hotkey / press mode change now
+// instead of at the next real key event (cancelling a running recording).
+func (a *App) wakeEventLoop() {
+	if a.keys == nil {
+		return
+	}
+	select {
+	case a.keys <- keyEvent{injected: true, at: time.Now()}:
+	default:
+	}
+}
+
+func (a *App) pressMode() string {
+	if a.toggle.Load() {
+		return core.PressToggle
+	}
+	return core.PressHold
+}
+
+// changePressMode is the tray handler: saves config.json and applies at once.
+func (a *App) changePressMode(mode string) {
+	if mode == a.pressMode() {
+		a.renderPressMode()
+		return
+	}
+	if err := core.SetConfigValue(a.configPath(), "pressMode", mode); err != nil {
+		a.log.Printf("press_mode_save_failed %v", err)
+		a.setError("設定ファイルに保存できませんでした（今回の起動中だけ切り替えます）: "+err.Error(), false)
+	}
+	a.toggle.Store(mode == core.PressToggle)
+	a.log.Printf("press_mode_changed %s", mode)
+	a.wakeEventLoop()
+	a.renderPressMode()
+	a.render()
+}
+
+func (a *App) modelFile() string {
+	if s, ok := a.model.Load().(string); ok {
+		return s
+	}
+	return a.cfg.Model
+}
+
+func (a *App) modelPathFor(file string) string {
+	c := a.cfg
+	c.Model = file
+	return c.ModelPath(a.modelsDir())
+}
+
+// changeModel is the tray handler: downloads the model if needed, saves
+// config.json and restarts whisper-server with it.
+func (a *App) changeModel(file string) {
+	defer a.recoverLog("change_model")
+	if file == a.modelFile() && a.ready.Load() {
+		a.renderModel()
+		return
+	}
+	if a.recording.Load() || a.processing.Load() > 0 {
+		a.renderModel()
+		a.setError("録音中・文字起こし中はモデルを切り替えられません。終わってからもう一度選んでください", false)
+		return
+	}
+	if !a.switching.CompareAndSwap(false, true) {
+		a.renderModel()
+		a.setError("モデルを準備中です。終わってからもう一度選んでください", false)
+		return
+	}
+	defer a.switching.Store(false)
+	prev := a.modelFile()
+	a.log.Printf("model_change from=%s to=%s", prev, file)
+	path := a.modelPathFor(file)
+	if err := a.ensureModel(path, core.ModelFileURL(file)); err != nil {
+		a.renderModel()
+		return
+	}
+	if err := core.SetConfigValue(a.configPath(), "model", file); err != nil {
+		a.log.Printf("model_save_failed %v", err)
+		a.setError("設定ファイルに保存できませんでした（今回の起動中だけ切り替えます）: "+err.Error(), false)
+	}
+	a.model.Store(file)
+	a.renderModel()
+	a.ready.Store(false)
+	a.render()
+	if a.server != nil {
+		a.server.StopAndWait()
+	}
+	a.startServer(path)
 }
 
 // setHotkey makes name ("ralt" | "rctrl") the push-to-talk key. The event
@@ -220,6 +322,7 @@ func (a *App) changeHotkey(name string) {
 	}
 	a.setHotkey(name)
 	a.log.Printf("hotkey_changed %s vk=0x%X", name, core.HotkeyVK(name))
+	a.wakeEventLoop()
 	a.renderHotkey()
 	a.render()
 }
@@ -232,9 +335,19 @@ func (a *App) recoverLog(where string) {
 }
 
 func (a *App) prepareModelAndServer() {
+	a.switching.Store(true)
+	defer a.switching.Store(false)
 	model := a.cfg.ModelPath(a.modelsDir())
+	if err := a.ensureModel(model, a.cfg.ModelDownloadURL()); err != nil {
+		return
+	}
+	a.startServer(model)
+}
+
+// ensureModel downloads the model to path (resuming a partial download)
+// unless it is already there. Progress is shown in the tray tooltip.
+func (a *App) ensureModel(model, url string) error {
 	if _, err := os.Stat(model); err != nil {
-		url := a.cfg.ModelDownloadURL()
 		a.log.Printf("model_download_start url=%s dest=%s", url, model)
 		a.setDownload(0)
 		t0 := time.Now()
@@ -252,14 +365,20 @@ func (a *App) prepareModelAndServer() {
 		a.setDownload(-1)
 		if err != nil {
 			a.log.Printf("model_download_failed err=%v after_ms=%d", err, time.Since(t0).Milliseconds())
-			a.setError("モデルのダウンロードに失敗しました（Koe を再起動すると続きから再開します）: "+err.Error(), true)
-			return
+			a.setError("モデルのダウンロードに失敗しました（Koe を再起動するか、もう一度選ぶと続きから再開します）: "+err.Error(), true)
+			return err
 		}
 		a.log.Printf("model_download_done ms=%d", time.Since(t0).Milliseconds())
 	}
+	return nil
+}
+
+// startServer launches whisper-server with model and marks Koe ready.
+func (a *App) startServer(model string) {
 	if fi, err := os.Stat(model); err == nil {
 		a.log.Printf("model %s size_mb=%d", model, fi.Size()>>20)
 	}
+	a.setError("", false)
 	a.server = &WhisperServer{app: a}
 	if err := a.server.Start(model); err != nil {
 		a.log.Printf("server_failed err=%v", err)
@@ -285,6 +404,14 @@ func (a *App) eventLoop(keys <-chan keyEvent) {
 			a.hold.SetHotkey(vk)
 			a.log.Printf("hotkey_applied vk=0x%X", vk)
 		}
+		if tg := a.toggle.Load(); tg != a.hold.Toggle {
+			if a.cur != nil {
+				a.cancel(ev.at)
+			}
+			a.holding.Store(false)
+			a.hold.SetToggle(tg)
+			a.log.Printf("press_mode_applied toggle=%v", tg)
+		}
 		if ev.injected {
 			continue
 		}
@@ -298,6 +425,10 @@ func (a *App) eventLoop(keys <-chan keyEvent) {
 			case core.ActStart:
 				a.log.Printf("key_down hotkey vk=0x%X", ev.vk)
 				a.begin(ev)
+			case core.ActNone:
+				if ev.vk == a.hold.HotkeyVK && a.hold.Latched() {
+					a.holding.Store(true) // stop tap: do not paste while the key is down
+				}
 			case core.ActCancel:
 				if wasHolding {
 					a.log.Printf("other_key_while_holding vk=0x%X -> cancel", ev.vk)
@@ -313,6 +444,15 @@ func (a *App) eventLoop(keys <-chan keyEvent) {
 			case core.ActShort:
 				a.holding.Store(false)
 				a.discard("too_short", held)
+			case core.ActLatch:
+				a.holding.Store(false)
+				if a.cur == nil {
+					// recording did not start (not ready / mic error): the next tap starts again
+					a.hold.Reset()
+					break
+				}
+				a.log.Printf("toggle_latched (recording until the next tap)")
+				a.render()
 			case core.ActFinish:
 				a.holding.Store(false)
 				a.end(ev.at, held)
@@ -462,7 +602,7 @@ func (a *App) process(u *utterance) {
 	packs := core.LoadPackEntries(a.packs(), a.cfg.EnabledPacks)
 	terms := core.WhisperTerms(personal, packs, a.usageCounts(append(append([]core.Entry{}, personal...), packs...)), core.WhisperPromptTermLimit)
 	prompt := core.BuildWhisperPrompt(a.cfg.Prompt, terms, a.previousText(u))
-	rec["whisper_model"] = filepath.Base(a.cfg.Model)
+	rec["whisper_model"] = filepath.Base(a.modelFile())
 
 	text, ok := a.transcribe(u, wav, prompt, voiced, personal, packs)
 	if !ok {
@@ -489,7 +629,7 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 	for attempt := 0; attempt < 2; attempt++ {
 		rec["whisper_prompt"] = prompt
 		t0 := time.Now()
-		raw, err := core.Transcribe(context.Background(), base, wav, prompt)
+		raw, err := core.Transcribe(context.Background(), base, wav, prompt, a.cfg.TemperatureFallback)
 		ms := time.Since(t0).Milliseconds()
 		totalMS += ms
 		rec["transcribe_ms"] = totalMS
@@ -502,7 +642,10 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 		}
 		raw = strings.TrimSpace(raw)
 		t, applied := core.Autocorrect(raw, entries)
-		a.log.Printf("whisper_ok ms=%d chars=%d prompt_chars=%d autocorrected=%v retry=%d", ms, len([]rune(t)), len([]rune(prompt)), applied, attempt)
+		ratio := core.MsPerAudioSecond(ms, voiced)
+		rec["ms_per_audio_second"] = int64(ratio)
+		a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
+			ms, voiced, ratio, filepath.Base(a.modelFile()), len([]rune(t)), len([]rune(prompt)), len(applied), attempt)
 		rec["raw"] = t
 		if t != raw {
 			rec["raw_before_autocorrect"] = raw
@@ -733,12 +876,17 @@ func (a *App) statusText() string {
 		return a.updateMsg
 	case a.download >= 0:
 		return fmt.Sprintf("モデル取得中 %.0f%%", a.download)
+	case a.recording.Load() && a.toggle.Load():
+		return "録音中（もう一度 " + core.HotkeyLabel(a.hotkey()) + " を押すと終了）"
 	case a.recording.Load():
 		return "録音中"
 	case a.processing.Load() > 0:
 		return "文字起こし中"
 	case !a.ready.Load():
 		return "準備中（モデル読み込み）"
+	}
+	if a.toggle.Load() {
+		return "待機中（" + core.HotkeyLabel(a.hotkey()) + " を押すと録音開始、もう一度で終了）"
 	}
 	return "待機中（" + core.HotkeyLabel(a.hotkey()) + " を押している間だけ録音）"
 }

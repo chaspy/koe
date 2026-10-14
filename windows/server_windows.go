@@ -5,6 +5,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,11 +31,14 @@ func hideWindow(cmd *exec.Cmd) {
 }
 
 type WhisperServer struct {
-	app    *App
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	job    windows.Handle
-	exited chan struct{}
+	app      *App
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	job      windows.Handle
+	exited   chan struct{}
+	stopping bool // Stop was called: the exit is expected
+	Threads  int
+	Model    string
 }
 
 // Start launches whisper-server.exe (or reuses one already listening) and
@@ -50,10 +54,8 @@ func (s *WhisperServer) Start(modelPath string) error {
 	if _, err := os.Stat(exe); err != nil {
 		return fmt.Errorf("whisper-server.exe が見つかりません: %s", exe)
 	}
-	threads := a.cfg.Threads
-	if threads <= 0 {
-		threads = core.AutoThreads(runtime.NumCPU())
-	}
+	threads := a.cfg.ThreadsFor(runtime.NumCPU())
+	s.Threads, s.Model = threads, modelPath
 	args := core.ServerArgs(a.cfg, modelPath, threads)
 	logPath := filepath.Join(a.localDir, "whisper-server.log")
 	lf, err := os.Create(logPath)
@@ -62,14 +64,20 @@ func (s *WhisperServer) Start(modelPath string) error {
 	}
 	cmd := exec.Command(exe, args...)
 	cmd.Dir = a.exeDir
-	cmd.Stdout, cmd.Stderr = lf, lf
+	// everything goes to whisper-server.log; CPU features, thread count and
+	// timings are also copied into koe.log
+	filter := &core.LineFilter{Match: core.InterestingServerLine, Fn: func(line string) {
+		a.log.Printf("whisper_server %s", line)
+	}}
+	out := io.MultiWriter(lf, filter)
+	cmd.Stdout, cmd.Stderr = out, out
 	hideWindow(cmd)
 	t0 := time.Now()
 	if err := cmd.Start(); err != nil {
 		lf.Close()
 		return fmt.Errorf("whisper-server を起動できません: %w", err)
 	}
-	a.log.Printf("server_launched pid=%d threads=%d model=%s log=%s", cmd.Process.Pid, threads, modelPath, logPath)
+	a.log.Printf("server_launched pid=%d threads=%d model=%s args=%q log=%s", cmd.Process.Pid, threads, modelPath, args[:len(args)-2], logPath)
 	exited := make(chan struct{})
 	s.mu.Lock()
 	s.cmd, s.exited = cmd, exited
@@ -83,7 +91,10 @@ func (s *WhisperServer) Start(modelPath string) error {
 			code = cmd.ProcessState.ExitCode()
 		}
 		a.log.Printf("server_exited code=%d (0x%X) err=%v after_ms=%d", code, uint32(code), err, time.Since(t0).Milliseconds())
-		if a.ready.Swap(false) {
+		s.mu.Lock()
+		expected := s.stopping
+		s.mu.Unlock()
+		if a.ready.Swap(false) && !expected {
 			a.setError("whisper-server が終了しました。Koe を再起動してください", true)
 		}
 		close(exited)
@@ -148,11 +159,31 @@ func (s *WhisperServer) assignJob(pid int) {
 func (s *WhisperServer) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.stopping = true
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
 	if s.job != 0 {
 		windows.CloseHandle(s.job)
 		s.job = 0
+	}
+}
+
+// StopAndWait stops the server and waits (up to 10 s) until it has exited
+// and the port no longer answers, so a new server can take the port.
+func (s *WhisperServer) StopAndWait() {
+	s.Stop()
+	s.mu.Lock()
+	exited := s.exited
+	s.mu.Unlock()
+	if exited != nil {
+		select {
+		case <-exited:
+		case <-time.After(10 * time.Second):
+		}
+	}
+	base := core.BaseURL(s.app.cfg.Port)
+	for i := 0; i < 20 && core.IsAlive(base); i++ {
+		time.Sleep(250 * time.Millisecond)
 	}
 }

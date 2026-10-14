@@ -69,6 +69,11 @@ enum Settings {
         guard autoEnter, let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
         return enterApps.contains(id)
     }
+    // 押し方: hold＝押している間だけ録音（既定） / toggle＝短く押すと開始、もう一度短く押すと終了して貼る
+    static var toggleMode: Bool {
+        get { defaults.string(forKey: "pressMode") == "toggle" }
+        set { defaults.set(newValue ? "toggle" : "hold", forKey: "pressMode") }
+    }
     // ターミナル以外（Google Docs 等）に貼るとき、whisper の区切りごとに改行する。既定はオフ
     static var lineBreaks: Bool {
         get { defaults.bool(forKey: "lineBreaks") }
@@ -1282,6 +1287,19 @@ enum History {
     }
 
     // 直近 n 件の貼り付けたテキスト（古い順）
+    // 直近 n 件の記録（古い順）
+    static func recentRecords(_ n: Int) -> [[String: Any]] {
+        let fm = FileManager.default
+        var files: [URL] = []
+        for d in ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted().suffix(7) {
+            let u = dir.appendingPathComponent(d)
+            files += ((try? fm.contentsOfDirectory(atPath: u.path)) ?? []).filter { $0.hasSuffix(".json") }.map { u.appendingPathComponent($0) }
+        }
+        return files.sorted { $0.lastPathComponent < $1.lastPathComponent }.suffix(n).compactMap {
+            (try? Data(contentsOf: $0)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        }
+    }
+
     static func recentPasted(_ n: Int) -> [(time: Date, text: String)] {
         let fm = FileManager.default
         let days = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).sorted().suffix(3)
@@ -1941,6 +1959,94 @@ enum Events {
     }
 }
 
+// MARK: - Diagnostics
+
+// 送ってもらう用の診断情報。版・機種・設定・動作の記録・速さ・whisper のログをまとめる。
+// 文字起こしの本文・録音・辞書の中身は入れない（設定の秘密の値と、語や本文が入りうる欄は伏せる）
+enum Diagnostics {
+    static let secretWords = ["key", "token", "secret", "password", "auth"]
+    // 値に語・本文・個人の情報が入りうる設定
+    static let privateKeys: Set<String> = ["prompt", "contextPrompt", "improveCommand", "improveTokenCommand", "llmPrompt", "glossaryPath", "orgGlossary"]
+    // 動作の記録で、語や本文が入りうる欄
+    static let privateEventFields: Set<String> = ["summary", "text", "raw", "pasted", "added", "terms", "error"]
+
+    static func redactSetting(_ key: String, _ value: Any) -> String {
+        let k = key.lowercased()
+        if secretWords.contains(where: { k.contains($0) }) { return "***" }
+        if privateKeys.contains(key) { return "（\(String(describing: value).count) 文字・伏せた）" }
+        return String(describing: value).replacingOccurrences(of: "\n", with: " ")
+    }
+
+    static func redactEvent(_ line: String) -> String? {
+        guard var e = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return nil }
+        for f in privateEventFields where e[f] != nil { e[f] = "（伏せた）" }
+        guard let d = try? JSONSerialization.data(withJSONObject: e, options: [.sortedKeys]) else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
+    static func sh(_ cmd: String) -> String {
+        let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", cmd]
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return "" }
+        p.waitUntilExit()
+        return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    // デスクトップに Koe-diagnostics-<日時>.zip を作り、その場所を返す
+    static func export() throws -> URL {
+        let fm = FileManager.default
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmm"
+        let stamp = f.string(from: Date())
+        let work = fm.temporaryDirectory.appendingPathComponent("Koe-diagnostics-\(stamp)")
+        try? fm.removeItem(at: work)
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        let koeDir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe")
+        let info = Bundle.main.infoDictionary
+        var lines: [String] = []
+        lines.append("Koe \(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?"))")
+        lines.append("macOS \(ProcessInfo.processInfo.operatingSystemVersionString)")
+        lines.append("機種 \(sh("sysctl -n hw.model")) / CPU \(sh("sysctl -n machdep.cpu.brand_string")) / 論理 CPU \(ProcessInfo.processInfo.processorCount) / メモリ \(ProcessInfo.processInfo.physicalMemory / 1_073_741_824) GB")
+        var load = [Double](repeating: 0, count: 3)
+        if getloadavg(&load, 3) > 0 { lines.append(String(format: "負荷 %.1f %.1f %.1f / 起動から %@", load[0], load[1], load[2], sh("uptime | sed 's/.*up \\([^,]*\\),.*/\\1/'"))) }
+        lines.append("モデル \(Settings.model)（\(((try? fm.attributesOfItem(atPath: (Settings.model as NSString).expandingTildeInPath))?[.size] as? Int ?? 0) / 1_048_576) MB）")
+        lines.append("入力デバイス: \(AudioDevices.inputs().map(\.name).joined(separator: " / "))")
+        lines.append("")
+        lines.append("## 設定（秘密の値・本文が入りうる値は伏せた）")
+        let dom = UserDefaults.standard.persistentDomain(forName: Bundle.main.bundleIdentifier ?? "io.github.chaspy.koe") ?? [:]
+        for k in dom.keys.sorted() where !k.hasPrefix("NS") { lines.append("- \(k) = \(redactSetting(k, dom[k]!))") }
+        lines.append("")
+        lines.append("## 辞書の大きさ（中身は入れない）")
+        lines.append("個人の辞書 \(Glossary.personal.count) 語 / パック \(Glossary.packs.count) 語 / 組織の辞書 \(Glossary.org.count) 語")
+        lines.append("")
+        lines.append("## 直近 300 回の速さと結果（数字だけ）")
+        lines.append("id\tapp\taudio_s\tvoiced_s\ttranscribe_ms\trelease_to_paste_ms\tload1\tpeak\tlevel_db\tpasted\tcommunication\timpact")
+        for r in History.recentRecords(300) {
+            let q = r["quality"] as? [String: Any]
+            let row: [Any?] = [r["id"], r["app"], r["audio_seconds"], r["voiced_seconds"], r["transcribe_ms"], r["release_to_paste_ms"],
+                               r["load1"], r["peak"], q?["level_db"], (r["pasted"] is String), r["communication"], r["communication_impact"]]
+            lines.append(row.map { $0.map { "\($0)" } ?? "" }.joined(separator: "\t"))
+        }
+        try lines.joined(separator: "\n").write(to: work.appendingPathComponent("diagnostics.txt"), atomically: true, encoding: .utf8)
+        // 動作の記録（直近 3000 行。語・本文が入りうる欄は伏せる）
+        if let ev = try? String(contentsOf: koeDir.appendingPathComponent("events.jsonl"), encoding: .utf8) {
+            let tail = ev.split(separator: "\n").suffix(3000).compactMap { redactEvent(String($0)) }
+            try tail.joined(separator: "\n").write(to: work.appendingPathComponent("events.jsonl"), atomically: true, encoding: .utf8)
+        }
+        // whisper のログ（末尾 500 行。音声認識の結果の文は whisper-server のログには出さない設定）
+        if let log = try? String(contentsOf: WhisperServer.logURL, encoding: .utf8) {
+            try log.split(separator: "\n", omittingEmptySubsequences: false).suffix(500).joined(separator: "\n")
+                .write(to: work.appendingPathComponent("whisper-server.log"), atomically: true, encoding: .utf8)
+        }
+        let desktop = fm.urls(for: .desktopDirectory, in: .userDomainMask)[0]
+        let zip = desktop.appendingPathComponent("Koe-diagnostics-\(stamp).zip")
+        try? fm.removeItem(at: zip)
+        _ = sh("cd \"\(work.deletingLastPathComponent().path)\" && /usr/bin/zip -qr \"\(zip.path)\" \"\(work.lastPathComponent)\"")
+        try? fm.removeItem(at: work)
+        guard fm.fileExists(atPath: zip.path) else { throw NSError(domain: "Koe", code: 30, userInfo: [NSLocalizedDescriptionKey: "zip を作れませんでした"]) }
+        return zip
+    }
+}
+
 // MARK: - Self update
 
 // 公開版（GitHub の Release）に新しい版が出ていたら知らせ、押せば dmg を落として入れ替える。
@@ -2029,6 +2135,8 @@ final class Utterance {
     var capture: Capture?
     // ロック録音（2 回続けて押して始め、もう 1 回押して終える）。貼らずにテキストファイルへ書き出す
     var locked = false
+    // トグルの押し方で始めた録音（もう一度押すまで続き、終わったら普通に貼る）
+    var toggled = false
     init(app: String) { record = ["app": app] }
 }
 
@@ -2053,6 +2161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var historyItem: NSMenuItem!
     private var micMenu: NSMenu!
     private var hotkeyMenu: NSMenu!
+    private var pressModeMenu: NSMenu!
     private var updateItem: NSMenuItem!
     private var lockItem: NSMenuItem!
     private var availableUpdate: Updater.Release?
@@ -2078,6 +2187,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         handleSigterm()
         buildMenu()
         render()
+        // 初めて起動したときは「ログイン時に起動」をオンにする（再起動のたびに手で開かなくてよいように）。
+        // 一度決めた後は、メニューで本人が切り替えた状態を尊重する
+        if !Settings.defaults.bool(forKey: "loginItemDefaulted") {
+            Settings.defaults.set(true, forKey: "loginItemDefaulted")
+            if SMAppService.mainApp.status != .enabled {
+                do { try SMAppService.mainApp.register(); Events.log("login_item_enabled") }
+                catch { Events.log("login_item_failed", ["error": error.localizedDescription]) }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.showWelcomeIfFirstLaunch() }
         // 起動時と 1 日 1 回、公開版に新しい版が出ていないか見る
         checkUpdate()
         Timer.scheduledTimer(withTimeInterval: 86400, repeats: true) { [weak self] _ in self?.checkUpdate() }
@@ -2224,11 +2343,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if pressed && !hotkeyDown {
                     hotkeyDown = true
                     // ロック録音中にもう一度押したら、離したときに終える
-                    if current?.locked == true { lockStopping = true } else { begin() }
+                    if current?.locked == true || current?.toggled == true { lockStopping = true } else { begin() }
                 }
                 else if !pressed && hotkeyDown {
                     hotkeyDown = false
-                    if lockStopping { lockStopping = false; current?.locked = true; endLocked() } else { end() }
+                    if lockStopping {
+                        lockStopping = false
+                        if current?.locked == true { endLocked() } else { end() }
+                    } else { end() }
                 }
                 else if pressed && hotkeyDown {
                     // 離したイベントを取りこぼしていた。前の録音を確定してから録り直す
@@ -2279,7 +2401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func cancel(reason: String, silent: Bool = false) {
-        guard let u = current, !u.locked else { return }
+        guard let u = current, !u.locked, !u.toggled else { return }
         current = nil
         recorder.discard()
         let held = Date().timeIntervalSince(u.pressedAt)
@@ -2291,6 +2413,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func end() {
         guard let u = current else { return }
         let held = Date().timeIntervalSince(u.pressedAt)
+        if Settings.toggleMode && !u.toggled && held < 0.5 {
+            // トグルの押し方: 短く押したら録音を続け、次に押したら終えて貼る
+            u.toggled = true
+            Events.log("toggle_started")
+            render()
+            return
+        }
         if held < Settings.minHoldSeconds {
             // 短く 2 回続けて押した＝ロック録音。録音は続けたまま、次に押すまで待つ
             if u.pressedAt.timeIntervalSince(lastShortTap) < 0.5 {
@@ -2618,6 +2747,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyItem.submenu = hotkeyMenu
         menu.addItem(keyItem)
 
+        let modeItem = NSMenuItem(title: "押し方", action: nil, keyEquivalent: "")
+        pressModeMenu = NSMenu()
+        for (tag, name) in [(0, "押している間だけ録音（既定）"), (1, "押すたびに開始・終了（トグル）")] as [(Int, String)] {
+            let it = NSMenuItem(title: name, action: #selector(choosePressMode(_:)), keyEquivalent: "")
+            it.target = self
+            it.tag = tag
+            pressModeMenu.addItem(it)
+        }
+        modeItem.submenu = pressModeMenu
+        menu.addItem(modeItem)
+
         let micItem = NSMenuItem(title: "マイク", action: nil, keyEquivalent: "")
         micMenu = NSMenu()
         micMenu.delegate = self
@@ -2644,6 +2784,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hist.target = self
         menu.addItem(hist)
 
+        let help = NSMenuItem(title: "使い方", action: #selector(openHelp), keyEquivalent: "")
+        help.target = self
+        menu.addItem(help)
+        let diag = NSMenuItem(title: "診断情報を書き出す（不具合を送る用）", action: #selector(exportDiagnostics), keyEquivalent: "")
+        diag.target = self
+        menu.addItem(diag)
         let log = NSMenuItem(title: "サーバーログを開く", action: #selector(openLog), keyEquivalent: "")
         log.target = self
         menu.addItem(log)
@@ -2842,6 +2988,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    @objc private func choosePressMode(_ sender: NSMenuItem) {
+        Settings.toggleMode = sender.tag == 1
+        Events.log("press_mode", ["mode": Settings.toggleMode ? "toggle" : "hold"])
+        render()
+    }
+
+    static let helpURL = URL(string: "https://github.com/chaspy/koe/blob/main/docs/usage-ja.md")!
+    @objc private func openHelp() { NSWorkspace.shared.open(AppDelegate.helpURL) }
+
+    @objc private func exportDiagnostics() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let zip = try Diagnostics.export()
+                Events.log("diagnostics_exported")
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.activateFileViewerSelecting([zip])
+                    let a = NSAlert()
+                    a.messageText = "診断情報をデスクトップに書き出しました"
+                    a.informativeText = "\(zip.lastPathComponent) を送ってください。\n入っているもの: 版・機種・設定（秘密の値は伏せた）・動作の記録と速さ・whisper のログ。\n入れていないもの: 文字起こしの本文・録音・辞書の中身。"
+                    a.runModal()
+                }
+            } catch {
+                DispatchQueue.main.async { self.fail("診断情報を書き出せませんでした: \(error.localizedDescription)") }
+            }
+        }
+    }
+
+    // 初めて起動したときに、使い方を 3 行で見せる
+    private func showWelcomeIfFirstLaunch() {
+        guard !Settings.defaults.bool(forKey: "welcomeShown") else { return }
+        Settings.defaults.set(true, forKey: "welcomeShown")
+        let a = NSAlert()
+        a.messageText = "Koe へようこそ"
+        a.informativeText = """
+        ・\(keyName()) を押している間だけ話し、離すと貼り付けます（ターミナルでは Enter も送ります）
+        ・\(keyName()) を素早く 2 回押すとロック録音（ハンズフリー）。もう 1 回押すと終わってテキストに書き出します
+        ・押すキー・押し方（トグル）・改行はメニューで変えられます。困ったら「診断情報を書き出す」を送ってください
+        メニューバーの吹き出しアイコンが Koe です。
+        """
+        a.addButton(withTitle: "はじめる")
+        a.addButton(withTitle: "使い方を見る")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertSecondButtonReturn { openHelp() }
+    }
+
     @objc private func openLog() {
         NSWorkspace.shared.open(WhisperServer.logURL)
     }
@@ -2855,6 +3046,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let c = current, c.locked {
             image = KoeIcon.filled; tint = .systemOrange
             line = String(format: "ロック録音中（%d 分）… もう一度 \(keyName()) を押すと終わり、テキストに書き出します", Int(Date().timeIntervalSince(c.pressedAt) / 60))
+        } else if let c = current, c.toggled {
+            image = KoeIcon.filled; tint = .systemRed; line = "録音中…（もう一度 \(keyName()) を押すと終わって貼り付けます）"
         } else if current != nil {
             image = KoeIcon.filled; tint = .systemRed; line = "録音中…"
         } else if let msg = errorMessage {
@@ -2912,6 +3105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         improveNowItem?.title = improver.running ? "改善中…" : "今すぐ改善する" + (improver.lastRun.map { "（前回: \($0.prefix(40))）" } ?? "")
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         for it in hotkeyMenu?.items ?? [] { it.state = it.tag == Int(Settings.hotkeyKeyCode) ? .on : .off }
+        for it in pressModeMenu?.items ?? [] { it.state = (it.tag == 1) == Settings.toggleMode ? .on : .off }
     }
 
     private func checkUpdate() {
@@ -2966,6 +3160,12 @@ if let i = CommandLine.arguments.firstIndex(of: "--check-update") {
     Updater.check { r in print(r.map { "新しい版 v\($0.version): \($0.dmg)" } ?? "新しい版はありません（今 v\(Updater.current)）"); done.signal() }
     done.wait()
     Settings.defaults.removeObject(forKey: "assumeVersion")
+    exit(0)
+}
+
+// Koe.app/Contents/MacOS/Koe --diagnostics: 診断情報の zip をデスクトップに書き出してパスを出す
+if CommandLine.arguments.contains("--diagnostics") {
+    do { print(try Diagnostics.export().path) } catch { print("失敗: \(error.localizedDescription)") }
     exit(0)
 }
 

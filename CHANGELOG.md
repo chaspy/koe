@@ -4,6 +4,21 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-14
+
+### macOS
+- Press mode option (menu → 押し方): hold to talk (default) or toggle — a short press starts recording and the next press stops and pastes. Typing or clicking does not cancel a toggled recording.
+- Menu → 診断情報を書き出す: writes a zip to the Desktop with version, machine, settings (secrets hidden), the event log and per-utterance timings, and the whisper log. No transcripts, audio or glossary contents.
+- Menu → 使い方 opens the Japanese usage guide (docs/usage-ja.md); a short welcome is shown on first launch.
+- "Open at login" is turned on the first time Koe starts, so it comes back after a restart. Turning it off in the menu is respected.
+
+### Windows
+- Faster transcription on CPU: whisper-server now uses as many threads as there are logical processors (up to 16; `threads` in config.json), greedy decoding (`-bs 1 -bo 1`), flash attention, and no temperature fallback (one decoding pass instead of up to six; `temperatureFallback` turns it back on).
+- Model menu "モデル（速さ⇔精度）": large-v3-turbo-q5_0 (default), small-q5_1 (faster) or base-q5_1 (fastest). A new model is downloaded on first selection and whisper-server restarts with it. `model` in config.json also accepts short names such as `small-q5_1`.
+- Press mode "押し方": hold to talk (default) or tap to start / tap to stop (`pressMode`: `"hold"` | `"toggle"`). In toggle mode other keys do not cancel the recording, and a long press still works as hold to talk. Applies without restart.
+- "診断情報を書き出す（送る用）" writes a zip to the desktop with the environment (CPU, RAM, model, threads, settings with secrets hidden) and the tails of koe.log / whisper-server.log / update.log. No audio and no transcribed text.
+- koe.log records the CPU name, logical CPUs, RAM and threads at start, whisper-server's system_info (AVX etc.) and timings, and for each utterance the audio length, transcription time and milliseconds per audio second. It no longer records the autocorrected words (only their count).
+
 ## 0.2.3 — 2026-10-14
 
 ### macOS

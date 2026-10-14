@@ -10,39 +10,50 @@ import (
 // DefaultModel is quantized large-v3-turbo (fast enough on CPU).
 const DefaultModel = "ggml-large-v3-turbo-q5_0.bin"
 
+// Press modes.
+const (
+	PressHold   = "hold"
+	PressToggle = "toggle"
+)
+
 // ModelBaseURL is where model files are downloaded from.
 const ModelBaseURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
 
 // Config is %APPDATA%\Koe\config.json. Missing keys keep the defaults.
 type Config struct {
-	Hotkey           string   `json:"hotkey"`   // "ralt" | "rctrl"
-	Model            string   `json:"model"`    // file name in the models dir, or an absolute path
-	ModelURL         string   `json:"modelURL"` // empty = ModelBaseURL + Model
-	Language         string   `json:"language"`
-	Port             int      `json:"port"`
-	Threads          int      `json:"threads"` // 0 = auto
-	Prompt           string   `json:"prompt"`
-	EnabledPacks     []string `json:"enabledPacks"`
-	PackSources      []string `json:"packSources"`
-	AutoEnter        bool     `json:"autoEnter"`
-	EnterApps        []string `json:"enterApps"`
-	EnterDelayMs     int      `json:"enterDelayMs"`
-	MinHoldSeconds   float64  `json:"minHoldSeconds"`
-	Sounds           bool     `json:"sounds"`
-	WarmMic          bool     `json:"warmMic"`
-	SaveHistory      bool     `json:"saveHistory"`
-	HistoryDays      int      `json:"historyDays"`
-	ContextPrompt    bool     `json:"contextPrompt"`
-	RestoreClipboard bool     `json:"restoreClipboard"`
-	MenuMaskKey      bool     `json:"menuMaskKey"` // send a dummy key while Alt is held so Alt alone does not open the app menu
-	UpdateCheck      bool     `json:"updateCheck"` // check GitHub Releases for a newer version at start and daily
-	UpdateRepo       string   `json:"updateRepo"`  // "owner/repo" whose releases are checked
+	Hotkey    string `json:"hotkey"`    // "ralt" | "rctrl"
+	PressMode string `json:"pressMode"` // "hold" (record while held) | "toggle" (tap to start, tap to stop)
+	Model     string `json:"model"`     // file name in the models dir, or an absolute path
+	ModelURL  string `json:"modelURL"`  // empty = ModelBaseURL + Model
+	Language  string `json:"language"`
+	Port      int    `json:"port"`
+	Threads   int    `json:"threads"` // 0 = auto (logical CPUs, up to 16)
+	// TemperatureFallback lets whisper re-decode a hard segment at higher
+	// temperatures (whisper.cpp's default). Off: one greedy pass, much faster on CPU.
+	TemperatureFallback bool     `json:"temperatureFallback"`
+	Prompt              string   `json:"prompt"`
+	EnabledPacks        []string `json:"enabledPacks"`
+	PackSources         []string `json:"packSources"`
+	AutoEnter           bool     `json:"autoEnter"`
+	EnterApps           []string `json:"enterApps"`
+	EnterDelayMs        int      `json:"enterDelayMs"`
+	MinHoldSeconds      float64  `json:"minHoldSeconds"`
+	Sounds              bool     `json:"sounds"`
+	WarmMic             bool     `json:"warmMic"`
+	SaveHistory         bool     `json:"saveHistory"`
+	HistoryDays         int      `json:"historyDays"`
+	ContextPrompt       bool     `json:"contextPrompt"`
+	RestoreClipboard    bool     `json:"restoreClipboard"`
+	MenuMaskKey         bool     `json:"menuMaskKey"` // send a dummy key while Alt is held so Alt alone does not open the app menu
+	UpdateCheck         bool     `json:"updateCheck"` // check GitHub Releases for a newer version at start and daily
+	UpdateRepo          string   `json:"updateRepo"`  // "owner/repo" whose releases are checked
 }
 
 // DefaultConfig mirrors the mac defaults.
 func DefaultConfig() Config {
 	return Config{
 		Hotkey:         "ralt",
+		PressMode:      PressHold,
 		Model:          DefaultModel,
 		Language:       "ja",
 		Port:           18080,
@@ -76,8 +87,16 @@ func ParseConfig(data []byte) (Config, error) {
 	if c.Hotkey != "ralt" && c.Hotkey != "rctrl" {
 		c.Hotkey = d.Hotkey
 	}
+	c.PressMode = strings.ToLower(strings.TrimSpace(c.PressMode))
+	if c.PressMode != PressToggle {
+		c.PressMode = PressHold
+	}
+	c.Model = NormalizeModel(c.Model)
 	if c.Model == "" {
 		c.Model = d.Model
+	}
+	if c.Threads < 0 {
+		c.Threads = 0
 	}
 	if c.Language == "" {
 		c.Language = d.Language
