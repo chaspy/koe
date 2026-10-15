@@ -55,3 +55,25 @@ Takeaways:
 | large-v3-turbo-q5_0 | 2 | 06s | 6.6 | auto (428) | 1 | 19563 | 2960 | 0.00 | no |  |
 | large-v3-turbo-q5_0 | 2 | 10s | 9.0 | 0 (whole) | 1 | 74207 | 8209 | 1.00 | no | 来週のリリースに向けて、残っている課題を洗い出して、担当と期限を決めてから、金曜日までに共有します。 |
 | large-v3-turbo-q5_0 | 2 | 10s | 9.0 | auto (561) | 1 | 26155 | 2893 | 0.00 | no | 。 |
+
+## 2026-10-16 — minimum window for audioCtx auto (real voice + CI)
+
+Real voice: 150 of the maintainer's own recorded utterances (1.1–20 s), run only on that Mac (CPU-only whisper-server v1.9.2, Metal off, small-q5_1, Koe's path and prompt); reference = what the macOS app (large-v3-turbo) pasted. Recordings and texts never left the machine; only these aggregates are kept. Drop = mean match of the whole window (0) minus the policy's (positive = worse).
+
+| policy | drop all | 1–3 s (23) | 3–6 s (40) | 6–10 s (40) | 10–20 s (47) |
+|---|---:|---:|---:|---:|---:|
+| auto, min 384 (old) | +0.089 | +0.336 | +0.127 | +0.034 | −0.016 |
+| **auto, min 768 (new)** | −0.025 | −0.002 | −0.029 | −0.023 | −0.032 |
+| auto, min 1000 | +0.010 | −0.002 | −0.002 | +0.033 | +0.008 |
+| whole window under 6 s, else min 384 | +0.018 | +0.026 | +0.012 | +0.071 | −0.025 |
+
+min 768 and 1000: mean of two runs (the runs differed by ≤ 0.001 per length); no loop or stock phrase left after the retry, nothing empty. With min 384 the short-utterance failures were a different short phrase of about the right length, not loops.
+
+Speed (run 38770834199, Intel Xeon Platinum 8573C, 2 logical processors; synthetic `accept` sentences, 1 run each; 7.5 min, billed 8 min ≈ $0.08):
+
+| policy | median | 1–3 s | 3–6 s | 6–10 s |
+|---|---:|---:|---:|---:|
+| auto, min 768 | 7.59 s | 7.21 | 7.63 | 8.10 |
+| auto, min 1000 | 9.56 s | 9.16 | 9.69 | 10.20 |
+
+For reference, the whole window took 16–22 s per utterance on the 2-core EPYC runner (2026-10-15 above).

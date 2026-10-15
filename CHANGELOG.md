@@ -4,6 +4,14 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.3.5 — 2026-10-16
+
+### Windows
+- Speed first (`audioCtx: "auto"`) now uses at least 768 frames (15 s) instead of 384. On real voice (150 recorded utterances, small-q5_1, compared with the whole window) the old minimum garbled short utterances — the match ratio fell by 0.34 for 1–3 s and 0.13 for 3–6 s — while 768 matched the whole window at every length (within ±0.03, no loops left after the retry). It takes about half the time of the whole window (median 7.6 s per utterance on a 2-core runner, vs. 16–22 s for the whole window), a little slower than the old minimum. The window grows with the utterance above about 12.8 s, as before.
+
+### macOS
+- No changes.
+
 ## 0.3.4 — 2026-10-15
 
 ### macOS

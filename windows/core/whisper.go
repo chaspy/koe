@@ -74,7 +74,7 @@ type AudioCtx int
 const (
 	AudioCtxAuto AudioCtx = -1
 	MaxAudioCtx           = 1500 // the 30 s window
-	MinAudioCtx           = 384  // below this, short utterances lose accuracy
+	MinAudioCtx           = 768  // 15 s; with 384 short real-voice utterances lost accuracy (windows/bench/results.md)
 )
 
 // UnmarshalJSON accepts "auto" or a number. Anything else (null, a negative
@@ -121,13 +121,17 @@ func (c AudioCtx) For(seconds float64, model string) int {
 // AutoAudioCtx sizes the encoder window to the audio: 50 frames per second
 // plus 10% and 64 frames of margin, between MinAudioCtx and MaxAudioCtx.
 // 30 s or more uses the whole window (0).
-func AutoAudioCtx(seconds float64) int {
+func AutoAudioCtx(seconds float64) int { return AutoAudioCtxMin(seconds, MinAudioCtx) }
+
+// AutoAudioCtxMin is AutoAudioCtx with another lower bound (for experiments
+// with the minimum window; Koe uses MinAudioCtx).
+func AutoAudioCtxMin(seconds float64, min int) int {
 	if seconds >= 30 {
 		return 0
 	}
 	n := int(math.Ceil(seconds*50*1.1-1e-9)) + 64
-	if n < MinAudioCtx {
-		n = MinAudioCtx
+	if n < min {
+		n = min
 	}
 	if n > MaxAudioCtx {
 		n = MaxAudioCtx

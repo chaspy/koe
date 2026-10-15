@@ -16,6 +16,9 @@ type UtteranceRequest struct {
 	AudioCtx AudioCtx
 	Fallback bool    // config temperatureFallback
 	Entries  []Entry // glossary + packs, for Autocorrect
+	// AudioCtxFor, if set, replaces AudioCtx.For for the first pass
+	// (experiments with other window policies; Koe leaves it nil).
+	AudioCtxFor func(seconds float64, model string) int
 	// OnPass, if set, is called after each whisper request (for logging).
 	OnPass func(attempt int, p Pass)
 }
@@ -68,6 +71,9 @@ func TranscribeUtterance(ctx context.Context, r UtteranceRequest) UtteranceResul
 	var res UtteranceResult
 	prompt := r.Prompt
 	actx := r.AudioCtx.For(r.Voiced, r.Model)
+	if r.AudioCtxFor != nil {
+		actx = r.AudioCtxFor(r.Voiced, r.Model)
+	}
 	fallback := r.Fallback
 	for attempt := 0; attempt < 2; attempt++ {
 		t0 := time.Now()

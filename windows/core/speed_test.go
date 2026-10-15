@@ -139,7 +139,7 @@ func TestAutoAudioCtx(t *testing.T) {
 		sec  float64
 		want int
 	}{
-		{0, 384}, {2, 384}, {5.81, 384}, {5.82, 385}, {10, 614}, {20, 1164},
+		{0, 768}, {2, 768}, {10, 768}, {12.8, 768}, {12.82, 770}, {20, 1164},
 		{25.1, 1445}, {26.2, 1500}, {29.99, 1500}, {30, 0}, {45, 0},
 	}
 	for _, c := range cases {
@@ -149,6 +149,9 @@ func TestAutoAudioCtx(t *testing.T) {
 		if got := AudioCtxAuto.For(c.sec, DefaultModel); got != c.want {
 			t.Errorf("auto For(%v) = %d", c.sec, got)
 		}
+	}
+	if AutoAudioCtxMin(2, 768) != 768 || AutoAudioCtxMin(20, 768) != 1164 || AutoAudioCtxMin(2, 1000) != 1000 || AutoAudioCtxMin(30, 1000) != 0 {
+		t.Fatal("AutoAudioCtxMin")
 	}
 	if AudioCtx(0).For(3, DefaultModel) != 0 || AudioCtx(768).For(3, "ggml-base-q5_1.bin") != 768 {
 		t.Fatal("fixed audioCtx")

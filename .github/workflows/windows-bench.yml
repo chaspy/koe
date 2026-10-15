@@ -19,6 +19,12 @@ on:
       runs:
         description: requests per combination (speed) / per sentence (accept)
         default: "3"
+      prompts:
+        description: "accept: koe,short | koe | short"
+        default: koe,short
+      audioctx:
+        description: "accept: window policies, e.g. auto | 0 | auto:768 | full<6 (comma-separated)"
+        default: auto
 
 permissions:
   contents: read
@@ -92,10 +98,13 @@ jobs:
         timeout-minutes: 5
         run: go build -o .cache/bench.exe ./bench && go build -o .cache/accept.exe ./bench/accept
 
-      - name: accept — small-q5_1, audioCtx auto, Koe's path, Koe's / short prompt (${{ inputs.runs }} runs x 20 sentences x 2)
+      - name: accept — small-q5_1, Koe's path (${{ inputs.runs }} runs x 20 sentences; prompts ${{ inputs.prompts }}; audioctx ${{ inputs.audioctx }})
         if: inputs.suite == 'accept'
         timeout-minutes: 25
-        run: .cache/accept.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-small-q5_1.bin -runs "${{ inputs.runs }}" -prompts koe,short -out bench-out/accept.jsonl
+        env:
+          PROMPTS: ${{ inputs.prompts }}
+          AUDIOCTX: ${{ inputs.audioctx }}
+        run: .cache/accept.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-small-q5_1.bin -runs "${{ inputs.runs }}" -prompts "$PROMPTS" -audioctx "$AUDIOCTX" -out bench-out/accept.jsonl
 
       - name: base-q5_1 (threads 2 / 4 / all, ${{ inputs.runs }} runs)
         if: inputs.suite == 'speed'

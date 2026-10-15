@@ -43,7 +43,7 @@ func TestTranscribeUtterance(t *testing.T) {
 	if res.Outcome != OutcomeOK || res.Text != good || !res.RetriedForRepetition || res.RepetitionBeforeRetry != loop || len(res.Passes) != 2 {
 		t.Fatalf("loop then good: %+v", res)
 	}
-	if (*seen)[0] != (seenReq{"用語。", "384", "0.0"}) || (*seen)[1] != (seenReq{"", "0", "0.2"}) {
+	if (*seen)[0] != (seenReq{"用語。", "768", "0.0"}) || (*seen)[1] != (seenReq{"", "0", "0.2"}) {
 		t.Fatalf("retry must use audio_ctx=0, temperature_inc=0.2, no prompt: %+v", *seen)
 	}
 
@@ -55,7 +55,7 @@ func TestTranscribeUtterance(t *testing.T) {
 
 	srv, seen = fakeWhisper(t, "ご視聴ありがとうございました", "スモオルです")
 	res = TranscribeUtterance(context.Background(), req(srv.URL))
-	if res.Outcome != OutcomeOK || res.Text != "スモールです" || !res.RetriedWithoutPrompt || res.RetriedForRepetition || (*seen)[1].prompt != "" || (*seen)[1].actx != "384" {
+	if res.Outcome != OutcomeOK || res.Text != "スモールです" || !res.RetriedWithoutPrompt || res.RetriedForRepetition || (*seen)[1].prompt != "" || (*seen)[1].actx != "768" {
 		t.Fatalf("hallucination retry: %+v %+v", res, *seen)
 	}
 
@@ -95,6 +95,13 @@ func TestTranscribeUtterance(t *testing.T) {
 	srv, _ = fakeWhisper(t, broken, "テスト"+strings.Repeat("ドラフ、", 10)+"(拍手)")
 	if res = TranscribeUtterance(context.Background(), req(srv.URL)); res.Outcome != OutcomeCollapsed || res.Text != "テストドラフ、" {
 		t.Fatalf("loop and stock after the retry: %+v", res)
+	}
+
+	srv, seen = fakeWhisper(t, good)
+	over := req(srv.URL)
+	over.AudioCtxFor = func(sec float64, model string) int { return 999 }
+	if res = TranscribeUtterance(context.Background(), over); res.Outcome != OutcomeOK || (*seen)[0].actx != "999" {
+		t.Fatalf("AudioCtxFor override: %+v %+v", res, *seen)
 	}
 
 	res = TranscribeUtterance(context.Background(), req("http://127.0.0.1:1"))

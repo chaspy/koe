@@ -5,7 +5,10 @@
 // utterance to -out. summary.py checks the pass conditions.
 //
 // -prompts koe,short also runs each utterance with the short prompt (Koe's
-// default sentence only, no pack terms) to show what the terms cost. Used by
+// default sentence only, no pack terms) to show what the terms cost.
+// -audioctx auto,0 compares Koe's speed-first window with the whole window.
+// -quiet keeps transcripts off stdout (for private recordings: the text stays
+// only in -out, on the machine). Used by
 // .github/workflows/windows-bench.yml (suite: accept).
 //
 //	go run ./bench/accept -server whisper-server.exe -model models/ggml-small-q5_1.bin -runs 3
@@ -19,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/chaspy/koe/windows/bench/internal/benchutil"
@@ -39,8 +43,9 @@ type result struct {
 	Threads              int     `json:"threads"`
 	ID                   string  `json:"id"`
 	Expected             string  `json:"expected"`
-	Prompt               string  `json:"prompt"`  // "koe" | "short"
-	Seconds              float64 `json:"seconds"` // sent to whisper, after silence trimming
+	Prompt               string  `json:"prompt"`            // "koe" | "short"
+	AudioCtxSetting      string  `json:"audio_ctx_setting"` // "auto" | "0" | frames
+	Seconds              float64 `json:"seconds"`           // sent to whisper, after silence trimming
 	Run                  int     `json:"run"`
 	MS                   int64   `json:"ms"` // all passes
 	Outcome              string  `json:"outcome"`
@@ -61,6 +66,8 @@ func main() {
 	packsDir := flag.String("packs", "../packs", "term packs (Koe ships ../packs)")
 	out := flag.String("out", "bench-out/accept.jsonl", "JSON lines output (appended)")
 	port := flag.Int("port", 18182, "whisper-server port")
+	ctxList := flag.String("audioctx", "auto", "comma-separated window policies: auto | 0 | frames | auto:MIN (auto with another minimum) | full<S (whole window under S seconds, else auto) | full<S+auto:MIN")
+	quiet := flag.Bool("quiet", false, "do not print transcripts (numbers only)")
 	promptList := flag.String("prompts", "koe", "comma-separated: koe (Koe's prompt with the default packs) | short (the default sentence only)")
 	flag.Parse()
 	if *model == "" {
@@ -107,8 +114,16 @@ func main() {
 	}
 	defer stop()
 	base := core.BaseURL(*port)
+	var ctxs []policy
+	for _, c := range strings.Split(*ctxList, ",") {
+		p, err := parsePolicy(strings.TrimSpace(c))
+		if err != nil {
+			fail(err.Error())
+		}
+		ctxs = append(ctxs, p)
+	}
 	for _, m := range modes {
-		fmt.Printf("model=%s threads=%d prompt=%s chars=%d: %s\n", name, *threads, m, len([]rune(prompts[m])), prompts[m])
+		fmt.Printf("model=%s threads=%d prompt=%s chars=%d audioctx=%v\n", name, *threads, m, len([]rune(prompts[m])), ctxs)
 	}
 
 	type clip struct {
@@ -131,22 +146,28 @@ func main() {
 	for run := 1; run <= *runs; run++ {
 		for _, id := range ids {
 			for _, m := range modes {
-				c := clips[id]
-				res := core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
-					BaseURL: base, WAV: c.wav, Prompt: prompts[m], Voiced: c.voiced, Model: name,
-					AudioCtx: cfg.AudioCtx, Fallback: cfg.TemperatureFallback, Entries: packs,
-				})
-				r := result{Model: name, Threads: *threads, ID: id, Expected: expected[id], Prompt: m, Seconds: core.Round2(c.voiced), Run: run,
-					MS: res.TotalMS, Outcome: res.Outcome, Text: res.Text,
-					RetriedForRepetition: res.RetriedForRepetition, RetriedWithoutPrompt: res.RetriedWithoutPrompt, RetriedForStock: res.RetriedForStock}
-				for _, p := range res.Passes {
-					r.Passes = append(r.Passes, pass{p.MS, p.AudioCtx, p.Fallback, p.Text, core.IsRepetitive(p.Text), core.HasStockPhrase(p.Text)})
+				for _, actx := range ctxs {
+					c := clips[id]
+					res := core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
+						BaseURL: base, WAV: c.wav, Prompt: prompts[m], Voiced: c.voiced, Model: name,
+						AudioCtx: cfg.AudioCtx, AudioCtxFor: actx.fn, Fallback: cfg.TemperatureFallback, Entries: packs,
+					})
+					r := result{Model: name, Threads: *threads, ID: id, Expected: expected[id], Prompt: m, AudioCtxSetting: actx.name, Seconds: core.Round2(c.voiced), Run: run,
+						MS: res.TotalMS, Outcome: res.Outcome, Text: res.Text,
+						RetriedForRepetition: res.RetriedForRepetition, RetriedWithoutPrompt: res.RetriedWithoutPrompt, RetriedForStock: res.RetriedForStock}
+					for _, p := range res.Passes {
+						r.Passes = append(r.Passes, pass{p.MS, p.AudioCtx, p.Fallback, p.Text, core.IsRepetitive(p.Text), core.HasStockPhrase(p.Text)})
+					}
+					if res.Err != nil {
+						r.Error = res.Err.Error()
+					}
+					_ = enc.Encode(r)
+					shown := r.Text
+					if *quiet {
+						shown = fmt.Sprintf("(%d chars)", len([]rune(r.Text)))
+					}
+					fmt.Printf("run=%d %s %s ctx=%s(%d) %.1fs %dms passes=%d outcome=%s %s\n", run, id, m, r.AudioCtxSetting, r.Passes[0].AudioCtx, c.voiced, r.MS, len(r.Passes), r.Outcome, shown)
 				}
-				if res.Err != nil {
-					r.Error = res.Err.Error()
-				}
-				_ = enc.Encode(r)
-				fmt.Printf("run=%d %s %s %.1fs %dms passes=%d ctx=%d outcome=%s %s\n", run, id, m, c.voiced, r.MS, len(r.Passes), r.Passes[0].AudioCtx, r.Outcome, r.Text)
 			}
 		}
 	}
@@ -155,4 +176,54 @@ func main() {
 func fail(msg string) {
 	fmt.Fprintln(os.Stderr, "accept:", msg)
 	os.Exit(1)
+}
+
+// policy is a window policy under test: how the first pass picks audio_ctx.
+type policy struct {
+	name string
+	fn   func(seconds float64, model string) int
+}
+
+func (p policy) String() string { return p.name }
+
+// parsePolicy reads auto | 0 | frames | auto:MIN | full<S | full<S+auto:MIN.
+// large-v3 models always get the whole window, as in Koe.
+func parsePolicy(s string) (policy, error) {
+	bad := fmt.Errorf("bad -audioctx %q", s)
+	full, min := 0.0, core.MinAudioCtx
+	rest := s
+	if strings.HasPrefix(rest, "full<") {
+		head, tail, _ := strings.Cut(strings.TrimPrefix(rest, "full<"), "+")
+		v, err := strconv.ParseFloat(head, 64)
+		if err != nil || v <= 0 {
+			return policy{}, bad
+		}
+		full, rest = v, tail
+		if rest == "" {
+			rest = "auto"
+		}
+	}
+	switch {
+	case rest == "auto":
+	case strings.HasPrefix(rest, "auto:"):
+		v, err := strconv.Atoi(strings.TrimPrefix(rest, "auto:"))
+		if err != nil || v <= 0 || v > core.MaxAudioCtx {
+			return policy{}, bad
+		}
+		min = v
+	default:
+		n, err := strconv.Atoi(rest)
+		if err != nil || n < 0 || full > 0 {
+			return policy{}, bad
+		}
+		var c core.AudioCtx
+		_ = c.UnmarshalJSON([]byte(rest))
+		return policy{s, func(sec float64, model string) int { return c.For(sec, model) }}, nil
+	}
+	return policy{s, func(sec float64, model string) int {
+		if core.FullWindowOnly(model) || sec < full {
+			return 0
+		}
+		return core.AutoAudioCtxMin(sec, min)
+	}}, nil
 }

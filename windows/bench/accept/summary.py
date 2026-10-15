@@ -50,6 +50,13 @@ def main():
             rs = [json.loads(l) for l in f if l.strip()]
     for r in rs:
         r.setdefault("prompt", "koe")
+        r.setdefault("audio_ctx_setting", "auto")
+    # a "mode" is a prompt and / or a window policy, whichever varies in the run
+    prompts = list(dict.fromkeys(r["prompt"] for r in rs))
+    settings = list(dict.fromkeys(r["audio_ctx_setting"] for r in rs))
+    for r in rs:
+        parts = ([r["prompt"]] if len(prompts) > 1 else []) + ([f"ctx {r['audio_ctx_setting']}"] if len(settings) > 1 else [])
+        r["mode"] = " / ".join(parts) or r["prompt"]
 
     out = ["## Koe acceptance check (Windows, Koe's transcription path)", ""]
     if a.cpu:
@@ -61,11 +68,11 @@ def main():
         out += ["", "**FAIL** — no results."]
         print("\n".join(out))
         return 1
-    modes = list(dict.fromkeys(r["prompt"] for r in rs))
-    judged = "koe" if "koe" in modes else modes[0]
+    modes = list(dict.fromkeys(r["mode"] for r in rs))
+    judged = next((m for m in modes if m.startswith("koe") or m == "ctx auto"), modes[0])
     model, threads = rs[0]["model"], rs[0]["threads"]
-    out.append(f"- {model}, {threads} threads, audioCtx auto, no temperature fallback; prompts: "
-               + ", ".join(f"`{m}`" for m in modes) + f" (pass / fail on `{judged}`: Koe's prompt with the default packs)")
+    out.append(f"- {model}, {threads} threads, no temperature fallback; modes: "
+               + ", ".join(f"`{m}`" for m in modes) + f" (pass / fail on `{judged}`)")
 
     def stats(g):
         return {
@@ -78,7 +85,7 @@ def main():
             "median": statistics.median(r["ms"] for r in g),
         }
 
-    by_mode = {m: [r for r in rs if r["prompt"] == m] for m in modes}
+    by_mode = {m: [r for r in rs if r["mode"] == m] for m in modes}
     st = {m: stats(g) for m, g in by_mode.items()}
     j = st[judged]
     checks = [
@@ -93,7 +100,7 @@ def main():
     for name, ok, detail in checks:
         out.append(f"- {'✅' if ok else '❌'} {name}: {detail}")
 
-    out += ["", "### Prompts", "", "| prompt | utterances | median s | mean match | looped | stock phrase | retried | failed |",
+    out += ["", "### Modes", "", "| mode | utterances | median s | mean match | looped | stock phrase | retried | failed |",
             "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for m in modes:
         x = st[m]
@@ -102,6 +109,16 @@ def main():
         d = st["koe"]["median"] - st["short"]["median"]
         out.append("")
         out.append(f"Koe's prompt vs short: {d / 1000:+.2f} s median per utterance ({d / st['short']['median'] * 100:+.0f}%).")
+
+    buckets = [(1, 3), (3, 6), (6, 10), (10, 20.01)]
+    out += ["", "### Median seconds per utterance by length", "", "| mode |" + "".join(f" {lo}–{int(hi)} s |" for lo, hi in buckets),
+            "|---|" + "---:|" * len(buckets)]
+    for m in modes:
+        cells = []
+        for lo, hi in buckets:
+            g = [r["ms"] for r in by_mode[m] if lo <= r["seconds"] < hi]
+            cells.append(f" {statistics.median(g) / 1000:.2f} ({len(g)}) |" if g else " – |")
+        out.append(f"| {m} |" + "".join(cells))
 
     cols = "".join(f" {m} ms |" for m in modes) + "".join(f" {m} match |" for m in modes)
     out += ["", f"| id | audio s |{cols} retried ({judged}) | output ({judged}, first run) |",
@@ -125,7 +142,7 @@ def main():
         out += ["", "Looped or stock-phrase outputs (before Koe's retry → what Koe pastes):", ""]
         for r in odd[:8]:
             t = next(p["text"] for p in r["passes"] if p["repetitive"] or p.get("stock"))
-            out.append(f"- {r['id']} {r['prompt']} run {r['run']}: {t[:100]} → {r['text'][:80]}")
+            out.append(f"- {r['id']} {r['mode']} run {r['run']}: {t[:100]} → {r['text'][:80]}")
     print("\n".join(out))
     return 0 if passed else 1
 
