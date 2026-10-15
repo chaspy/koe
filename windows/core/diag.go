@@ -161,7 +161,7 @@ func RedactedConfigLines(data []byte, skip ...string) ([]string, error) {
 // transcriptField matches log fields that could carry transcribed text:
 // text=, raw=, pasted=, prompt=, transcript=, whisper_prompt=, autocorrected=[...]
 // with a quoted, bracketed or bare value.
-var transcriptField = regexp.MustCompile(`\b(text|raw|pasted|prompt|transcript|whisper_prompt|raw_before_autocorrect|repetition_before_retry|repetition_collapsed|autocorrected)=("(?:[^"\\]|\\.)*"|\[[^\]]*\]|\S+)`)
+var transcriptField = regexp.MustCompile(`\b(text|raw|pasted|prompt|transcript|whisper_prompt|raw_before_autocorrect|repetition_before_retry|repetition_collapsed|stock_phrase_before_retry|stock_phrase_removed|autocorrected)=("(?:[^"\\]|\\.)*"|\[[^\]]*\]|\S+)`)
 
 // RedactLogLine removes transcript-carrying fields from one log line. Koe
 // itself does not log text; this protects exports of older logs.

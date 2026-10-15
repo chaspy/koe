@@ -1,5 +1,8 @@
-# Measures whisper-server speed on a Windows runner the way Koe calls it
-# (windows/bench). Manual only: windows runners are billed per minute
+# Windows runner checks (windows/bench). Manual only.
+#   suite=speed  : whisper-server speed by model x audio_ctx x threads
+#   suite=accept : Koe's transcription path (core.TranscribeUtterance) on 20
+#                  sentences with small-q5_1 + audioCtx auto; pass / fail
+# Cost: windows runners are billed per minute
 # ($0.010/min for 2 cores on private repositories), so the job is capped at
 # 45 minutes, large-v3-turbo runs once per combination with all threads only,
 # and the models are cached.
@@ -8,8 +11,13 @@ name: windows-bench
 on:
   workflow_dispatch:
     inputs:
+      suite:
+        description: speed (models x audio_ctx x threads) or accept (Koe's path, pass / fail)
+        type: choice
+        options: [speed, accept]
+        default: speed
       runs:
-        description: requests per combination (base / small)
+        description: requests per combination (speed) / per sentence (accept)
         default: "3"
 
 permissions:
@@ -82,19 +90,25 @@ jobs:
 
       - name: Build bench
         timeout-minutes: 5
-        run: go build -o .cache/bench.exe ./bench
+        run: go build -o .cache/bench.exe ./bench && go build -o .cache/accept.exe ./bench/accept
+
+      - name: accept — small-q5_1, audioCtx auto, Koe's path, Koe's / short prompt (${{ inputs.runs }} runs x 20 sentences x 2)
+        if: inputs.suite == 'accept'
+        timeout-minutes: 25
+        run: .cache/accept.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-small-q5_1.bin -runs "${{ inputs.runs }}" -prompts koe,short -out bench-out/accept.jsonl
 
       - name: base-q5_1 (threads 2 / 4 / all, ${{ inputs.runs }} runs)
+        if: inputs.suite == 'speed'
         timeout-minutes: 8
         run: .cache/bench.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-base-q5_1.bin -threads 2,4,0 -runs "${{ inputs.runs }}" -out bench-out/results.jsonl
 
       - name: small-q5_1 (threads 2 / 4 / all, ${{ inputs.runs }} runs)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.suite == 'speed' }}
         timeout-minutes: 15
         run: .cache/bench.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-small-q5_1.bin -threads 2,4,0 -runs "${{ inputs.runs }}" -out bench-out/results.jsonl
 
       - name: large-v3-turbo-q5_0 (all threads, 1 run)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.suite == 'speed' }}
         timeout-minutes: 12
         run: .cache/bench.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-large-v3-turbo-q5_0.bin -threads 0 -runs 1 -out bench-out/results.jsonl
 
@@ -106,7 +120,12 @@ jobs:
         run: |
           started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq '.jobs[] | select(.name=="bench") | .started_at' || true)
           minutes=$(python -c "import datetime,sys; s=sys.argv[1]; print('%.2f' % ((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(s.replace('Z','+00:00'))).total_seconds()/60) if s else '')" "$started")
-          python bench/summary.py bench-out/results.jsonl --cpu "$CPU_NAME" --logical-cpus "$LOGICAL_CPUS" ${minutes:+--minutes "$minutes"} --usd-per-minute 0.010 | tee -a "$GITHUB_STEP_SUMMARY"
+          args=(--cpu "$CPU_NAME" --logical-cpus "$LOGICAL_CPUS" ${minutes:+--minutes "$minutes"} --usd-per-minute 0.010)
+          if [ "${{ inputs.suite }}" = accept ]; then
+            python bench/accept/summary.py bench-out/accept.jsonl "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"  # exits 1 on FAIL
+          else
+            python bench/summary.py bench-out/results.jsonl "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
       - uses: actions/upload-artifact@v4
         if: always()

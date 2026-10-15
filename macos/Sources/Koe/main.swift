@@ -2578,21 +2578,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.saveLocked(u, t)
                         return
                     }
-                    if isRepetitive(t) {
-                        // 同じ文・語の繰り返し（「ドラフ、ドラフ、…」）。30 秒の枠全体・温度のフォールバックあり・プロンプトなしで
-                        // 1 回だけやり直し、それでも繰り返すなら繰り返しの部分を 1 回に縮める
+                    let loop = isRepetitive(t), stock = hasStockPhrase(t)
+                    if loop || stock {
+                        // 同じ文・語の繰り返し（「ドラフ、ドラフ、…」）や、文の中の決まり文句（「…収募 (音楽)」）は読み間違い。
+                        // 30 秒の枠全体・温度のフォールバックあり・プロンプトなしで 1 回だけやり直し、
+                        // それでも残るなら繰り返しは 1 回に縮め、決まり文句は取り除いて貼る
                         if !retried {
-                            Events.log("repetition_retry", ["chars": t.count])
-                            u.record["retried_for_repetition"] = true
-                            u.record["repetition_before_retry"] = t
+                            if loop {
+                                Events.log("repetition_retry", ["chars": t.count])
+                                u.record["retried_for_repetition"] = true
+                                u.record["repetition_before_retry"] = t
+                            }
+                            if stock {
+                                Events.log("stock_phrase_retry", ["chars": t.count])
+                                u.record["retried_for_stock_phrase"] = true
+                                u.record["stock_phrase_before_retry"] = t
+                            }
                             if !prompt.isEmpty { u.record["retried_without_prompt"] = true }
                             self.transcribe(u, prompt: "", retried: true, loopRetry: true)
                             return
                         }
-                        u.record["repetition_collapsed"] = t
-                        let c = collapseRepeats(t)
+                        var c = t
+                        if loop {
+                            u.record["repetition_collapsed"] = t
+                            c = collapseRepeats(c)
+                        }
+                        if stock {
+                            u.record["stock_phrase_removed"] = c
+                            c = removeStockPhrases(c)
+                        }
                         self.transcribing -= 1
-                        self.deliver(u, c)
+                        if c.isEmpty {
+                            self.drop(u, outcome: "hallucination", message: "うまく聞き取れませんでした。もう一度話してください")
+                        } else {
+                            self.deliver(u, c)
+                        }
                         return
                     }
                     self.transcribing -= 1

@@ -10,6 +10,35 @@ var Hallucinations = map[string]bool{
 	"(音楽)": true, "(拍手)": true, "[音楽]": true, "[BLANK_AUDIO]": true,
 }
 
+// StockPhrases are tags and closing lines whisper inserts from noise or its
+// training data; inside an utterance they mean the decoding went wrong
+// (seen: 「…残っているテストの収募 (音楽)」). Plain 「ありがとうございました」 is
+// not here: people say it.
+var StockPhrases = []string{
+	"(音楽)", "（音楽）", "[音楽]", "(拍手)", "（拍手）", "[拍手]", "(笑)", "[笑]",
+	"[BLANK_AUDIO]", "[blank_audio]", "(字幕)", "ご視聴ありがとうございました",
+}
+
+// HasStockPhrase: text contains one of StockPhrases.
+func HasStockPhrase(text string) bool {
+	for _, p := range StockPhrases {
+		if strings.Contains(text, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveStockPhrases drops StockPhrases (with a 。 right after
+// 「ご視聴ありがとうございました」) and tidies the spaces left behind.
+func RemoveStockPhrases(text string) string {
+	for _, p := range StockPhrases {
+		text = strings.ReplaceAll(text, p+"。", "")
+		text = strings.ReplaceAll(text, p, "")
+	}
+	return strings.Join(strings.Fields(text), " ")
+}
+
 const sentenceEnds = "。！？!?\n"
 
 // Repetition thresholds. whisper sometimes loops on one word or a few
@@ -130,24 +159,32 @@ func CollapseRepeats(text string) string {
 	return strings.TrimSpace(text)
 }
 
+// collapseWords keeps one word of each run. When the word before the run
+// already ends with it (the loop started inside a word: 「…ながらドラフ、ドラフ、…」),
+// the run is dropped and that word takes the run's last separator.
 func collapseWords(text string) string {
 	toks := splitWords(text)
-	var out strings.Builder
+	var out []wordToken
 	for i := 0; i < len(toks); {
 		j := i + 1
 		for toks[i].word != "" && j < len(toks) && toks[j].word == toks[i].word {
 			j++
 		}
-		if j-i >= repeatWordRun {
-			out.WriteString(toks[i].word + toks[j-1].sep)
-		} else {
-			for _, t := range toks[i:j] {
-				out.WriteString(t.word + t.sep)
-			}
+		switch {
+		case j-i < repeatWordRun:
+			out = append(out, toks[i:j]...)
+		case len(out) > 0 && strings.HasSuffix(out[len(out)-1].word, toks[i].word):
+			out[len(out)-1].sep = toks[j-1].sep
+		default:
+			out = append(out, wordToken{toks[i].word, toks[j-1].sep})
 		}
 		i = j
 	}
-	return out.String()
+	var b strings.Builder
+	for _, t := range out {
+		b.WriteString(t.word + t.sep)
+	}
+	return b.String()
 }
 
 func collapseUnits(text string) string {

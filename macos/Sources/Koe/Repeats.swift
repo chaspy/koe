@@ -75,20 +75,25 @@ func collapseRepeats(_ text: String) -> String {
     return t.trimmingCharacters(in: .whitespaces)
 }
 
+// 前の語が繰り返しの語で終わっている（語の途中から繰り返しが始まった「…ながらドラフ、ドラフ、…」）ときは、
+// 繰り返しを丸ごと落として前の語に最後の区切りを付ける
 private func collapseWords(_ text: String) -> String {
     let toks = splitWords(text)
-    var out = "", i = 0
+    var out: [(word: String, sep: String)] = []
+    var i = 0
     while i < toks.count {
         var j = i + 1
         while !toks[i].word.isEmpty && j < toks.count && toks[j].word == toks[i].word { j += 1 }
-        if j - i >= repeatWordRun {
-            out += toks[i].word + toks[j - 1].sep
+        if j - i < repeatWordRun {
+            out.append(contentsOf: toks[i..<j])
+        } else if let last = out.last, last.word.hasSuffix(toks[i].word) {
+            out[out.count - 1].sep = toks[j - 1].sep
         } else {
-            for t in toks[i..<j] { out += t.word + t.sep }
+            out.append((toks[i].word, toks[j - 1].sep))
         }
         i = j
     }
-    return out
+    return out.map { $0.word + $0.sep }.joined()
 }
 
 private func collapseUnits(_ text: String) -> String {
@@ -120,4 +125,25 @@ private func collapseSentences(_ text: String) -> String {
     }
     flush("")
     return out
+}
+
+// whisper が雑音や学習データから入れる札・締めの決まり文句（windows/core の StockPhrases と同じ）。
+// 発話の途中に出たら読み間違い（実例:「…残っているテストの収募 (音楽)」）。
+// 「ありがとうございました」だけは人が言うので入れない
+let stockPhrases = [
+    "(音楽)", "（音楽）", "[音楽]", "(拍手)", "（拍手）", "[拍手]", "(笑)", "[笑]",
+    "[BLANK_AUDIO]", "[blank_audio]", "(字幕)", "ご視聴ありがとうございました",
+]
+
+func hasStockPhrase(_ text: String) -> Bool {
+    stockPhrases.contains { text.contains($0) }
+}
+
+// 決まり文句（「ご視聴ありがとうございました」の直後の「。」も）を取り除き、残った空白を整える
+func removeStockPhrases(_ text: String) -> String {
+    var t = text
+    for p in stockPhrases {
+        t = t.replacingOccurrences(of: p + "。", with: "").replacingOccurrences(of: p, with: "")
+    }
+    return t.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" }).joined(separator: " ")
 }

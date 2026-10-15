@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -656,68 +655,70 @@ func (a *App) process(u *utterance) {
 
 func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64, personal, packs []core.Entry) (string, bool) {
 	rec := u.record
-	base := core.BaseURL(a.cfg.Port)
-	totalMS := int64(0)
-	entries := append(append([]core.Entry{}, personal...), packs...)
-	actx := a.audioCtxSetting().For(voiced, a.modelFile())
-	fallback := a.cfg.TemperatureFallback
-	rec["whisper_audio_ctx"] = actx
-	for attempt := 0; attempt < 2; attempt++ {
-		rec["whisper_prompt"] = prompt
-		t0 := time.Now()
-		raw, err := core.Transcribe(context.Background(), base, wav, prompt, fallback, actx)
-		ms := time.Since(t0).Milliseconds()
-		totalMS += ms
-		rec["transcribe_ms"] = totalMS
-		if err != nil {
-			a.log.Printf("whisper_error ms=%d audio_ctx=%d err=%v", ms, actx, err)
-			rec["outcome"] = "error"
-			rec["error"] = err.Error()
-			a.fail("文字起こしに失敗: " + err.Error())
-			return "", false
-		}
-		raw = strings.TrimSpace(raw)
-		t, applied := core.Autocorrect(raw, entries)
-		ratio := core.MsPerAudioSecond(ms, voiced)
-		rec["ms_per_audio_second"] = int64(ratio)
-		a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
-			ms, voiced, ratio, actx, fallback, filepath.Base(a.modelFile()), len([]rune(t)), len([]rune(prompt)), len(applied), attempt)
-		rec["raw"] = t
-		if t != raw {
-			rec["raw_before_autocorrect"] = raw
-			rec["autocorrected"] = applied
-		}
-		if t == "" || core.Hallucinations[t] {
-			if attempt == 0 && voiced >= 1.0 {
-				rec["retried_without_prompt"] = true
-				prompt = ""
-				continue
+	model := a.modelFile()
+	rec["whisper_audio_ctx"] = a.audioCtxSetting().For(voiced, model)
+	rec["whisper_prompt"] = prompt
+	res := core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
+		BaseURL: core.BaseURL(a.cfg.Port), WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
+		AudioCtx: a.audioCtxSetting(), Fallback: a.cfg.TemperatureFallback,
+		Entries: append(append([]core.Entry{}, personal...), packs...),
+		OnPass: func(attempt int, p core.Pass) {
+			if p.Err != nil {
+				a.log.Printf("whisper_error ms=%d audio_ctx=%d err=%v", p.MS, p.AudioCtx, p.Err)
+				return
 			}
-			rec["outcome"] = "hallucination"
-			a.fail("うまく聞き取れませんでした。もう一度話してください")
-			return "", false
-		}
-		if core.IsRepetitive(t) {
-			// whisper looped ("ドラフ、ドラフ、…"): once more over the whole 30 s
-			// window with the temperature fallback (which breaks loops) and
-			// without the prompt; if it still loops, paste the repeat once
-			if attempt == 0 {
-				a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(t)), actx, fallback)
-				rec["retried_for_repetition"] = true
-				rec["repetition_before_retry"] = t
-				if prompt != "" {
-					rec["retried_without_prompt"] = true
-				}
-				prompt, actx, fallback = "", 0, true
-				rec["whisper_audio_ctx_retry"] = actx
-				continue
+			ratio := core.MsPerAudioSecond(p.MS, voiced)
+			rec["ms_per_audio_second"] = int64(ratio)
+			a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
+				p.MS, voiced, ratio, p.AudioCtx, p.Fallback, filepath.Base(model), len([]rune(p.Text)), len([]rune(p.Prompt)), len(p.Applied), attempt)
+			if attempt == 0 && core.IsRepetitive(p.Text) {
+				a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
 			}
-			rec["repetition_collapsed"] = t
-			return core.CollapseRepeats(t), true
+			if attempt == 0 && core.HasStockPhrase(p.Text) {
+				a.log.Printf("whisper_stock_phrase chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
+			}
+		},
+	})
+	rec["transcribe_ms"] = res.TotalMS
+	if last := res.Passes[len(res.Passes)-1]; last.Err == nil {
+		rec["whisper_prompt"] = last.Prompt
+		rec["raw"] = last.Text
+		if last.Text != last.Raw {
+			rec["raw_before_autocorrect"] = last.Raw
+			rec["autocorrected"] = last.Applied
 		}
-		return t, true
 	}
-	return "", false
+	if res.RetriedWithoutPrompt {
+		rec["retried_without_prompt"] = true
+	}
+	if res.RetriedForRepetition {
+		rec["retried_for_repetition"] = true
+		rec["repetition_before_retry"] = res.RepetitionBeforeRetry
+		rec["whisper_audio_ctx_retry"] = 0
+	}
+	if res.RetriedForStock {
+		rec["retried_for_stock_phrase"] = true
+		rec["stock_phrase_before_retry"] = res.StockBeforeRetry
+		rec["whisper_audio_ctx_retry"] = 0
+	}
+	if res.StockRemoved != "" {
+		rec["stock_phrase_removed"] = res.StockRemoved
+	}
+	switch res.Outcome {
+	case core.OutcomeError:
+		rec["outcome"] = "error"
+		rec["error"] = res.Err.Error()
+		a.fail("文字起こしに失敗: " + res.Err.Error())
+		return "", false
+	case core.OutcomeHallucination:
+		rec["outcome"] = "hallucination"
+		a.fail("うまく聞き取れませんでした。もう一度話してください")
+		return "", false
+	}
+	if res.RepetitionCollapsed != "" {
+		rec["repetition_collapsed"] = res.RepetitionCollapsed
+	}
+	return res.Text, true
 }
 
 func (a *App) paste(u *utterance, text string) error {

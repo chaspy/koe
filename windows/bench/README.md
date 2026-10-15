@@ -7,6 +7,7 @@
 - `main.go` — the runner (`go run ./bench -h`); works with a local whisper-server on macOS / Linux too.
 - `summary.py` — the markdown table.
 - `results.md` — past results (runner CPU, cost, full tables).
+- `accept/` — the pre-tester check (`suite: accept`): 20 sentences (1–10 s; a01 is the sentence that looped on a tester's PC) transcribed through Koe's own path (`core.TranscribeUtterance`: silence trimming, prompt with the default packs, audio_ctx, autocorrect, hallucination / repetition retries) with small-q5_1 + audioCtx auto, 3 runs each, once with Koe's prompt (default sentence + pack terms) and once with the short prompt (default sentence only) to show what the terms cost. Pass, judged on Koe's prompt: no utterance loops in any whisper pass, mean match ≥ 0.9, median ≤ 6 s per utterance on the 2-core runner (a 12-thread PC is about 3× faster, so about 2 s there). The expected texts use the usual written form where kana / kanji / digits vary (お疲れ様, 3時, 一旦, 全て); `say` reads them the same.
 
 Regenerate a file:
 

@@ -15,6 +15,7 @@ let loops: [(String, String)] = [
     ("それは" + String(repeating: "ミティ", count: 12) + "です", "それはミティです"),
     (String(repeating: "ドラフ ", count: 5), "ドラフ"),
     ("了解しました。了解しました。了解しました。", "了解しました。"),
+    ("スモールを選びながら" + String(repeating: "ドラフ、", count: 40), "スモールを選びながらドラフ、"),
 ]
 for (input, want) in loops {
     check(isRepetitive(input), "not detected: \(input)")
@@ -34,6 +35,18 @@ for ok in [
 ] {
     check(!isRepetitive(ok), "false positive: \(ok)")
     check(collapseRepeats(ok) == ok, "collapseRepeats changed \(ok) to \(collapseRepeats(ok))")
+}
+for (input, want) in [
+    ("今日の作業はここまでにして、残っているテストの収募 (音楽)", "今日の作業はここまでにして、残っているテストの収募"),
+    ("了解です。ご視聴ありがとうございました。", "了解です。"),
+    ("[BLANK_AUDIO] テストです [音楽]", "テストです"),
+    ("（拍手）ありがとうございます", "ありがとうございます"),
+] {
+    check(hasStockPhrase(input), "stock not detected: \(input)")
+    check(removeStockPhrases(input) == want, "removeStockPhrases(\(input)) = \(removeStockPhrases(input)), want \(want)")
+}
+for ok in ["ありがとうございました、助かります。", "音楽をかけてください。", "拍手が起きました。", "BLANK のままでいいです"] {
+    check(!hasStockPhrase(ok), "not a stock phrase: \(ok)")
 }
 if failures > 0 { print("\(failures) failure(s)"); exit(1) }
 print("ok")

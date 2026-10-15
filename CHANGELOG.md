@@ -4,6 +4,17 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.3.4 — 2026-10-15
+
+### macOS
+- Fixed: a tag or closing line whisper made up inside the text (「…テストの収募 (音楽)」, [BLANK_AUDIO], (拍手), ご視聴ありがとうございました) was pasted. It now counts as a failed transcription: Koe retries once over the whole window with the temperature fallback and without the prompt, and if the phrase is still there it is removed before pasting.
+- Fixed: when a loop started inside a word (「…選びながらドラフ、ドラフ、…」), shrinking the repeat still left two copies.
+
+### Windows
+- Fixed: a tag or closing line whisper made up inside the text (「…テストの収募 (音楽)」, seen with small-q5_1; also [BLANK_AUDIO], (拍手), ご視聴ありがとうございました) was pasted. It now counts as a failed transcription: Koe retries once with audio_ctx=0 and the temperature fallback, without the prompt, and if the phrase is still there it is removed before pasting. koe.log shows `whisper_stock_phrase`.
+- windows-bench `suite: accept` also runs every sentence with the short prompt (no pack terms) to show the terms' cost; the speed condition is now a 6 s median on the 2-core runner.
+- Fixed: when a loop started inside a word (「…選びながらドラフ、ドラフ、…」), shrinking the repeat still left two copies. The transcription path (prompt, audio_ctx, retries, collapse) is now one function in `core`, used by Koe and by the new acceptance check (`windows-bench`, suite `accept`).
+
 ## 0.3.3 — 2026-10-15
 
 ### macOS

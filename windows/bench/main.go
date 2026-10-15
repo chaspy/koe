@@ -8,14 +8,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -23,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chaspy/koe/windows/bench/internal/benchutil"
 	"github.com/chaspy/koe/windows/core"
 )
 
@@ -57,7 +55,7 @@ func main() {
 	if *name == "" {
 		*name = strings.TrimSuffix(strings.TrimPrefix(filepath.Base(*model), "ggml-"), ".bin")
 	}
-	ids, err := audioIDs(filepath.Join(*dir, "sentences.tsv"))
+	ids, _, err := benchutil.Sentences(filepath.Join(*dir, "sentences.tsv"))
 	if err != nil {
 		fail(err.Error())
 	}
@@ -75,7 +73,7 @@ func main() {
 		cfg := core.DefaultConfig()
 		cfg.Port = *port
 		logPath := filepath.Join(filepath.Dir(*out), fmt.Sprintf("server-%s-t%d.log", *name, threads))
-		stop, err := startServer(*server, core.ServerArgs(cfg, *model, threads), logPath)
+		stop, err := benchutil.StartServer(*server, core.ServerArgs(cfg, *model, threads), logPath)
 		if err != nil {
 			fail(err.Error())
 		}
@@ -90,7 +88,7 @@ func main() {
 				stop()
 				fail(err.Error())
 			}
-			sec := wavSeconds(wav)
+			sec := core.Seconds(benchutil.PCM(wav))
 			for _, mode := range strings.Split(*ctxList, ",") {
 				actx := 0
 				if mode == "auto" {
@@ -137,74 +135,4 @@ func threadCounts(list string) []int {
 	}
 	sort.Ints(out)
 	return out
-}
-
-func audioIDs(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var ids []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		if id, _, ok := strings.Cut(sc.Text(), "\t"); ok && id != "" {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) == 0 {
-		return nil, fmt.Errorf("no sentences in %s", path)
-	}
-	return ids, sc.Err()
-}
-
-// wavSeconds is the length of a 16 kHz mono 16-bit wav (its data chunk).
-func wavSeconds(wav []byte) float64 {
-	for i := 12; i+8 <= len(wav); {
-		size := int(binary.LittleEndian.Uint32(wav[i+4 : i+8]))
-		if string(wav[i:i+4]) == "data" {
-			if i+8+size > len(wav) {
-				size = len(wav) - i - 8
-			}
-			return float64(size) / (core.SampleRate * 2)
-		}
-		i += 8 + size + size%2
-	}
-	return 0
-}
-
-func startServer(bin string, args []string, logPath string) (stop func(), err error) {
-	logf, err := os.Create(logPath)
-	if err != nil {
-		return nil, err
-	}
-	cmd := exec.Command(bin, args...)
-	cmd.Stdout, cmd.Stderr = logf, logf
-	if err := cmd.Start(); err != nil {
-		logf.Close()
-		return nil, err
-	}
-	stop = func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		logf.Close()
-	}
-	base := core.BaseURL(portOf(args))
-	for deadline := time.Now().Add(5 * time.Minute); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-		if core.IsAlive(base) {
-			return stop, nil
-		}
-	}
-	stop()
-	return nil, fmt.Errorf("whisper-server did not start in 5 minutes (see %s)", logPath)
-}
-
-func portOf(args []string) int {
-	for i, a := range args {
-		if a == "--port" && i+1 < len(args) {
-			n, _ := strconv.Atoi(args[i+1])
-			return n
-		}
-	}
-	return 0
 }

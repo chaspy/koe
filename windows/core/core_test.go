@@ -206,9 +206,10 @@ func TestRepeats(t *testing.T) {
 		strings.Repeat("ドラフ、", 60) + "ドラフ":          "ドラフ",
 		"えっと、" + strings.Repeat("ドラフ、", 8) + "ドラフ。": "えっと、ドラフ。",
 		kinyou: "来週のリリースに向けて、残っている課題を洗い出して、半島と起源を決めてから、金曜日間、",
-		"それは" + strings.Repeat("ミティ", 12) + "です": "それはミティです",
-		strings.Repeat("ドラフ ", 5):                "ドラフ",
-		"了解しました。了解しました。了解しました。":                  "了解しました。",
+		"それは" + strings.Repeat("ミティ", 12) + "です":  "それはミティです",
+		strings.Repeat("ドラフ ", 5):                 "ドラフ",
+		"了解しました。了解しました。了解しました。":                   "了解しました。",
+		"スモールを選びながら" + strings.Repeat("ドラフ、", 40): "スモールを選びながらドラフ、",
 	}
 	for in, want := range loops {
 		if !IsRepetitive(in) {
@@ -234,6 +235,22 @@ func TestRepeats(t *testing.T) {
 		}
 		if got := CollapseRepeats(ok); got != strings.TrimSpace(ok) {
 			t.Errorf("CollapseRepeats changed %q to %q", ok, got)
+		}
+	}
+	stock := map[string]string{
+		"今日の作業はここまでにして、残っているテストの収募 (音楽)": "今日の作業はここまでにして、残っているテストの収募",
+		"了解です。ご視聴ありがとうございました。":           "了解です。",
+		"[BLANK_AUDIO] テストです [音楽]":       "テストです",
+		"（拍手）ありがとうございます":                 "ありがとうございます",
+	}
+	for in, want := range stock {
+		if !HasStockPhrase(in) || RemoveStockPhrases(in) != want {
+			t.Errorf("stock %q: has=%v removed=%q", in, HasStockPhrase(in), RemoveStockPhrases(in))
+		}
+	}
+	for _, ok := range []string{"ありがとうございました、助かります。", "音楽をかけてください。", "拍手が起きました。", "BLANK のままでいいです"} {
+		if HasStockPhrase(ok) {
+			t.Errorf("not a stock phrase: %q", ok)
 		}
 	}
 	if CleanServerText(" a \n\n b\r\n") != "a b" {
