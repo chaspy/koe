@@ -46,7 +46,13 @@ dist: build
 	hdiutil create -volname "Koe $(VERSION)" -srcfolder build/dmg -ov -format UDZO build/Koe-$(VERSION).dmg
 	@echo "→ build/Koe-$(VERSION).dmg"
 
+# 文字列処理の単体テスト（XCTest は Command Line Tools に無いので swiftc で直接ビルドする）
+test:
+	mkdir -p build
+	swiftc -O -o build/text-test Sources/Koe/Repeats.swift Tests/text/main.swift
+	./build/text-test
+
 clean:
 	rm -rf .build build
 
-.PHONY: build install dist clean
+.PHONY: build install dist clean test

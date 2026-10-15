@@ -94,7 +94,7 @@ func (a *App) diagnosticsText() []byte {
 	}
 	w("threads = %d (config threads=%d)", threads, a.cfg.Threads)
 	w("pressMode = %s", a.pressMode())
-	w("audioCtx = %s (speed first %s)", a.audioCtxSetting(), onOff(a.audioCtxSetting() != 0))
+	w("audioCtx = %s (speed first %s%s)", a.audioCtxSetting(), onOff(a.audioCtxSetting() != 0), map[bool]string{true: "; not applied: model needs the whole window"}[core.FullWindowOnly(a.modelFile()) && a.audioCtxSetting() != 0])
 	w("hotkey = %s", a.hotkey())
 	w("enabledPacks = %v", a.cfg.EnabledPacks)
 	w("packSources = %v", a.cfg.PackSources)

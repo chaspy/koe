@@ -146,12 +146,23 @@ func TestAutoAudioCtx(t *testing.T) {
 		if got := AutoAudioCtx(c.sec); got != c.want {
 			t.Errorf("AutoAudioCtx(%v) = %d, want %d", c.sec, got, c.want)
 		}
-		if got := AudioCtxAuto.For(c.sec); got != c.want {
+		if got := AudioCtxAuto.For(c.sec, DefaultModel); got != c.want {
 			t.Errorf("auto For(%v) = %d", c.sec, got)
 		}
 	}
-	if AudioCtx(0).For(3) != 0 || AudioCtx(768).For(3) != 768 {
+	if AudioCtx(0).For(3, DefaultModel) != 0 || AudioCtx(768).For(3, "ggml-base-q5_1.bin") != 768 {
 		t.Fatal("fixed audioCtx")
+	}
+	// large-v3 returned empty text with a smaller window: always the whole one
+	for _, m := range []string{"ggml-large-v3-turbo-q5_0.bin", `C:\models\ggml-large-v3.bin`, "D:/m/GGML-LARGE-V3-TURBO.bin"} {
+		if !FullWindowOnly(m) || AudioCtxAuto.For(3, m) != 0 || AudioCtx(768).For(3, m) != 0 {
+			t.Errorf("%s must use the whole window", m)
+		}
+	}
+	for _, m := range []string{"ggml-small-q5_1.bin", "ggml-base-q5_1.bin", "ggml-large-v2.bin", `C:\large-v3\ggml-small.bin`} {
+		if FullWindowOnly(m) {
+			t.Errorf("%s does not need the whole window", m)
+		}
 	}
 }
 
@@ -193,6 +204,17 @@ func TestAudioCtxConfig(t *testing.T) {
 	}
 }
 
+func TestDefaultModelOnlyWhenMissing(t *testing.T) {
+	c, _ := ParseConfig([]byte(`{"hotkey":"ralt"}`))
+	if c.Model != "ggml-small-q5_1.bin" {
+		t.Fatal("no model key ->", c.Model)
+	}
+	c, _ = ParseConfig([]byte(`{"model":"ggml-large-v3-turbo-q5_0.bin"}`))
+	if c.Model != "ggml-large-v3-turbo-q5_0.bin" {
+		t.Fatal("a chosen model must be kept:", c.Model)
+	}
+}
+
 func TestModelMapping(t *testing.T) {
 	cases := map[string]string{
 		"small-q5_1":                   "ggml-small-q5_1.bin",
@@ -211,7 +233,7 @@ func TestModelMapping(t *testing.T) {
 		"ggml-small-q5_1.bin":          "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin",
 		"ggml-base-q5_1.bin":           "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin",
 	}
-	if len(ModelChoices) != 3 || ModelChoices[0].File != DefaultModel {
+	if len(ModelChoices) != 3 || ModelChoices[0].File != DefaultModel || DefaultModel != "ggml-small-q5_1.bin" {
 		t.Fatal(ModelChoices)
 	}
 	for _, c := range ModelChoices {

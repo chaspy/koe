@@ -230,32 +230,6 @@ let hallucinations = [
     "(音楽)", "(拍手)", "[音楽]", "[BLANK_AUDIO]",
 ]
 
-// プロンプトに引っ張られると、同じ文を何度も繰り返すことがある（「〜しました。〜しました。〜しました。」）
-func isRepetitive(_ text: String) -> Bool {
-    let parts = text.components(separatedBy: CharacterSet(charactersIn: "。！？!?\n ")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count >= 4 }
-    var count: [String: Int] = [:]
-    for p in parts { count[p, default: 0] += 1 }
-    return (count.values.max() ?? 0) >= 3
-}
-
-// 3 回以上出た文を 1 回に減らす（プロンプトなしでやり直しても繰り返したとき）
-func collapseRepeats(_ text: String) -> String {
-    var seen: [String: Int] = [:]
-    var out = ""
-    var cur = ""
-    func flush(_ sep: String) {
-        let k = cur.trimmingCharacters(in: .whitespaces)
-        if k.count >= 4 { seen[k, default: 0] += 1 }
-        if k.count < 4 || seen[k]! == 1 { out += cur + sep }
-        cur = ""
-    }
-    for ch in text {
-        if "。！？!?\n".contains(ch) { flush(String(ch)) } else { cur.append(ch) }
-    }
-    flush("")
-    return out.trimmingCharacters(in: .whitespaces)
-}
-
 // MARK: - whisper-server
 
 final class WhisperServer {
@@ -334,7 +308,10 @@ final class WhisperServer {
         }
     }
 
-    func transcribe(wav: URL, prompt: String, keepLines: Bool = false, seconds: Double = 0, done: @escaping (Result<String, Error>) -> Void) {
+    // audioCtx / temperatureInc: nil = サーバーの既定（全体の枠・温度のフォールバックあり）。繰り返しのやり直しでは明示して送る
+    func transcribe(wav: URL, prompt: String, keepLines: Bool = false, seconds: Double = 0,
+                    audioCtx: Int? = nil, temperatureInc: String? = nil,
+                    done: @escaping (Result<String, Error>) -> Void) {
         let boundary = "whisperja-\(UUID().uuidString)"
         var body = Data()
         func field(_ name: String, _ value: String) {
@@ -343,6 +320,8 @@ final class WhisperServer {
         field("response_format", "text")
         field("prompt", prompt)
         field("temperature", "0.0")
+        if let audioCtx { field("audio_ctx", String(audioCtx)) }
+        if let temperatureInc { field("temperature_inc", temperatureInc) }
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
         guard let audio = try? Data(contentsOf: wav) else {
             return done(.failure(NSError(domain: "Koe", code: 5,
@@ -498,21 +477,36 @@ enum Glossary {
         }.resume()
     }
 
-    // 最近の発話（直近 300 件）に出てきた件数。10 分ごとに数え直す
+    // 最近の発話（直近 300 件）に出てきた件数。数えるのは重い（辞書 約 500 語 × 300 件の突き合わせで数秒かかっていた）ので、
+    // 裏で数えておき、文字起こしのときは数え終わった結果を使うだけにする（10 分空いた後の最初の 1 回が 3 秒遅れていた）
     private static var usage: [String: Int] = [:]
     private static var usageAt = Date.distantPast
+    private static var usageRefreshing = false
+    private static let usageLock = NSLock()
     private static func usageCounts(_ entries: [Entry]) -> [String: Int] {
-        if Date().timeIntervalSince(usageAt) < 600 { return usage }
-        let texts = History.recentPasted(300).map { $0.text.lowercased() }
-        var u: [String: Int] = [:]
-        for e in entries {
-            let keys = ([e.term] + e.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }).map { $0.lowercased() }.filter { $0.count >= 2 }
-            let n = texts.reduce(0) { acc, t in acc + (keys.contains { t.contains($0) } ? 1 : 0) }
-            if n > 0 { u[e.term] = n }
+        usageLock.lock(); let cached = usage, stale = Date().timeIntervalSince(usageAt) >= 600; usageLock.unlock()
+        if stale { refreshUsage(entries) }
+        return cached
+    }
+    static func refreshUsage(_ entries: [Entry]? = nil, ifOlderThan age: TimeInterval = 0) {
+        usageLock.lock()
+        if usageRefreshing || Date().timeIntervalSince(usageAt) < age { usageLock.unlock(); return }
+        usageRefreshing = true
+        usageLock.unlock()
+        let list = entries ?? (personal + packs + org)
+        DispatchQueue.global(qos: .utility).async {
+            let started = Date()
+            // NSString の検索は Swift の String.contains よりずっと速い
+            let texts = History.recentPasted(300).map { $0.text.lowercased() as NSString }
+            var u: [String: Int] = [:]
+            for e in list {
+                let keys = ([e.term] + e.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }).map { $0.lowercased() }.filter { $0.count >= 2 }
+                let n = texts.reduce(0) { acc, t in acc + (keys.contains { t.range(of: $0).location != NSNotFound } ? 1 : 0) }
+                if n > 0 { u[e.term] = n }
+            }
+            usageLock.lock(); usage = u; usageAt = Date(); usageRefreshing = false; usageLock.unlock()
+            Events.log("usage_refreshed", ["ms": Int(Date().timeIntervalSince(started) * 1000), "terms": list.count])
         }
-        usage = u
-        usageAt = Date()
-        return u
     }
 
     // 個人・組織の辞書をまとめて、最近の発話に出てきた回数が多い順に詰める。
@@ -1580,6 +1574,20 @@ final class Improver {
         if let l = j["label"] as? String, ["understood", "corrected", "unclear"].contains(l) { return l }
         return nil
     }
+    // 辞書に入れてよい「語」か。句（助詞を含む）や、ひらがな・漢字だけの普通の言葉は入れない（人名は除く）
+    static func isTerm(_ w: String, person: Bool) -> Bool {
+        guard (2...20).contains(w.count) else { return false }
+        if person { return true }
+        let hasKanaOrLatin = w.unicodeScalars.contains { (0x30A0...0x30FF).contains($0.value) || ($0.isASCII && CharacterSet.alphanumerics.contains($0)) }
+        if !hasKanaOrLatin { return false }
+        // カタカナ・英字を含んでも、助詞でつながった句は入れない（「新社Slackの一本化」「①の恒久対応」）
+        for p in ["の", "を", "が", "は", "に", "で", "と", "へ", "から", "まで"] where w.contains(p) {
+            // カタカナ語の中の「ノ」等ではなく、ひらがなの助詞のとき
+            return false
+        }
+        return true
+    }
+
     private func mergeTerms(_ terms: [[String: Any]]) -> [String] {
         let candURL = koeDir.appendingPathComponent("glossary_candidates.json")
         var cand = (try? JSONSerialization.jsonObject(with: Data(contentsOf: candURL))) as? [String: [String: Any]] ?? [:]
@@ -1588,7 +1596,8 @@ final class Improver {
             guard let right = (t["right"] as? String)?.trimmingCharacters(in: .whitespaces), (2...30).contains(right.count),
                   let wrong = (t["wrong"] as? String)?.trimmingCharacters(in: .whitespaces), !wrong.isEmpty, wrong != right,
                   // 語ではなく文・注記になっているもの（「(聞き取り不能)」「〜、〜のやつ」）は辞書に入れない
-                  wrong.count <= 15, !wrong.contains("、"), !right.contains("("), !right.contains("（") else { continue }
+                  wrong.count <= 15, !wrong.contains("、"), !right.contains("("), !right.contains("（"),
+                  Improver.isTerm(right, person: t["kind"] as? String == "person") else { continue }
             var c = cand[right] ?? ["count": 0, "wrongs": [String]()]
             // 人の名前・呼び名は個人の辞書にだけ使い、共有パックへの提案には回さない印
             if t["kind"] as? String == "person" { c["person"] = true }
@@ -1633,7 +1642,8 @@ final class Improver {
     次の 2 つを JSON だけで返してください。
 
     1. terms: 誤変換された語と正しい表記
-       - 技術用語・英字略語・サービス名・社内用語・プロダクト名、人の名前・呼び名（ハンドル名・あだ名）が対象。普通の日本語の言い回しは対象外
+       - 技術用語・英字略語・サービス名・社内用語・プロダクト名、人の名前・呼び名（ハンドル名・あだ名）が対象
+       - 1 つの語だけ。句や言い回し（「〜の〜」「〜を〜する」）、普通の日本語の言葉（「遅延」「返事不要」等）、文の一部は出さない
        - 人の名前・呼び名には kind: "person"、それ以外は kind: "term" を付ける（人の名前は本人の Mac の個人の辞書にだけ入り、共有されない）
        - wrong は文字起こしに実際に含まれる文字列。right は正しい表記（2〜30 文字）
        - 本人の次の発話や送った文の手直しで正しい表記が明示されているか、Claude が「〜と読みました」「〜のことですか？」と読み替えて本人が否定していなければ explicit: true
@@ -1841,7 +1851,9 @@ enum Typist {
             // 貼り付け直後の Enter は TUI 側で貼り付けの一部として扱われることがあるので少し待つ。
             // Mac が重いと貼り付けの取り込みが遅れ、0.25 秒では Enter が貼り付けに吸われる（負荷 20 で実際に起きた）ので、負荷に応じて待ちを延ばす
             let app = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            DispatchQueue.main.asyncAfter(deadline: .now() + enterDelay(chars: text.count)) {
+            let delay = enterDelay(chars: text.count)
+            Events.log("enter_scheduled", ["delay_ms": Int(delay * 1000)])
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 // 待っている間に別のアプリに移っていたら送らない（貼った先でないところで Enter を押さない）
                 guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app else { return Events.log("enter_skipped", ["reason": "app_changed"]) }
                 postKey(36, flags: [])
@@ -2161,6 +2173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitors: [Any] = []
     private var hotkeyDown = false
     private var lastShortTap = Date.distantPast
+    private var keyUpLagMs = 0
     private var lowLevelWarnedAt = Date.distantPast
     private var lockStopping = false
     private var warmItem: NSMenuItem!
@@ -2195,6 +2208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         handleSigterm()
         buildMenu()
         render()
+        Glossary.refreshUsage()
         // 初めて起動したときは「ログイン時に起動」をオンにする（再起動のたびに手で開かなくてよいように）。
         // 一度決めた後は、メニューで本人が切り替えた状態を尊重する
         if !Settings.defaults.bool(forKey: "loginItemDefaulted") {
@@ -2355,6 +2369,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 else if !pressed && hotkeyDown {
                     hotkeyDown = false
+                    // 実際に離した時刻（イベントに付いている起動からの秒数）と、Koe が気づいた時刻の差。Mac が重いと知らせが遅れる
+                    keyUpLagMs = Int((ProcessInfo.processInfo.systemUptime - e.timestamp) * 1000)
                     if lockStopping {
                         lockStopping = false
                         if current?.locked == true { endLocked() } else { end() }
@@ -2449,6 +2465,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         u.record["hold_seconds"] = round(held * 100) / 100
         // 速さの計測: 離した時刻と、そのときの Mac の負荷・裏で改善ループが動いていたか
         u.releasedAt = Date()
+        u.record["key_up_lag_ms"] = keyUpLagMs
         var load = [Double](repeating: 0, count: 3)
         if getloadavg(&load, 3) > 0 { u.record["load1"] = round(load[0] * 10) / 10 }
         u.record["improve_running"] = improver.running
@@ -2480,7 +2497,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 // 1 秒未満で声もない押下は誤操作のことが多いので音は鳴らさない
                 self.drop(u, outcome: "no_voice", message: "声を検出できませんでした", silent: held < 1.0)
             } else {
-                self.transcribe(u, prompt: Settings.whisperPrompt(previous: u.locked ? nil : self.previousText(for: u)))
+                let p0 = Date()
+                let prompt = Settings.whisperPrompt(previous: u.locked ? nil : self.previousText(for: u))
+                u.record["prompt_ms"] = Int(Date().timeIntervalSince(p0) * 1000)
+                self.transcribe(u, prompt: prompt)
             }
         }
     }
@@ -2524,12 +2544,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if silent { showError(message) } else { fail(message) }
     }
 
-    private func transcribe(_ u: Utterance, prompt: String, retried: Bool = false) {
+    // loopRetry: 繰り返しのやり直し（30 秒の枠全体・温度のフォールバックあり）
+    private func transcribe(_ u: Utterance, prompt: String, retried: Bool = false, loopRetry: Bool = false) {
         guard let cap = u.capture else { return }
         let started = Date()
         u.record["whisper_model"] = (Settings.model as NSString).lastPathComponent
         u.record["whisper_prompt"] = prompt
-        server.transcribe(wav: cap.url, prompt: prompt, keepLines: u.locked || Settings.keepLines, seconds: cap.seconds) { result in
+        server.transcribe(wav: cap.url, prompt: prompt, keepLines: u.locked || Settings.keepLines, seconds: cap.seconds,
+                          audioCtx: loopRetry ? 0 : nil, temperatureInc: loopRetry ? "0.2" : nil) { result in
             DispatchQueue.main.async {
                 u.record["transcribe_ms"] = Int(Date().timeIntervalSince(started) * 1000) + (u.record["transcribe_ms"] as? Int ?? 0)
                 switch result {
@@ -2557,11 +2579,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         return
                     }
                     if isRepetitive(t) {
-                        // 同じ文の繰り返し＝プロンプトに引っ張られた幻聴。プロンプトなしでやり直し、それでも繰り返すなら 1 回に減らす
-                        if !retried && !prompt.isEmpty {
-                            u.record["retried_without_prompt"] = true
+                        // 同じ文・語の繰り返し（「ドラフ、ドラフ、…」）。30 秒の枠全体・温度のフォールバックあり・プロンプトなしで
+                        // 1 回だけやり直し、それでも繰り返すなら繰り返しの部分を 1 回に縮める
+                        if !retried {
+                            Events.log("repetition_retry", ["chars": t.count])
+                            u.record["retried_for_repetition"] = true
                             u.record["repetition_before_retry"] = t
-                            self.transcribe(u, prompt: "", retried: true)
+                            if !prompt.isEmpty { u.record["retried_without_prompt"] = true }
+                            self.transcribe(u, prompt: "", retried: true, loopRetry: true)
                             return
                         }
                         u.record["repetition_collapsed"] = t
@@ -2658,6 +2683,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func finish(_ u: Utterance, pasted: String?) {
         if let text = pasted {
+            Glossary.refreshUsage(ifOlderThan: 300)
             recentByApp[u.record["app"] as? String ?? ""] = (Date(), text)
             recent.append((Date(), text))
             if recent.count > 10 { recent.removeFirst(recent.count - 10) }

@@ -4,6 +4,22 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.3.3 — 2026-10-15
+
+### macOS
+- Fixed: the first utterance after about 10 minutes of silence took 3–4 s longer. Counting which glossary terms were used recently (about 500 terms against the last 300 utterances) ran right before transcription; it now runs in the background. The record keeps `prompt_ms`.
+- The improvement loop adds only single terms to the personal glossary: phrases joined by particles (「〜の〜」) and ordinary words written only in kanji/hiragana are skipped (people's names are still allowed).
+- Fixed: whisper sometimes looped on a short word ("ドラフ、ドラフ、…") or a few characters ("ミティミティ…") and the whole loop was pasted. Repetition is now also detected as the same word 5+ times in a row (split at 、 , space 。) or the same 2–6 characters 6+ times in a row. Koe retries once over the whole 30 s window with the temperature fallback (audio_ctx=0, temperature_inc=0.2) and without the prompt; if it still loops, the repeated part is pasted once.
+- `make test` runs the text unit tests (no Xcode needed).
+- Diagnostics: each utterance records how late the key-up event reached Koe (`key_up_lag_ms`), and Enter scheduling is logged with its delay.
+
+### Windows
+- The default model is now small-q5_1 (about 190 MB, also the first download). A bench on a 2-core Windows runner (windows/bench/results.md) showed small + speed first (`audioCtx: "auto"`) as the best balance: 3–5× faster than the whole window (4–7 s instead of 16–22 s per utterance) with match ratio 0.91–1.00. Only configs without `model` change; a model already in config.json (including the large-v3-turbo written by earlier versions) is kept.
+- Fixed: large-v3-turbo returned empty text when speed first shrank the window. large-v3 models now always use the whole window (audio_ctx=0); the menu says 「turbo では効きません」.
+- Model menu order and labels: small-q5_1（既定・速さと精度のバランス）, large-v3-turbo-q5_0（精度重視・遅い）, base-q5_1（とても速いが誤変換が多い）.
+- Fixed: whisper sometimes looped on a short word ("ドラフ、ドラフ、…", seen with small-q5_1 and audio_ctx=384) or a few characters, and the whole loop was pasted. Repetition is now also detected as the same word 5+ times in a row (split at 、 , space 。) or the same 2–6 characters 6+ times in a row. Koe retries once with audio_ctx=0 and the temperature fallback (temperature_inc=0.2), without the prompt; if it still loops, the repeated part is pasted once. koe.log shows `whisper_repetition` and `fallback=` on `whisper_ok`.
+- Requests now always send `temperature_inc` (0.0, or 0.2 with `temperatureFallback`) instead of relying on the server default.
+
 ## 0.3.2 — 2026-10-14
 
 ### macOS

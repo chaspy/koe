@@ -106,8 +106,12 @@ func (c AudioCtx) String() string {
 	return strconv.Itoa(int(c))
 }
 
-// For is the audio_ctx to send for an utterance of seconds.
-func (c AudioCtx) For(seconds float64) int {
+// For is the audio_ctx to send for an utterance of seconds with model:
+// always 0 for models that need the whole window (FullWindowOnly).
+func (c AudioCtx) For(seconds float64, model string) int {
+	if FullWindowOnly(model) {
+		return 0
+	}
 	if c == AudioCtxAuto {
 		return AutoAudioCtx(seconds)
 	}
@@ -146,19 +150,18 @@ func IsAlive(baseURL string) bool {
 }
 
 // BuildInferenceBody builds the multipart body of POST /inference
-// (response_format=text, prompt, temperature=0.0, audio_ctx, file=audio.wav).
-// Without fallback it also sends temperature_inc=0.0 so a hard segment is
-// decoded once instead of up to six times.
-//
-// audio_ctx is always sent, 0 included: v1.9.2's server writes it into its
-// global params, so a value from an earlier request would otherwise stick.
+// (response_format=text, prompt, temperature=0.0, temperature_inc, audio_ctx,
+// file=audio.wav). Without fallback temperature_inc=0.0 decodes a hard segment
+// once instead of up to six times; with fallback it is 0.2 (whisper's default).
+// Both are always sent so the request does not depend on server defaults.
 func BuildInferenceBody(wav []byte, prompt string, fallback bool, audioCtx int) (body []byte, contentType string, err error) {
 	var b bytes.Buffer
 	w := multipart.NewWriter(&b)
-	fields := [][2]string{{"response_format", "text"}, {"prompt", prompt}, {"temperature", "0.0"}, {"audio_ctx", strconv.Itoa(audioCtx)}}
-	if !fallback {
-		fields = append(fields, [2]string{"temperature_inc", "0.0"})
+	inc := "0.0"
+	if fallback {
+		inc = "0.2"
 	}
+	fields := [][2]string{{"response_format", "text"}, {"prompt", prompt}, {"temperature", "0.0"}, {"temperature_inc", inc}, {"audio_ctx", strconv.Itoa(audioCtx)}}
 	for _, f := range fields {
 		if err := w.WriteField(f[0], f[1]); err != nil {
 			return nil, "", err

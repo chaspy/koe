@@ -91,7 +91,7 @@ func (a *App) setupTray() {
 			}
 		}()
 	}
-	mm := systray.AddMenuItem("モデル（速さ⇔精度）", "遅いと感じたら small → base の順に軽くする")
+	mm := systray.AddMenuItem("モデル（速さ⇔精度）", "既定は small。精度が欲しいときは large-v3-turbo（遅い）、遅いと感じたら base")
 	t.models = map[string]*systray.MenuItem{}
 	for _, c := range core.ModelChoices {
 		mi := mm.AddSubMenuItemCheckbox(c.Label, "", false)
@@ -103,7 +103,7 @@ func (a *App) setupTray() {
 			}
 		}()
 	}
-	t.speed = systray.AddMenuItemCheckbox("速さ優先（短い発話を速く。精度が少し落ちることがある）", "オフにすると毎回 30 秒ぶんの枠で文字起こしします（遅いが元の精度）", false)
+	t.speed = systray.AddMenuItemCheckbox("速さ優先（短い発話を速く。精度が少し落ちることがある。turbo では効きません）", "オフにすると毎回 30 秒ぶんの枠で文字起こしします（遅いが元の精度）。large-v3-turbo は枠を縮めると文字が出なくなるため、オンでも常に全体で処理します", false)
 	go func() {
 		for range t.speed.ClickedCh {
 			a.changeSpeedFirst()

@@ -3,3 +3,4 @@
 /.cache/
 *.exe
 *.dll
+/bench-out/

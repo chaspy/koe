@@ -11,12 +11,18 @@ type ModelChoice struct {
 	Label string // menu label
 }
 
-// ModelChoices, most accurate first. File names checked on
-// huggingface.co/ggerganov/whisper.cpp (574 / 190 / 60 MB).
+// ModelChoices, the default first. File names checked on
+// huggingface.co/ggerganov/whisper.cpp (190 / 574 / 60 MB).
 var ModelChoices = []ModelChoice{
-	{"ggml-large-v3-turbo-q5_0.bin", "large-v3-turbo-q5_0（既定・精度重視、約 550MB）"},
-	{"ggml-small-q5_1.bin", "small-q5_1（速い、約 190MB）"},
-	{"ggml-base-q5_1.bin", "base-q5_1（とても速い、約 60MB）"},
+	{"ggml-small-q5_1.bin", "small-q5_1（既定・速さと精度のバランス、約 190MB）"},
+	{"ggml-large-v3-turbo-q5_0.bin", "large-v3-turbo-q5_0（精度重視・遅い、約 550MB）"},
+	{"ggml-base-q5_1.bin", "base-q5_1（とても速いが誤変換が多い、約 60MB）"},
+}
+
+// FullWindowOnly: large-v3 models (turbo included) need whisper's whole 30 s
+// window; with a smaller audio_ctx they returned empty text (windows/bench).
+func FullWindowOnly(model string) bool {
+	return strings.Contains(strings.ToLower(filepath.Base(strings.ReplaceAll(model, `\`, "/"))), "large-v3")
 }
 
 // NormalizeModel accepts a short name ("small-q5_1", "ggml-small-q5_1") as

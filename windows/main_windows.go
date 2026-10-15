@@ -204,7 +204,7 @@ func (a *App) startup() {
 		a.exportReceivers()
 	}()
 	if firstRun {
-		go messageBox("Koe", "Koe を起動しました。\n\n初回は音声認識モデル（約 550MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。\n\n文字起こしが遅いと感じたら、アイコンのメニュー「モデル（速さ⇔精度）」で small → base の順に軽くしてください。", 0x40)
+		go messageBox("Koe", "Koe を起動しました。\n\n初回は音声認識モデル（約 190MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。\n\n文字起こしが遅いと感じたら、アイコンのメニュー「モデル（速さ⇔精度）」で base に軽くしてください（誤変換は増えます）。", 0x40)
 	}
 	a.reportPreviousUpdate()
 	go a.updateLoop()
@@ -659,12 +659,13 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 	base := core.BaseURL(a.cfg.Port)
 	totalMS := int64(0)
 	entries := append(append([]core.Entry{}, personal...), packs...)
-	actx := a.audioCtxSetting().For(voiced)
+	actx := a.audioCtxSetting().For(voiced, a.modelFile())
+	fallback := a.cfg.TemperatureFallback
 	rec["whisper_audio_ctx"] = actx
 	for attempt := 0; attempt < 2; attempt++ {
 		rec["whisper_prompt"] = prompt
 		t0 := time.Now()
-		raw, err := core.Transcribe(context.Background(), base, wav, prompt, a.cfg.TemperatureFallback, actx)
+		raw, err := core.Transcribe(context.Background(), base, wav, prompt, fallback, actx)
 		ms := time.Since(t0).Milliseconds()
 		totalMS += ms
 		rec["transcribe_ms"] = totalMS
@@ -679,8 +680,8 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 		t, applied := core.Autocorrect(raw, entries)
 		ratio := core.MsPerAudioSecond(ms, voiced)
 		rec["ms_per_audio_second"] = int64(ratio)
-		a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
-			ms, voiced, ratio, actx, filepath.Base(a.modelFile()), len([]rune(t)), len([]rune(prompt)), len(applied), attempt)
+		a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
+			ms, voiced, ratio, actx, fallback, filepath.Base(a.modelFile()), len([]rune(t)), len([]rune(prompt)), len(applied), attempt)
 		rec["raw"] = t
 		if t != raw {
 			rec["raw_before_autocorrect"] = raw
@@ -697,10 +698,18 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 			return "", false
 		}
 		if core.IsRepetitive(t) {
-			if attempt == 0 && prompt != "" {
-				rec["retried_without_prompt"] = true
+			// whisper looped ("ドラフ、ドラフ、…"): once more over the whole 30 s
+			// window with the temperature fallback (which breaks loops) and
+			// without the prompt; if it still loops, paste the repeat once
+			if attempt == 0 {
+				a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(t)), actx, fallback)
+				rec["retried_for_repetition"] = true
 				rec["repetition_before_retry"] = t
-				prompt = ""
+				if prompt != "" {
+					rec["retried_without_prompt"] = true
+				}
+				prompt, actx, fallback = "", 0, true
+				rec["whisper_audio_ctx_retry"] = actx
 				continue
 			}
 			rec["repetition_collapsed"] = t

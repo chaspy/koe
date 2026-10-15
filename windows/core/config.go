@@ -7,8 +7,10 @@ import (
 	"strings"
 )
 
-// DefaultModel is quantized large-v3-turbo (fast enough on CPU).
-const DefaultModel = "ggml-large-v3-turbo-q5_0.bin"
+// DefaultModel is quantized small: with the speed-first audio_ctx it was the
+// best balance of speed and accuracy on CPU (windows/bench/results.md).
+// Users whose config.json already names a model keep it.
+const DefaultModel = "ggml-small-q5_1.bin"
 
 // Press modes.
 const (

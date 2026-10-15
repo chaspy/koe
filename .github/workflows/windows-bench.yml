@@ -1,0 +1,116 @@
+# Measures whisper-server speed on a Windows runner the way Koe calls it
+# (windows/bench). Manual only: windows runners are billed per minute
+# ($0.010/min for 2 cores on private repositories), so the job is capped at
+# 45 minutes, large-v3-turbo runs once per combination with all threads only,
+# and the models are cached.
+name: windows-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: requests per combination (base / small)
+        default: "3"
+
+permissions:
+  contents: read
+  actions: read # job start time for the cost line
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: windows
+    env:
+      WHISPER_TAG: v1.9.2
+      MODELS: ggml-base-q5_1.bin ggml-small-q5_1.bin ggml-large-v3-turbo-q5_0.bin
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+
+      - uses: actions/setup-go@v5
+        timeout-minutes: 5
+        with:
+          go-version-file: windows/go.mod
+          cache-dependency-path: windows/go.sum
+
+      - name: Runner info
+        timeout-minutes: 2
+        run: |
+          cpu=$(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Select-Object -First 1).Name" | tr -d '\r' | sed 's/ *$//')
+          echo "CPU_NAME=$cpu" >> "$GITHUB_ENV"
+          echo "LOGICAL_CPUS=$NUMBER_OF_PROCESSORS" >> "$GITHUB_ENV"
+          echo "$cpu, $NUMBER_OF_PROCESSORS logical processors"
+
+      - name: whisper.cpp ${{ env.WHISPER_TAG }} (same zip as windows/build.sh)
+        timeout-minutes: 5
+        run: |
+          mkdir -p .cache
+          curl -fsSL --retry 3 -o .cache/whisper.zip "https://github.com/ggml-org/whisper.cpp/releases/download/$WHISPER_TAG/whisper-bin-x64.zip"
+          # only the server and its DLLs, flattened (Git Bash's unzip finds no match for build.sh's patterns)
+          python -c "import os,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); os.makedirs(sys.argv[2],exist_ok=True); [open(os.path.join(sys.argv[2],os.path.basename(n)),'wb').write(z.read(n)) for n in z.namelist() if n.endswith(('/whisper-server.exe','.dll'))]" .cache/whisper.zip .cache/whisper
+          ls .cache/whisper/whisper-server.exe
+
+      - name: Restore models
+        id: models
+        uses: actions/cache/restore@v4
+        timeout-minutes: 5
+        with:
+          path: windows/.cache/models
+          key: whisper-models-v1-base-q5_1-small-q5_1-large-v3-turbo-q5_0
+
+      - name: Download models
+        if: steps.models.outputs.cache-hit != 'true'
+        timeout-minutes: 15
+        run: |
+          mkdir -p .cache/models
+          for m in $MODELS; do
+            curl -fsSL --retry 3 -o ".cache/models/$m" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$m"
+          done
+          ls -la .cache/models
+
+      - name: Save models
+        if: steps.models.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        with:
+          path: windows/.cache/models
+          key: ${{ steps.models.outputs.cache-primary-key }}
+
+      - name: Build bench
+        timeout-minutes: 5
+        run: go build -o .cache/bench.exe ./bench
+
+      - name: base-q5_1 (threads 2 / 4 / all, ${{ inputs.runs }} runs)
+        timeout-minutes: 8
+        run: .cache/bench.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-base-q5_1.bin -threads 2,4,0 -runs "${{ inputs.runs }}" -out bench-out/results.jsonl
+
+      - name: small-q5_1 (threads 2 / 4 / all, ${{ inputs.runs }} runs)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: .cache/bench.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-small-q5_1.bin -threads 2,4,0 -runs "${{ inputs.runs }}" -out bench-out/results.jsonl
+
+      - name: large-v3-turbo-q5_0 (all threads, 1 run)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 12
+        run: .cache/bench.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-large-v3-turbo-q5_0.bin -threads 0 -runs 1 -out bench-out/results.jsonl
+
+      - name: Summary
+        if: always()
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          started=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --jq '.jobs[] | select(.name=="bench") | .started_at' || true)
+          minutes=$(python -c "import datetime,sys; s=sys.argv[1]; print('%.2f' % ((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(s.replace('Z','+00:00'))).total_seconds()/60) if s else '')" "$started")
+          python bench/summary.py bench-out/results.jsonl --cpu "$CPU_NAME" --logical-cpus "$LOGICAL_CPUS" ${minutes:+--minutes "$minutes"} --usd-per-minute 0.010 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 3
+        with:
+          name: windows-bench
+          path: windows/bench-out/

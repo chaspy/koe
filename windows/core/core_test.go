@@ -200,6 +200,42 @@ func TestRepeats(t *testing.T) {
 	if got := CollapseRepeats(r); got != "了解しました。" {
 		t.Fatal(got)
 	}
+	// shapes whisper actually produced (small, audio_ctx=384, no temperature fallback)
+	kinyou := "来週のリリースに向けて、残っている課題を洗い出して、半島と起源を決めてから、" + strings.Repeat("金曜日間、", 31)
+	loops := map[string]string{
+		strings.Repeat("ドラフ、", 60) + "ドラフ":          "ドラフ",
+		"えっと、" + strings.Repeat("ドラフ、", 8) + "ドラフ。": "えっと、ドラフ。",
+		kinyou: "来週のリリースに向けて、残っている課題を洗い出して、半島と起源を決めてから、金曜日間、",
+		"それは" + strings.Repeat("ミティ", 12) + "です": "それはミティです",
+		strings.Repeat("ドラフ ", 5):                "ドラフ",
+		"了解しました。了解しました。了解しました。":                  "了解しました。",
+	}
+	for in, want := range loops {
+		if !IsRepetitive(in) {
+			t.Errorf("not detected: %q", in)
+		}
+		if got := CollapseRepeats(in); got != want {
+			t.Errorf("CollapseRepeats(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for _, ok := range []string{
+		"はい、はい、わかりました。",
+		"テスト、テスト、マイクのテストです。",
+		"ミーティング、ミーティング、ミーティングの予定を入れてください。",
+		"はい、はい、はい、はい、了解です。",
+		"了解しました。了解しました。",
+		"ははは、それは面白いですね。",
+		"予算は1000000000000円です。",
+		"ドラフト、ドラフト版のレビュー、それからマージ",
+		"",
+	} {
+		if IsRepetitive(ok) {
+			t.Errorf("false positive: %q", ok)
+		}
+		if got := CollapseRepeats(ok); got != strings.TrimSpace(ok) {
+			t.Errorf("CollapseRepeats changed %q to %q", ok, got)
+		}
+	}
 	if CleanServerText(" a \n\n b\r\n") != "a b" {
 		t.Fatal("clean")
 	}
@@ -231,7 +267,7 @@ func TestConfig(t *testing.T) {
 	if c.Hotkey != "ralt" || c.AutoEnter || c.Model != DefaultModel || c.EnabledPacks[0] != "developer" {
 		t.Fatalf("%+v", c)
 	}
-	if c.ModelPath(`C:\m`) != filepath.Join(`C:\m`, DefaultModel) || !strings.HasSuffix(c.ModelDownloadURL(), "/ggml-large-v3-turbo-q5_0.bin") {
+	if c.ModelPath(`C:\m`) != filepath.Join(`C:\m`, DefaultModel) || !strings.HasSuffix(c.ModelDownloadURL(), "/ggml-small-q5_1.bin") {
 		t.Fatal(c.ModelPath(`C:\m`), c.ModelDownloadURL())
 	}
 	c.Model = `D:\models\x.bin`
@@ -324,11 +360,11 @@ func TestTranscribe(t *testing.T) {
 		t.Fatal("configured threads")
 	}
 	body, _, _ := BuildInferenceBody(nil, "", true, 0)
-	if strings.Contains(string(body), "temperature_inc") {
-		t.Fatal("fallback on must not send temperature_inc")
+	if !strings.Contains(string(body), "name=\"temperature_inc\"\r\n\r\n0.2\r\n") {
+		t.Fatal("fallback on must send temperature_inc=0.2")
 	}
 	if !strings.Contains(string(body), "name=\"audio_ctx\"\r\n\r\n0\r\n") {
-		t.Fatal("audio_ctx=0 must be sent so an earlier value does not stick")
+		t.Fatal("audio_ctx=0 must be sent")
 	}
 }
 
