@@ -50,31 +50,6 @@ func SaveHistory(dir, id string, wav []byte, record map[string]any) error {
 	return os.WriteFile(filepath.Join(day, id+".json"), b, 0o644)
 }
 
-// PruneHistory removes day folders older than `days` days (by folder name).
-func PruneHistory(dir string, days int, now time.Time) []string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil
-	}
-	cutoff := now.AddDate(0, 0, -(days - 1)).Format("2006-01-02")
-	var removed []string
-	for _, e := range entries {
-		name := e.Name()
-		if !e.IsDir() || len(name) != 10 {
-			continue
-		}
-		if _, err := time.Parse("2006-01-02", name); err != nil {
-			continue
-		}
-		if name < cutoff {
-			if os.RemoveAll(filepath.Join(dir, name)) == nil {
-				removed = append(removed, name)
-			}
-		}
-	}
-	return removed
-}
-
 // Pasted is one pasted utterance from history.
 type Pasted struct {
 	Time time.Time

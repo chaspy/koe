@@ -22,6 +22,7 @@ type trayItems struct {
 	models    map[string]*systray.MenuItem
 	speed     *systray.MenuItem
 	gpu       *systray.MenuItem
+	keep      map[int]*systray.MenuItem
 	lastTip   string
 	lastIcon  int
 }
@@ -116,6 +117,18 @@ func (a *App) setupTray() {
 			go a.changeGPU()
 		}
 	}()
+	hk2 := systray.AddMenuItem("履歴を残す期間", "録音と文字起こしの履歴（%LOCALAPPDATA%\\Koe\\history）を残す日数。文字は録音の約 2 倍残し、全体で 1GB を超えたら古い録音から消します")
+	t.keep = map[int]*systray.MenuItem{}
+	for _, d := range core.HistoryKeepChoices {
+		mi := hk2.AddSubMenuItemCheckbox(core.HistoryKeepLabel(d), "", false)
+		t.keep[d] = mi
+		days := d
+		go func() {
+			for range mi.ClickedCh {
+				go a.changeHistoryKeep(days)
+			}
+		}()
+	}
 	mDiag := systray.AddMenuItem("診断情報を書き出す（送る用）", "デスクトップに zip を作ります（録音・文字起こしの中身は入りません）")
 	go func() {
 		for range mDiag.ClickedCh {
@@ -229,6 +242,21 @@ func (a *App) renderGPU() {
 		t.gpu.Uncheck()
 	} else {
 		t.gpu.Check()
+	}
+}
+
+// renderHistoryKeep checks the history retention in use.
+func (a *App) renderHistoryKeep() {
+	t := &a.tray
+	cur := int(a.keepDays.Load())
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for d, mi := range t.keep {
+		if d == cur {
+			mi.Check()
+		} else {
+			mi.Uncheck()
+		}
 	}
 }
 

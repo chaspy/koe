@@ -4,6 +4,18 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.5.0 — 2026-10-16
+
+### macOS
+- Fixed: after every update macOS silently dropped Koe's Accessibility permission, so pasting failed without any sign. Builds were ad-hoc signed, so each build looked like a different app. Koe is now signed with a fixed certificate ("Koe Code Signing"), so the permission survives updates. **Updating to this version needs the Accessibility permission once more (remove Koe in System Settings → Privacy & Security → Accessibility and add it again); after that, updates keep it.**
+- When the Accessibility permission is missing, Koe no longer records the paste as done: the utterance is logged as `no_accessibility`, the text stays on the clipboard (⌘V), and Koe shows how to re-add the permission (also once at launch).
+- If the frontmost app at paste time is not the app you started talking in (you switched apps while Koe was transcribing), Koe no longer pastes into it: the text stays on the clipboard (⌘V) and in 「最近の文字起こし」, the utterance is recorded as `target_changed` (counted as a failure), and Koe says 「貼り先が変わったので貼りませんでした」. Compared by app (bundle id), so another window or tab of the same app still gets the paste. History and events now record `paste_app` next to `app`.
+- The history (`~/Library/Application Support/Koe/history`) no longer grows forever (one Mac had 614 MB after 10 days). By default recordings (.wav / .alt.wav) are kept 14 days and the text and records (.json) 30 days, and when the folder is over 1 GB the oldest recordings go first. Menu → 「履歴を残す期間」: 7 / 14 (default) / 30 / 90 days / forever; text is kept about twice as long as recordings. Pruning runs in the background at launch and once a day, never touches files changed within the last day (the improvement loop and evaluation may be using them), and never touches the lock-recording texts in ~/Documents/Koe. Diagnostics show the setting and the history size. `Koe --history-prune-dry-run` prints what would be removed.
+
+### Windows
+- If the foreground app at paste time is not the app you were in when you started talking (you switched apps while Koe was transcribing), Koe no longer pastes into it: the text stays on the clipboard (Ctrl+V) and in 「最近の文字起こし」, the utterance is recorded as `target_changed`, and Koe says 「貼り先が変わったので貼りませんでした」. Compared by app (exe name), so another window or tab of the same app still gets the paste. koe.log `paste` lines show `start_app=`.
+- The same history retention: `historyKeepDays` (default 14; recordings 14 days, text 30 days, 1 GB cap, 0 = keep everything) replaces the old `historyDays` (7 days, whole day folders, only at start). Pruning runs in the background at start and once a day; menu → 「履歴を残す期間」; diagnostics show the setting and the history size.
+
 ## 0.4.2 — 2026-10-16
 
 ### macOS

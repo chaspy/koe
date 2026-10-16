@@ -46,7 +46,7 @@ type Config struct {
 	Sounds              bool     `json:"sounds"`
 	WarmMic             bool     `json:"warmMic"`
 	SaveHistory         bool     `json:"saveHistory"`
-	HistoryDays         int      `json:"historyDays"`
+	HistoryKeepDays     int      `json:"historyKeepDays"` // recordings kept this many days, text about twice as long; 0 = keep everything
 	ContextPrompt       bool     `json:"contextPrompt"`
 	RestoreClipboard    bool     `json:"restoreClipboard"`
 	MenuMaskKey         bool     `json:"menuMaskKey"` // send a dummy key while Alt is held so Alt alone does not open the app menu
@@ -57,29 +57,29 @@ type Config struct {
 // DefaultConfig mirrors the mac defaults.
 func DefaultConfig() Config {
 	return Config{
-		Hotkey:         "ralt",
-		PressMode:      PressHold,
-		Model:          DefaultModel,
-		Language:       "ja",
-		Port:           18080,
-		Prompt:         DefaultPrompt,
-		EnabledPacks:   []string{"developer"},
-		PackSources:    []string{},
-		AutoEnter:      true,
-		EnterApps:      append([]string{}, DefaultEnterApps...),
-		EnterDelayMs:   350,
-		MinHoldSeconds: 0.3,
-		Sounds:         true,
-		WarmMic:        true,
-		SaveHistory:    true,
-		HistoryDays:    7,
-		ContextPrompt:  true,
-		MenuMaskKey:    true,
-		UpdateCheck:    true,
-		UpdateRepo:     DefaultUpdateRepo,
-		AudioCtx:       AudioCtxAuto,
-		GPU:            GPUAuto,
-		GPUAudioCtx:    0,
+		Hotkey:          "ralt",
+		PressMode:       PressHold,
+		Model:           DefaultModel,
+		Language:        "ja",
+		Port:            18080,
+		Prompt:          DefaultPrompt,
+		EnabledPacks:    []string{"developer"},
+		PackSources:     []string{},
+		AutoEnter:       true,
+		EnterApps:       append([]string{}, DefaultEnterApps...),
+		EnterDelayMs:    350,
+		MinHoldSeconds:  0.3,
+		Sounds:          true,
+		WarmMic:         true,
+		SaveHistory:     true,
+		HistoryKeepDays: DefaultHistoryKeepDays,
+		ContextPrompt:   true,
+		MenuMaskKey:     true,
+		UpdateCheck:     true,
+		UpdateRepo:      DefaultUpdateRepo,
+		AudioCtx:        AudioCtxAuto,
+		GPU:             GPUAuto,
+		GPUAudioCtx:     0,
 	}
 }
 
@@ -131,8 +131,8 @@ func ParseConfig(data []byte) (Config, error) {
 	if c.MinHoldSeconds <= 0 {
 		c.MinHoldSeconds = d.MinHoldSeconds
 	}
-	if c.HistoryDays <= 0 {
-		c.HistoryDays = d.HistoryDays
+	if c.HistoryKeepDays < 0 {
+		c.HistoryKeepDays = d.HistoryKeepDays
 	}
 	c.UpdateRepo = strings.Trim(strings.TrimSpace(c.UpdateRepo), "/")
 	if strings.Count(c.UpdateRepo, "/") != 1 {

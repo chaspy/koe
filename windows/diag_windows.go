@@ -122,6 +122,10 @@ func (a *App) diagnosticsText() []byte {
 	if c := a.backendChoice(); c.Choice != "" {
 		w("backend_choice = %s (%s; gpu_ms=%d cpu_ms=%d; measured %s for %s / %s)", c.Choice, c.Reason, c.GPUms, c.CPUms, c.At, c.Version, c.Model)
 	}
+	keep := int(a.keepDays.Load())
+	hb, hf, ho := core.HistoryUsage(a.historyDir())
+	w("history = keep %d days of recordings, %d days of text (0 = keep everything; over %d MB the oldest recordings go); saveHistory=%v", keep, core.HistoryTextDays(keep), core.HistoryCapBytes>>20, a.cfg.SaveHistory)
+	w("history_size = %.1f MB, %d files, oldest day %s", float64(hb)/(1<<20), hf, ho)
 	w("pressMode = %s", a.pressMode())
 	w("audioCtx = %s (speed first %s%s)", a.audioCtxSetting(), onOff(a.audioCtxSetting() != 0), map[bool]string{true: "; not applied: model needs the whole window"}[core.FullWindowOnly(a.modelFile()) && a.audioCtxSetting() != 0])
 	w("hotkey = %s", a.hotkey())
@@ -133,7 +137,7 @@ func (a *App) diagnosticsText() []byte {
 	cfgRaw, err := os.ReadFile(a.configPath())
 	if err != nil {
 		w("(could not read: %v)", err)
-	} else if lines, err := core.RedactedConfigLines(cfgRaw, "model", "pressMode", "hotkey", "enabledPacks", "packSources", "threads", "audioCtx", "gpu", "gpuAudioCtx"); err != nil {
+	} else if lines, err := core.RedactedConfigLines(cfgRaw, "model", "pressMode", "hotkey", "enabledPacks", "packSources", "threads", "audioCtx", "gpu", "gpuAudioCtx", "historyKeepDays"); err != nil {
 		w("(invalid JSON: %v)", err)
 	} else {
 		for _, l := range lines {

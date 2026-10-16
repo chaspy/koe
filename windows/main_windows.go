@@ -64,6 +64,7 @@ type App struct {
 	switching  atomic.Bool   // a model switch is running
 	audioCtx   atomic.Int64  // core.AudioCtx in use; the menu "速さ優先" switches auto / 0
 	gpuOff     atomic.Bool   // config gpu "off"; the menu "GPU を使う" switches it
+	keepDays   atomic.Int64  // historyKeepDays in use; the menu "履歴を残す期間" switches it
 	gpuOK      atomic.Bool   // the GPU server has transcribed once (no more first-request fallback)
 	keys       chan keyEvent
 	updating   atomic.Bool
@@ -161,6 +162,7 @@ func (a *App) startup() {
 	a.model.Store(cfg.Model)
 	a.audioCtx.Store(int64(cfg.AudioCtx))
 	a.gpuOff.Store(cfg.GPU == core.GPUOff)
+	a.keepDays.Store(int64(cfg.HistoryKeepDays))
 	a.gpuNames = readGPUAdapters()
 	a.usage.Compute = a.computeUsage
 	a.renderHotkey()
@@ -168,6 +170,7 @@ func (a *App) startup() {
 	a.renderModel()
 	a.renderSpeedFirst()
 	a.renderGPU()
+	a.renderHistoryKeep()
 	a.log.Printf("start Koe %s rev=%s windows=%d.%d.%d cpus=%d exe=%s", version, rev, v.MajorVersion, v.MinorVersion, v.BuildNumber, runtime.NumCPU(), a.exeDir)
 	si := readSysInfo()
 	a.log.Printf("system cpu=%q logical_cpus=%d ram_mb=%d ram_free_mb=%d threads=%d (config threads=%d)",
@@ -180,9 +183,7 @@ func (a *App) startup() {
 		_ = os.WriteFile(a.glossaryPath(), []byte("# Koe 個人の辞書\r\n# 1 行 1 語。タブの後に、実際に起きた誤変換の形を ／ 区切りで書く（例: プルリク<TAB>プロリク／プロリック）\r\n"), 0o644)
 	}
 	_ = os.MkdirAll(a.userPacksDir(), 0o755)
-	if removed := core.PruneHistory(a.historyDir(), cfg.HistoryDays, time.Now()); len(removed) > 0 {
-		a.log.Printf("history_pruned %v", removed)
-	}
+	go a.historyPruneLoop()
 	for _, p := range core.RecentPasted(a.historyDir(), 5) {
 		a.recent = append(a.recent, p.Text)
 	}
@@ -923,7 +924,15 @@ func (a *App) process(u *utterance) {
 		return
 	}
 	u.record["release_to_transcribed_ms"] = time.Since(u.releasedAt).Milliseconds()
-	if err := a.paste(u, text); err != nil {
+	if err := a.paste(u, text); errors.Is(err, errTargetChanged) {
+		// the user moved to another app while Koe was transcribing: do not
+		// paste into it; the text is on the clipboard
+		rec["outcome"] = "target_changed"
+		rec["kept_on_clipboard"] = true
+		a.save(u, wav, nil)
+		a.fail("貼り先が変わったので貼りませんでした（Ctrl+V で貼れます）")
+		return
+	} else if err != nil {
 		rec["outcome"] = "paste_failed"
 		rec["error"] = err.Error()
 		a.save(u, wav, nil)
@@ -1025,6 +1034,10 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 	return res.Text, true
 }
 
+// errTargetChanged: the foreground app at paste time is not the one at press
+// time; the text was put on the clipboard but not pasted.
+var errTargetChanged = errors.New("paste target changed")
+
 func (a *App) paste(u *utterance, text string) error {
 	// do not send Ctrl+V while the hotkey is held for the next utterance (it would become Ctrl+Alt+V)
 	for i := 0; a.holding.Load() && i < 300; i++ {
@@ -1036,6 +1049,20 @@ func (a *App) paste(u *utterance, text string) error {
 	}
 	name := core.ExeName(exe)
 	u.record["paste_app"] = name
+	if core.TargetChanged(u.app, name) {
+		a.log.Printf("paste_target_changed start_app=%s paste_app=%s chars=%d -> clipboard only", u.app, name, len([]rune(text)))
+		if err := setClipboardText(text); err != nil {
+			return err
+		}
+		a.mu.Lock()
+		a.recent = append(a.recent, text)
+		if len(a.recent) > 5 {
+			a.recent = a.recent[len(a.recent)-5:]
+		}
+		a.mu.Unlock()
+		a.render()
+		return errTargetChanged
+	}
 	prev, hadPrev, perr := getClipboardText()
 	if perr != nil {
 		a.log.Printf("clipboard_read_failed %v", perr)
@@ -1050,7 +1077,7 @@ func (a *App) paste(u *utterance, text string) error {
 	}
 	ms := time.Since(u.releasedAt).Milliseconds()
 	u.record["release_to_paste_ms"] = ms
-	a.log.Printf("paste app=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, len([]rune(text)), time.Since(t0).Milliseconds(), ms)
+	a.log.Printf("paste app=%s start_app=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, u.app, len([]rune(text)), time.Since(t0).Milliseconds(), ms)
 
 	entered := false
 	if a.cfg.AutoEnter && core.IsTerminal(exe, a.cfg.EnterApps) {
@@ -1133,6 +1160,37 @@ func (a *App) computeUsage() map[string]int {
 	u := core.UsageCounts(entries, texts)
 	a.log.Printf("usage_counted terms=%d texts=%d ms=%d", len(entries), len(texts), time.Since(t0).Milliseconds())
 	return u
+}
+
+// historyPruneLoop applies the history retention at start and once a day, off
+// the recording / transcription path.
+func (a *App) historyPruneLoop() {
+	defer a.recoverLog("history_prune")
+	for {
+		a.pruneHistory("start_or_daily")
+		time.Sleep(core.HistoryPruneEvery)
+	}
+}
+
+func (a *App) pruneHistory(reason string) {
+	keep := int(a.keepDays.Load())
+	t0 := time.Now()
+	r := core.HistoryPrune(a.historyDir(), keep, core.HistoryCapBytes, time.Now())
+	a.log.Printf("history_pruned reason=%s keep_days=%d text_days=%d removed_audio=%d removed_text=%d removed_dirs=%d freed_mb=%.1f size_mb=%.1f ms=%d",
+		reason, keep, core.HistoryTextDays(keep), r.Audio, r.Text, r.Dirs, float64(r.Bytes)/(1<<20), float64(r.SizeAfter)/(1<<20), time.Since(t0).Milliseconds())
+}
+
+// changeHistoryKeep is the tray handler of "履歴を残す期間".
+func (a *App) changeHistoryKeep(days int) {
+	defer a.recoverLog("history_keep")
+	if err := core.SetConfigValue(a.configPath(), "historyKeepDays", days); err != nil {
+		a.log.Printf("history_keep_save_failed %v", err)
+		a.setError("設定ファイルに保存できませんでした（今回の起動中だけ切り替えます）: "+err.Error(), false)
+	}
+	a.keepDays.Store(int64(days))
+	a.log.Printf("history_keep_changed %d", days)
+	a.renderHistoryKeep()
+	a.pruneHistory("setting_changed")
 }
 
 func (a *App) syncPacks() {

@@ -147,6 +147,11 @@ enum Settings {
         get { defaults.object(forKey: "saveHistory") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "saveHistory") }
     }
+    // 履歴の録音を残す日数（文字と記録はその約 2 倍。0 は消さない）。Retention を参照
+    static var historyKeepDays: Int {
+        get { defaults.object(forKey: "historyKeepDays") as? Int ?? Retention.defaultKeepDays }
+        set { defaults.set(newValue, forKey: "historyKeepDays") }
+    }
     // 比較用に、使わなかった側のマイクの録音も保存する（マイクの A/B 比較）
     static var saveAllMics: Bool {
         get { defaults.object(forKey: "saveAllMics") as? Bool ?? false }
@@ -1958,7 +1963,7 @@ enum Events {
                   let o = d["outcome"] as? String, let t = (d["t"] as? String).flatMap(f.date(from:)),
                   Calendar.current.isDateInToday(t) else { continue }
             if o == "pasted" { ok += 1 }
-            else if ["no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press"].contains(o) { ng += 1 }
+            else if ["no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press", "no_accessibility", "target_changed"].contains(o) { ng += 1 }
             else if o == "cancelled", d["reason"] as? String != "mouse", (d["hold_seconds"] as? Double ?? 0) >= 1.0 { ng += 1 }
         }
         return (ok, ok + ng)
@@ -2030,6 +2035,12 @@ enum Diagnostics {
         lines.append("## 設定（秘密の値・本文が入りうる値は伏せた）")
         let dom = UserDefaults.standard.persistentDomain(forName: Bundle.main.bundleIdentifier ?? "io.github.chaspy.koe") ?? [:]
         for k in dom.keys.sorted() where !k.hasPrefix("NS") { lines.append("- \(k) = \(redactSetting(k, dom[k]!))") }
+        lines.append("")
+        let keep = Settings.historyKeepDays
+        let hu = Retention.usage(History.dir)
+        lines.append("## 履歴（中身は入れない）")
+        lines.append(keep > 0 ? "保存期間: 録音 \(keep) 日・文字 \(Retention.textDays(keep)) 日（1GB を超えたら古い録音から消す）" : "保存期間: ずっと（消さない）")
+        lines.append(String(format: "大きさ: %.1f MB・%d ファイル・いちばん古い日 %@", Double(hu.bytes) / 1_048_576, hu.files, hu.oldest ?? "なし"))
         lines.append("")
         lines.append("## 辞書の大きさ（中身は入れない）")
         lines.append("個人の辞書 \(Glossary.personal.count) 語 / パック \(Glossary.packs.count) 語 / 組織の辞書 \(Glossary.org.count) 語")
@@ -2184,6 +2195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var soundItem: NSMenuItem!
     private var llmItem: NSMenuItem!
     private var historyItem: NSMenuItem!
+    private var keepItems: [NSMenuItem] = []
     private var micMenu: NSMenu!
     private var hotkeyMenu: NSMenu!
     private var pressModeMenu: NSMenu!
@@ -2224,6 +2236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self.showWelcomeIfFirstLaunch() }
+        // 起動時と 1 日 1 回、古い履歴を消す（裏で。録音・貼り付けを待たせない）
+        pruneHistory("launch")
+        Timer.scheduledTimer(withTimeInterval: Retention.every, repeats: true) { [weak self] _ in self?.pruneHistory("daily") }
         // 起動時と 1 日 1 回、公開版に新しい版が出ていないか見る
         checkUpdate()
         Timer.scheduledTimer(withTimeInterval: 86400, repeats: true) { [weak self] _ in self?.checkUpdate() }
@@ -2348,6 +2363,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         AVCaptureDevice.requestAccess(for: .audio) { _ in }
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(opts) {
+            // 許可済みに見えて外れている（署名が変わった）ときも同じ案内を 1 回出す
+            Events.log("no_accessibility_at_launch")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                if !AXIsProcessTrusted() { self.showAccessibilityNotice() }
+            }
             // 許可されるまで待ってからキー監視を張り直す
             Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { t in
                 if AXIsProcessTrusted() {
@@ -2546,6 +2566,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sound?.play()
     }
 
+    // アクセシビリティの許可が無いと、送った ⌘V は黙って捨てられる（貼れたように見えて何も入らない）。
+    // ビルドの署名が変わると、システム設定では許可済みに見えても実際は外れていることがある。
+    // そのときは貼ったことにしない: 文はクリップボードに残し、outcome=no_accessibility で記録して知らせる
+    private func blockedWithoutAccessibility(_ u: Utterance, _ text: String) -> Bool {
+        guard !AXIsProcessTrusted() else { return false }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        u.record["outcome"] = "no_accessibility"
+        u.record["kept_on_clipboard"] = true
+        Events.log("no_accessibility", ["chars": text.count])
+        fail("アクセシビリティの許可が外れています。文はクリップボードにあります（⌘V で貼れます）")
+        finish(u, pasted: nil)
+        showAccessibilityNotice()
+        return true
+    }
+
+    // 起動中に 1 回だけ、直し方を出す
+    private var accessibilityNoticeShown = false
+    private func showAccessibilityNotice() {
+        guard !accessibilityNoticeShown else { return }
+        accessibilityNoticeShown = true
+        Events.log("accessibility_notice")
+        let a = NSAlert()
+        a.messageText = "アクセシビリティの許可が外れています"
+        a.informativeText = "このままでは貼り付けられません。システム設定で Koe を一度消して追加し直してください（プライバシーとセキュリティ > アクセシビリティ で Koe を選んで「−」、もう一度「+」で Koe を追加）。話した文はクリップボードに残してあるので ⌘V で貼れます。"
+        a.addButton(withTitle: "システム設定を開く")
+        a.addButton(withTitle: "閉じる")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    // 貼る瞬間の前面のアプリを記録し（paste_app）、録音を始めたときのアプリ（app）と違えば貼らない。
+    // 文字起こしを待つ間に別のアプリへ移ると、話した文が思わぬところに入る（入った先も分からない）ため。
+    // 文はクリップボードと「最近の文字起こし」に残し、outcome=target_changed で記録して知らせる
+    private func blockedTargetChanged(_ u: Utterance, _ text: String) -> Bool {
+        let now = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        u.record["paste_app"] = now
+        let start = u.record["app"] as? String ?? ""
+        guard PasteTarget.changed(start: start, now: now) else { return false }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+        u.record["outcome"] = "target_changed"
+        u.record["kept_on_clipboard"] = true
+        Events.log("target_changed", ["app": start, "paste_app": now, "chars": text.count])
+        recent.append((Date(), text))
+        if recent.count > 10 { recent.removeFirst(recent.count - 10) }
+        fail("貼り先が変わったので貼りませんでした（⌘V で貼れます）")
+        finish(u, pasted: nil)
+        return true
+    }
+
     // 取りこぼしは黙って捨てない。音とメニューで知らせる
     private func fail(_ message: String) {
         play(Settings.failSound)
@@ -2717,9 +2793,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func deliver(_ u: Utterance, _ raw: String) {
         u.record["llm_enabled"] = Settings.llmEnabled
         guard Settings.llmEnabled else {
+            if blockedWithoutAccessibility(u, raw) { return }
+            if blockedTargetChanged(u, raw) { return }
             markPasted(u)
             Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter)
-            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil])
+            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? ""])
             finish(u, pasted: raw)
             return
         }
@@ -2742,9 +2820,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     // 整形に失敗しても入力は失わない
                     u.record["llm_error"] = e.localizedDescription
                 }
+                if self.blockedWithoutAccessibility(u, text) { return }
+                if self.blockedTargetChanged(u, text) { return }
                 self.markPasted(u)
                 Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter)
-                Events.log("pasted", ["llm": true])
+                Events.log("pasted", ["llm": true, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? ""])
                 self.finish(u, pasted: text)
             }
         }
@@ -2877,6 +2957,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         historyItem = NSMenuItem(title: "録音と結果を保存（評価用）", action: #selector(toggleHistory), keyEquivalent: "")
         historyItem.target = self
         menu.addItem(historyItem)
+
+        let keepItem = NSMenuItem(title: "履歴を残す期間", action: nil, keyEquivalent: "")
+        let keepMenu = NSMenu()
+        for d in Retention.choices {
+            let mi = NSMenuItem(title: Retention.label(d), action: #selector(setHistoryKeep(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.tag = d
+            keepMenu.addItem(mi)
+            keepItems.append(mi)
+        }
+        keepMenu.addItem(.separator())
+        let keepNote = NSMenuItem(title: "文字は録音の約 2 倍残す。全体で 1GB を超えたら古い録音から消す", action: nil, keyEquivalent: "")
+        keepNote.isEnabled = false
+        keepMenu.addItem(keepNote)
+        keepItem.submenu = keepMenu
+        menu.addItem(keepItem)
 
         soundItem = NSMenuItem(title: "録音の開始・終了で音を鳴らす", action: #selector(toggleSound), keyEquivalent: "")
         soundItem.target = self
@@ -3083,6 +3179,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    @objc private func setHistoryKeep(_ sender: NSMenuItem) {
+        Settings.historyKeepDays = sender.tag
+        Events.log("history_keep_changed", ["days": sender.tag])
+        render()
+        pruneHistory("setting_changed")
+    }
+
+    // Retention の規則で古い履歴を消す。裏のキューで動き、録音・文字起こしを待たせない
+    private static let pruneQueue = DispatchQueue(label: "koe.history-prune", qos: .utility)
+    private func pruneHistory(_ reason: String) {
+        let keep = Settings.historyKeepDays
+        Self.pruneQueue.async {
+            let t0 = Date()
+            let r = Retention.prune(dir: History.dir, keepDays: keep)
+            Events.log("history_pruned", ["reason": reason, "keep_days": keep, "text_days": Retention.textDays(keep),
+                                          "removed_audio": r.audio, "removed_text": r.text, "removed_dirs": r.dirs,
+                                          "freed_mb": Double(r.bytes) / 1_048_576, "size_mb": Double(r.sizeAfter) / 1_048_576,
+                                          "ms": Int(Date().timeIntervalSince(t0) * 1000)])
+        }
+    }
+
     @objc private func openHistory() {
         try? FileManager.default.createDirectory(at: History.dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(History.dir)
@@ -3214,6 +3331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         llmItem?.title = "LLM で整形（\(Settings.llmModel)）"
         llmItem?.state = Settings.llmEnabled ? .on : .off
         historyItem?.state = Settings.saveHistory ? .on : .off
+        for mi in keepItems { mi.state = mi.tag == Settings.historyKeepDays ? .on : .off }
         clipboardItem?.state = Settings.restoreClipboard ? .on : .off
         improveItem?.state = Settings.improveEnabled ? .on : .off
         improveNowItem?.isEnabled = Settings.improveEnabled && !improver.running
@@ -3288,6 +3406,16 @@ if let i = CommandLine.arguments.firstIndex(of: "--check-update") {
 // Koe.app/Contents/MacOS/Koe --diagnostics: 診断情報の zip をデスクトップに書き出してパスを出す
 if CommandLine.arguments.contains("--diagnostics") {
     do { print(try Diagnostics.export().path) } catch { print("失敗: \(error.localizedDescription)") }
+    exit(0)
+}
+
+// Koe.app/Contents/MacOS/Koe --history-prune-dry-run: 今の設定で消すはずの履歴を数えるだけ（消さない。確認用）
+if CommandLine.arguments.contains("--history-prune-dry-run") {
+    let keep = Settings.historyKeepDays
+    let u = Retention.usage(History.dir)
+    let r = Retention.prune(dir: History.dir, keepDays: keep, dryRun: true)
+    print(String(format: "設定: 録音 %d 日・文字 %d 日（0 = 消さない）/ いまの大きさ %.1f MB・%d ファイル・いちばん古い日 %@", keep, Retention.textDays(keep), Double(u.bytes) / 1_048_576, u.files, u.oldest ?? "なし"))
+    print(String(format: "消すはずのもの: 録音 %d・文字 %d・%.1f MB → 残り %.1f MB", r.audio, r.text, Double(r.bytes) / 1_048_576, Double(r.sizeAfter) / 1_048_576))
     exit(0)
 }
 

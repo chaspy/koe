@@ -420,10 +420,7 @@ func TestHistory(t *testing.T) {
 	if rp := RecentPasted(dir, 5); len(rp) != 2 || rp[0].Text != "古い" {
 		t.Fatalf("%+v", rp)
 	}
-	removed := PruneHistory(dir, 7, now)
-	if !reflect.DeepEqual(removed, []string{"2026-10-06"}) {
-		t.Fatal(removed)
-	}
+	os.RemoveAll(filepath.Join(dir, old[:10]))
 	rp := RecentPasted(dir, 5)
 	if len(rp) != 1 || rp[0].Text != "こんにちは" || rp[0].App != "cmd.exe" || !rp[0].Time.Equal(now) {
 		t.Fatalf("%+v", rp)
@@ -487,5 +484,25 @@ func TestLogger(t *testing.T) {
 	b, _ := os.ReadFile(p)
 	if !strings.Contains(string(b), "key_down vk=0xA5\r\n") {
 		t.Fatal(string(b))
+	}
+}
+
+func TestTargetChanged(t *testing.T) {
+	cases := []struct {
+		start, paste string
+		want         bool
+	}{
+		{"WindowsTerminal.exe", "WindowsTerminal.exe", false},
+		{"WindowsTerminal.exe", `C:\Program Files\WindowsApps\x\WindowsTerminal.exe`, false},
+		{"Code.exe", "code.exe", false},
+		{"WindowsTerminal.exe", "chrome.exe", true},
+		{"slack.exe", "Teams.exe", true},
+		{"", "chrome.exe", false},
+		{"chrome.exe", "", false},
+	}
+	for _, c := range cases {
+		if got := TargetChanged(c.start, c.paste); got != c.want {
+			t.Errorf("TargetChanged(%q, %q) = %v, want %v", c.start, c.paste, got, c.want)
+		}
 	}
 }

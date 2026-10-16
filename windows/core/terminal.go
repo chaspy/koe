@@ -33,3 +33,12 @@ func IsTerminal(exe string, apps []string) bool {
 	}
 	return false
 }
+
+// TargetChanged reports whether the foreground app at paste time differs
+// from the one at press time (compared by app — exe name — so switching
+// windows or tabs inside the same app still pastes). Unknown on either side
+// is not a change.
+func TargetChanged(startApp, pasteApp string) bool {
+	a, b := strings.ToLower(ExeName(startApp)), strings.ToLower(ExeName(pasteApp))
+	return a != "" && a != "." && b != "" && b != "." && a != b
+}

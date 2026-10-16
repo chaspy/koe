@@ -1,8 +1,11 @@
 APP_NAME   := Koe
 BUNDLE     := build/$(APP_NAME).app
 INSTALL_DIR ?= $(HOME)/Applications
-# 署名 identity を固定すると、再ビルドしてもマイク・アクセシビリティの許可が外れない
-SIGN_IDENTITY ?= -
+# 署名は固定の自己署名証明書「Koe Code Signing」で行う（scripts/sign.sh。作り方は docs/notes/signing.md）。
+# ad-hoc 署名（-）だとビルドごとに cdhash が変わり、入れ替えるたびにアクセシビリティの許可が外れる。
+# 公開用（dist）は証明書が無ければ止める（SIGN_REQUIRED=1）
+SIGN_IDENTITY ?= Koe Code Signing
+SIGN_REQUIRED ?= 0
 # 同梱する whisper-server（静的リンク・Metal 埋め込み）。無ければ同梱せず、実行時に whisperHome のものを使う
 #   cmake -B build-static -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON && cmake --build build-static -j --target whisper-server
 WHISPER_SERVER ?= $(HOME)/.local/src/whisper.cpp/build-static/bin/whisper-server
@@ -22,8 +25,7 @@ build:
 	cp Resources/* $(BUNDLE)/Contents/Resources/
 	mkdir -p $(BUNDLE)/Contents/Resources/packs && cp ../packs/*.txt $(BUNDLE)/Contents/Resources/packs/
 	if [ -x "$(WHISPER_SERVER)" ]; then cp "$(WHISPER_SERVER)" $(BUNDLE)/Contents/MacOS/whisper-server; fi
-	if [ -f $(BUNDLE)/Contents/MacOS/whisper-server ]; then codesign --force --sign "$(SIGN_IDENTITY)" $(BUNDLE)/Contents/MacOS/whisper-server; fi
-	codesign --force --sign "$(SIGN_IDENTITY)" $(BUNDLE)
+	SIGN_IDENTITY="$(SIGN_IDENTITY)" SIGN_REQUIRED=$(SIGN_REQUIRED) bash scripts/sign.sh $(BUNDLE)
 
 # 録音中・文字起こし中なら終わるまで待ってから入れ替える（使いながら入れ直しても発話を失わない）
 STATE := $(HOME)/Library/Application Support/Koe/state
@@ -38,6 +40,7 @@ install: build
 	@sleep 1; open $(INSTALL_DIR)/$(APP_NAME).app || (sleep 2; open $(INSTALL_DIR)/$(APP_NAME).app)
 
 # 配布用 dmg（whisper-server 同梱。モデルは初回起動時にダウンロード）
+dist: SIGN_REQUIRED = 1
 dist: build
 	test -f $(BUNDLE)/Contents/MacOS/whisper-server || (echo "whisper-server が同梱されていません（WHISPER_SERVER を確認）" && exit 1)
 	rm -rf build/dmg && mkdir -p build/dmg
@@ -51,6 +54,10 @@ test:
 	mkdir -p build
 	swiftc -O -o build/text-test Sources/Koe/Repeats.swift Tests/text/main.swift
 	./build/text-test
+	swiftc -O -o build/paste-test Sources/Koe/PasteTarget.swift Tests/paste/main.swift
+	./build/paste-test
+	swiftc -O -o build/history-test Sources/Koe/Retention.swift Tests/history/main.swift
+	./build/history-test
 
 clean:
 	rm -rf .build build
