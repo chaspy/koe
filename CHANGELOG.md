@@ -4,6 +4,14 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.4.2 — 2026-10-16
+
+### macOS
+- Fixed: when whisper-server had stopped (for example killed from outside), every utterance failed with "Could not connect to the server" until Koe was restarted. Koe now checks the server when the key is pressed and restarts it while you speak, retries a transcription once after restarting the server if the connection fails, and checks every minute while idle. Recording is allowed while the server is restarting; the transcription waits for it. A second server is not launched while one is still loading.
+
+### Windows
+- No changes.
+
 ## 0.4.1 — 2026-10-16
 
 ### Windows

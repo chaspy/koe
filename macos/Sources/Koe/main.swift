@@ -239,6 +239,10 @@ final class WhisperServer {
     func start(onReady: @escaping (Result<Void, Error>) -> Void) {
         isAlive { alive in
             if alive { return onReady(.success(())) }
+            // 起動中（読み込み待ち）なら、もう 1 本は起動せずに待つ
+            if self.process?.isRunning == true {
+                return self.waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
+            }
             do {
                 try self.launch()
                 self.waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
@@ -283,7 +287,7 @@ final class WhisperServer {
         return dir.appendingPathComponent("whisper-server.log")
     }
 
-    private func isAlive(_ done: @escaping (Bool) -> Void) {
+    func isAlive(_ done: @escaping (Bool) -> Void) {
         var req = URLRequest(url: baseURL)
         req.timeoutInterval = 1
         URLSession.shared.dataTask(with: req) { _, resp, _ in
@@ -2209,6 +2213,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         render()
         Glossary.refreshUsage()
+        watchServer()
         // 初めて起動したときは「ログイン時に起動」をオンにする（再起動のたびに手で開かなくてよいように）。
         // 一度決めた後は、メニューで本人が切り替えた状態を尊重する
         if !Settings.defaults.bool(forKey: "loginItemDefaulted") {
@@ -2259,6 +2264,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             case .failure(let e): self.showError(e.localizedDescription, sticky: true)
             }
         })
+    }
+
+    // 1 分ごとに whisper-server が生きているかを見て、録音中でなければ起こし直す
+    private func watchServer() {
+        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self, self.serverReady, self.current == nil, self.transcribing == 0 else { return }
+            self.server.isAlive { alive in
+                guard !alive else { return }
+                DispatchQueue.main.async {
+                    Events.log("server_restart", ["reason": "health_check"])
+                    self.serverReady = false
+                    self.render()
+                    self.startServer()
+                }
+            }
+        }
     }
 
     private func startServer() {
@@ -2400,12 +2421,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func begin() {
         guard current == nil else { return }
-        guard serverReady else {
+        // モデルの初回ダウンロード中だけは断る。起こし直しの最中なら録音し、離したときに準備ができるのを待って文字起こしする
+        guard serverReady || downloadProgress == nil && FileManager.default.fileExists(atPath: Settings.model) else {
             Events.log("not_ready")
             fail("モデル読み込み中です。少し待ってから話してください")
             return
         }
         let u = Utterance(app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        // 押した瞬間に whisper-server が生きているかを見る。止まっていたら、話している間に起こし直しておく
+        server.isAlive { alive in
+            guard !alive else { return }
+            DispatchQueue.main.async {
+                guard self.serverReady else { return }
+                Events.log("server_restart", ["reason": "key_down_check"])
+                self.serverReady = false
+                self.render()
+                self.startServer()
+            }
+        }
         if recorder.start() {
             // 開始音はマイクに入り込むので小さめに鳴らす
             play(Settings.startSound, volume: 0.35)
@@ -2618,6 +2651,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.transcribing -= 1
                     self.deliver(u, t)
                 case .failure(let e):
+                    // whisper-server が止まっていた（強制終了など）。起こし直して 1 回だけやり直す（話した分を捨てない）
+                    if !retried, let ue = e as? URLError, [.cannotConnectToHost, .networkConnectionLost, .cannotFindHost].contains(ue.code) {
+                        u.record["server_restarted"] = true
+                        Events.log("server_restart", ["reason": "transcribe_connect_failed"])
+                        self.serverReady = false
+                        self.render()
+                        self.server.start { result in
+                            DispatchQueue.main.async {
+                                if case .success = result {
+                                    self.serverReady = true
+                                    self.render()
+                                    self.transcribe(u, prompt: prompt, retried: true)
+                                } else {
+                                    self.transcribing -= 1
+                                    u.record["error"] = e.localizedDescription
+                                    Events.log("error", self.lossEstimate(u).merging(["error": "server restart failed"]) { a, _ in a })
+                                    self.finish(u, pasted: nil)
+                                    self.fail("文字起こしの仕組み（whisper）を起こし直せませんでした。Koe を終了して開き直してください")
+                                }
+                            }
+                        }
+                        return
+                    }
                     self.transcribing -= 1
                     u.record["error"] = e.localizedDescription
                     var extra = self.lossEstimate(u)
