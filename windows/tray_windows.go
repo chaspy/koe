@@ -21,6 +21,7 @@ type trayItems struct {
 	modes     map[string]*systray.MenuItem
 	models    map[string]*systray.MenuItem
 	speed     *systray.MenuItem
+	gpu       *systray.MenuItem
 	lastTip   string
 	lastIcon  int
 }
@@ -103,10 +104,16 @@ func (a *App) setupTray() {
 			}
 		}()
 	}
-	t.speed = systray.AddMenuItemCheckbox("速さ優先（短い発話を速く。精度が少し落ちることがある。turbo では効きません）", "オフにすると毎回 30 秒ぶんの枠で文字起こしします（遅いが元の精度）。large-v3-turbo は枠を縮めると文字が出なくなるため、オンでも常に全体で処理します", false)
+	t.speed = systray.AddMenuItemCheckbox("速さ優先（短い発話を速く。精度が少し落ちることがある。turbo では効きません）", "オフにすると毎回 30 秒ぶんの枠で文字起こしします（遅いが元の精度）。large-v3-turbo は枠を縮めると文字が出なくなるため、オンでも常に全体で処理します。GPU で動いているときも精度を優先して全体で処理します（config の gpuAudioCtx で変更可）", false)
 	go func() {
 		for range t.speed.ClickedCh {
 			a.changeSpeedFirst()
+		}
+	}()
+	t.gpu = systray.AddMenuItemCheckbox("GPU を使う", "対応する GPU（Intel Arc / Iris Xe など）があれば、そちらで文字起こしします。使えないときは自動で CPU に戻ります", false)
+	go func() {
+		for range t.gpu.ClickedCh {
+			go a.changeGPU()
 		}
 	}()
 	mDiag := systray.AddMenuItem("診断情報を書き出す（送る用）", "デスクトップに zip を作ります（録音・文字起こしの中身は入りません）")
@@ -196,6 +203,32 @@ func (a *App) renderSpeedFirst() {
 		t.speed.Check()
 	} else {
 		t.speed.Uncheck()
+	}
+}
+
+// renderGPU checks "GPU を使う" unless gpu is "off", and says what runs now.
+func (a *App) renderGPU() {
+	t := &a.tray
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.gpu == nil {
+		return
+	}
+	title := "GPU を使う"
+	switch note := a.gpuStatus(); {
+	case strings.HasPrefix(note, "gpu"):
+		title += "（いまは GPU で動作中）"
+	case a.gpuOff.Load(), note == "":
+	case strings.HasSuffix(note, core.FallbackNotBundled):
+		title += "（この版には GPU 用が入っていません）"
+	default:
+		title += "（GPU が使えないため CPU で動作中）"
+	}
+	t.gpu.SetTitle(title)
+	if a.gpuOff.Load() {
+		t.gpu.Uncheck()
+	} else {
+		t.gpu.Check()
 	}
 }
 

@@ -4,6 +4,19 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.4.0 — 2026-10-16
+
+### Repository
+- Removed the original `whisper-ja-toggle` CLI (the shell script, its Makefile and README section). Koe.app replaces it; it is still in the git history of earlier releases.
+
+### Windows
+- GPU support (Vulkan): Koe ships `whisper-server-vulkan.exe` (whisper.cpp v1.9.2 built with `-DGGML_VULKAN=ON` by the new whisper-vulkan workflow) next to the CPU build. With `"gpu": "auto"` (default) Koe starts the Vulkan build and keeps it only if it runs on a GPU *and* is faster: on first start it transcribes a short bundled test clip (`assets\probe.wav`, synthetic speech) once on the GPU and once on the CPU and uses the faster one, because small integrated GPUs can be slower than the CPU. The result is saved in `%LOCALAPPDATA%\Koe\backend.json` and reused until the version, the model or the display adapters change. If the Vulkan build fails to start, finds no GPU device (`ggml_vulkan: No devices found` / `no GPU found`), or fails its first transcription, Koe switches to the CPU build. Menu → 「GPU を使う」 turns it on / off (`"gpu": "off"`).
+- On a GPU, speed first does not shrink the window (whole window for accuracy; `gpuAudioCtx`, default 0).
+- koe.log shows `server_backend=gpu|cpu`, `backend_measure gpu_ms= cpu_ms= choice=`, `gpu_fallback reason=` and the display adapters; diagnostics add the GPU settings, the measurement and `whisper-server-vulkan.log`.
+
+### macOS
+- No changes.
+
 ## 0.3.5 — 2026-10-16
 
 ### Windows

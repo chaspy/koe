@@ -33,7 +33,9 @@ type Config struct {
 	// TemperatureFallback lets whisper re-decode a hard segment at higher
 	// temperatures (whisper.cpp's default). Off: one greedy pass, much faster on CPU.
 	TemperatureFallback bool     `json:"temperatureFallback"`
-	AudioCtx            AudioCtx `json:"audioCtx"` // encoder window: "auto" (sized to the utterance) | 0 (whole 30 s) | frames
+	AudioCtx            AudioCtx `json:"audioCtx"`    // encoder window: "auto" (sized to the utterance) | 0 (whole 30 s) | frames
+	GPU                 string   `json:"gpu"`         // "auto" (Vulkan build when a GPU works, else CPU) | "off"
+	GPUAudioCtx         AudioCtx `json:"gpuAudioCtx"` // encoder window on a GPU; default 0 (whole: fast enough there, most accurate)
 	Prompt              string   `json:"prompt"`
 	EnabledPacks        []string `json:"enabledPacks"`
 	PackSources         []string `json:"packSources"`
@@ -76,6 +78,8 @@ func DefaultConfig() Config {
 		UpdateCheck:    true,
 		UpdateRepo:     DefaultUpdateRepo,
 		AudioCtx:       AudioCtxAuto,
+		GPU:            GPUAuto,
+		GPUAudioCtx:    0,
 	}
 }
 
@@ -98,6 +102,10 @@ func ParseConfig(data []byte) (Config, error) {
 	c.Model = NormalizeModel(c.Model)
 	if c.Model == "" {
 		c.Model = d.Model
+	}
+	c.GPU = strings.ToLower(strings.TrimSpace(c.GPU))
+	if c.GPU != GPUOff {
+		c.GPU = GPUAuto
 	}
 	if c.Threads < 0 {
 		c.Threads = 0

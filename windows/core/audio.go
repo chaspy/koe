@@ -120,3 +120,22 @@ func Seconds(pcm []int16) float64 { return float64(len(pcm)) / SampleRate }
 
 // Round2 rounds to 2 decimals (for logs / history).
 func Round2(x float64) float64 { return math.Round(x*100) / 100 }
+
+// WAVSamples returns the samples of a 16 kHz mono 16-bit wav (its data chunk).
+func WAVSamples(wav []byte) []int16 {
+	for i := 12; i+8 <= len(wav); {
+		size := int(binary.LittleEndian.Uint32(wav[i+4 : i+8]))
+		if string(wav[i:i+4]) == "data" {
+			if i+8+size > len(wav) {
+				size = len(wav) - i - 8
+			}
+			pcm := make([]int16, size/2)
+			for k := range pcm {
+				pcm[k] = int16(binary.LittleEndian.Uint16(wav[i+8+2*k:]))
+			}
+			return pcm
+		}
+		i += 8 + size + size%2
+	}
+	return nil
+}

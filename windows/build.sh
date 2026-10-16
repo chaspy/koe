@@ -47,6 +47,23 @@ if [ ! -f "$WDIR/whisper-server.exe" ]; then
   [ -f "$WDIR/whisper-server.exe" ] || { echo "whisper-server.exe not in $CZIP" >&2; exit 1; }
 fi
 
+echo "== whisper.cpp $WHISPER_TAG Vulkan (GPU) =="
+# built by .github/workflows/whisper-vulkan.yml; taken from its latest
+# successful run on main. Without it Koe still works (CPU only).
+VDIR="$CACHE/vulkan-$WHISPER_TAG"
+if [ ! -f "$VDIR/whisper-server-vulkan.exe" ] && [ "${SKIP_VULKAN:-}" != 1 ]; then
+  VULKAN_REPO="${VULKAN_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)}"
+  run=$(gh run list -R "$VULKAN_REPO" -w whisper-vulkan.yml -b main -s success -L 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
+  if [ -n "$run" ]; then
+    gh run download "$run" -R "$VULKAN_REPO" -n "whisper-server-vulkan-$WHISPER_TAG" -D "$VDIR" || true
+  fi
+fi
+if [ -f "$VDIR/whisper-server-vulkan.exe" ]; then
+  cat "$VDIR/vulkan-build.txt" 2>/dev/null || true
+else
+  echo "warning: no whisper-server-vulkan.exe (run the whisper-vulkan workflow, or SKIP_VULKAN=1); building without GPU support" >&2
+fi
+
 echo "== build Koe.exe ($VERSION, $REV) =="
 mkdir -p "$STAGE"
 find "$STAGE" -mindepth 1 -delete
@@ -54,6 +71,7 @@ mkdir -p "$STAGE/packs" "$STAGE/assets"
 CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
   -ldflags "-H windowsgui -s -w -X main.version=$VERSION -X main.rev=$REV" -o "$STAGE/Koe.exe" .
 cp "$WDIR"/whisper-server.exe "$WDIR"/*.dll "$STAGE/"
+[ -f "$VDIR/whisper-server-vulkan.exe" ] && cp "$VDIR/whisper-server-vulkan.exe" "$STAGE/"
 cp ../packs/*.txt "$STAGE/packs/"
 cp assets/*.wav "$STAGE/assets/"
 cp README-windows.md "$STAGE/"

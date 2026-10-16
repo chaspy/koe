@@ -21,6 +21,7 @@ import (
 var serverLogPatterns = []string{
 	"system_info", "AVX", "CPU", "total time", "encode time", "decode time",
 	"load time", "model size", "processing '", "error", "failed",
+	"whisper_backend_init_gpu", "ggml_vulkan", "total size",
 }
 
 // InterestingServerLine reports whether a whisper-server output line should

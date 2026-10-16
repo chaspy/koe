@@ -1,0 +1,163 @@
+# Builds whisper-server v1.9.2 with Vulkan for Windows x64 (whisper-server-vulkan.exe,
+# picked up by windows/build.sh from this workflow's artifact), then checks on
+# the GPU-less runner that Koe's GPU path falls back to the CPU build
+# ("no_device"). Manual only. Cost: windows runners are $0.010/min (2 cores,
+# private repositories); the two jobs are capped at 24 + 6 = 30 minutes.
+name: whisper-vulkan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read # job start times for the cost line
+
+env:
+  WHISPER_TAG: v1.9.2
+  VULKAN_VERSION: 1.4.328.1
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 3
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ env.WHISPER_TAG }}
+          path: whisper.cpp
+
+      - name: Vulkan SDK ${{ env.VULKAN_VERSION }} (LunarG installer)
+        timeout-minutes: 8
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\vulkansdk.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\vulkansdk.exe" --accept-licenses --default-answer --confirm-command install | Out-Null
+          $sdk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          if (!(Test-Path "$sdk\Bin\glslc.exe")) { throw "glslc.exe not found in $sdk" }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\Bin"
+
+      - name: Configure (Vulkan, static libs, static CRT, no OpenMP, portable CPU code)
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          cmake -S whisper.cpp -B build \
+            -DGGML_VULKAN=ON -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF \
+            -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DWHISPER_BUILD_TESTS=OFF -DWHISPER_SDL2=OFF
+
+      - name: Build whisper-server
+        timeout-minutes: 20
+        shell: bash
+        run: cmake --build build --config Release --target whisper-server -j 4
+
+      - name: Package
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/bin/Release/whisper-server.exe dist/whisper-server-vulkan.exe
+          pip install -q pefile
+          python - <<'EOF' | tee dist/vulkan-build.txt
+          import os, pefile, zipfile, io
+          p = "dist/whisper-server-vulkan.exe"
+          pe = pefile.PE(p, fast_load=False)
+          dlls = sorted({e.dll.decode() for e in getattr(pe, "DIRECTORY_ENTRY_IMPORT", [])}, key=str.lower)
+          b = io.BytesIO()
+          with zipfile.ZipFile(b, "w", zipfile.ZIP_DEFLATED) as z:
+              z.write(p, os.path.basename(p))
+          print(f"whisper-server-vulkan.exe: {os.path.getsize(p) / 1e6:.1f} MB, zipped {len(b.getvalue()) / 1e6:.1f} MB")
+          print("imports: " + ", ".join(dlls))
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        timeout-minutes: 3
+        with:
+          name: whisper-server-vulkan-${{ env.WHISPER_TAG }}
+          path: dist/
+          retention-days: 90
+
+  check:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 6
+    defaults:
+      run:
+        shell: bash
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 2
+
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 2
+        with:
+          name: whisper-server-vulkan-${{ env.WHISPER_TAG }}
+          path: windows/.cache/vulkan
+
+      - uses: actions/setup-go@v5
+        timeout-minutes: 3
+        with:
+          go-version-file: windows/go.mod
+          cache-dependency-path: windows/go.sum
+
+      - name: CPU build of whisper.cpp ${{ env.WHISPER_TAG }} and small-q5_1
+        timeout-minutes: 3
+        run: |
+          mkdir -p .cache/models
+          curl -fsSL --retry 3 -o .cache/whisper.zip "https://github.com/ggml-org/whisper.cpp/releases/download/$WHISPER_TAG/whisper-bin-x64.zip"
+          python -c "import os,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); os.makedirs(sys.argv[2],exist_ok=True); [open(os.path.join(sys.argv[2],os.path.basename(n)),'wb').write(z.read(n)) for n in z.namelist() if n.endswith(('/whisper-server.exe','.dll'))]" .cache/whisper.zip .cache/whisper
+          curl -fsSL --retry 3 -o .cache/models/ggml-small-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin
+
+      - name: Koe's GPU path on a runner without a GPU (3 sentences)
+        timeout-minutes: 4
+        run: |
+          go build -o .cache/accept.exe ./bench/accept
+          .cache/accept.exe -server .cache/whisper/whisper-server.exe -server-gpu .cache/vulkan/whisper-server-vulkan.exe \
+            -model .cache/models/ggml-small-q5_1.bin -limit 3 -runs 1 -prompts koe -out bench-out/accept.jsonl
+
+      - name: Summary
+        if: always()
+        timeout-minutes: 2
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'EOF' | tee -a "$GITHUB_STEP_SUMMARY"
+          import datetime, json, os, subprocess, math
+          print("## whisper-server Vulkan build and GPU fallback check\n")
+          try:
+              print("- " + open(".cache/vulkan/vulkan-build.txt", encoding="utf-8").read().strip().replace("\n", "\n- "))
+          except OSError:
+              print("- (no build info)")
+          rs = [json.loads(l) for l in open("bench-out/accept.jsonl", encoding="utf-8")] if os.path.exists("bench-out/accept.jsonl") else []
+          log = open("bench-out/server-accept-vulkan.log", encoding="utf-8", errors="replace").read() if os.path.exists("bench-out/server-accept-vulkan.log") else ""
+          lines = [l.strip() for l in log.splitlines() if "ggml_vulkan" in l or "whisper_backend_init_gpu" in l]
+          print("- Vulkan server said: " + (" / ".join(f"`{l}`" for l in lines[:4]) or "(nothing)"))
+          ok = bool(rs) and all(r["backend"] == "cpu" and r["gpu_fallback"] == "no_device" and r["outcome"] == "ok" for r in rs)
+          for r in rs:
+              print(f"- {r['id']}: backend {r['backend']} (fallback: {r['gpu_fallback'] or '-'}), outcome {r['outcome']}, {r['ms']} ms")
+          print(f"\n### {'PASS' if ok else 'FAIL'}: {'fell back to the CPU build with no_device' if ok else 'expected backend cpu, fallback no_device, outcome ok'}\n")
+          try:
+              jobs = json.loads(subprocess.run(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/jobs"], capture_output=True, text=True).stdout)["jobs"]
+              now = datetime.datetime.now(datetime.timezone.utc)
+              total = 0
+              for j in jobs:
+                  s = datetime.datetime.fromisoformat(j["started_at"].replace("Z", "+00:00"))
+                  e = datetime.datetime.fromisoformat(j["completed_at"].replace("Z", "+00:00")) if j.get("completed_at") else now
+                  m = (e - s).total_seconds() / 60
+                  total += math.ceil(m)
+                  print(f"- job {j['name']}: {m:.1f} min (billed {math.ceil(m)})")
+              print(f"- estimated cost: {total} min × $0.010 = ${total * 0.010:.2f}")
+          except Exception as ex:
+              print(f"- (job times unavailable: {ex})")
+          raise SystemExit(0 if ok else 1)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        timeout-minutes: 2
+        with:
+          name: gpu-fallback-check
+          path: windows/bench-out/

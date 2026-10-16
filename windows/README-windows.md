@@ -44,12 +44,27 @@ https://aka.ms/vs/17/release/vc_redist.x64.exe
   - 以前の版で使い始めた人は `config.json` に `model` が書かれているので、そのモデルのままです（既定が変わっても切り替わりません）。small にしたいときはこのメニューで選んでください
   - はじめて選んだモデルはダウンロードします（進み具合はアイコンにマウスを乗せると出ます）。終わると自動で切り替わり、`config.json` の `model` にも保存されます
 - 速さ優先（短い発話を速く。精度が少し落ちることがある。turbo では効きません） … 既定オン。話した長さに合わせた枠（最小 15 秒ぶん）で文字起こしするので、30 秒ぶん全体で処理するより約半分の時間で済みます（オフにすると毎回 30 秒ぶんの枠で処理します）。large-v3-turbo は枠を縮めると文字が出なくなるため、オンでも常に 30 秒ぶん全体で処理します。選ぶとすぐに切り替わり（再起動は不要）、`config.json` の `audioCtx` にも保存されます（オン `"auto"` / オフ `0`）
+- GPU を使う … 既定オン。対応する GPU（Intel の内蔵グラフィックスなど、Vulkan に対応したもの）があれば、GPU 用の whisper-server で文字起こしします。くわしくは下の「GPU」
+  - 項目の後ろに、いまどちらで動いているか（「いまは GPU で動作中」「GPU が使えないため CPU で動作中」など）が出ます
+  - 切り替えると whisper-server を起動し直します（再起動は不要）。`config.json` の `gpu` にも保存されます（オン `"auto"` / オフ `"off"`）
 - 診断情報を書き出す（送る用） … デスクトップに `Koe-diagnostics-<日時>.zip` を作って、エクスプローラーで表示します（下の「不具合のときに送ってほしいもの」）
 - ログのフォルダを開く
 - 設定ファイルを開く
 - 更新を確認 … 新しい版が出ていないか、いま確かめます（下の「更新」）
 - Koe のバージョン（例: `Koe 0.1.1 (f2db111)`）
 - 終了
+
+## GPU
+
+`gpu` が `"auto"`（既定）のとき、Koe は次のように決めます。
+
+1. GPU 用の whisper-server（`whisper-server-vulkan.exe`）を起動します。起動できない・GPU が見つからない（whisper-server が「No devices found」「no GPU found」と出す）ときは、CPU 用に切り替えます。
+2. GPU が見つかったら、同梱の短い試験音声（`assets\probe.wav`、合成音声で約 5 秒）を GPU と CPU で 1 回ずつ文字起こしし、**速いほうを使います**。内蔵の小さな GPU では CPU のほうが速いこともあるためです。測るのは初回だけで、起動が 20〜60 秒ほど長くなります（アイコンには「GPU と CPU の速さを測っています（初回だけ）」と出ます）。
+3. 結果は `%LOCALAPPDATA%\Koe\backend.json` に残り、次の起動からはそれを使います。Koe の版・モデル・グラフィックスが変わったときと、メニューで「GPU を使う」をオンにし直したときに測り直します。
+4. GPU で動き始めたあと、最初の文字起こしが失敗したときは、CPU 用に切り替えてやり直します（以後は CPU を使います）。
+
+- GPU のときは、精度を優先して「速さ優先」の枠の縮めは使わず、毎回 30 秒ぶん全体で処理します（`gpuAudioCtx`、既定 `0`。`"auto"` にすると CPU と同じく縮めます）。
+- どちらで動いたか・GPU の名前・測った時間・切り替えた理由は、`koe.log`（`server_backend=` `backend_measure` `gpu_fallback reason=`）と診断情報に出ます。
 
 ## 速さの目安
 
@@ -88,6 +103,8 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `model` | `"ggml-small-q5_1.bin"` | モデルのファイル名（`%LOCALAPPDATA%\Koe\models` 内）か絶対パス。`"small-q5_1"` のような短い名前も可 |
 | `threads` | `0` | 文字起こしに使うスレッド数。`0` は自動（論理プロセッサ数、最大 16） |
 | `audioCtx` | `"auto"` | 文字起こしの枠の大きさ。`"auto"` は話した長さに合わせる（最小 15 秒ぶん＝768、それより長い発話は長さに合わせて広げる。30 秒以上は全体）、`0` は毎回 30 秒ぶん全体（遅いが元の精度）、数値は固定（1 秒 = 50、最大 1500）。メニューの「速さ優先」で `"auto"` / `0` を切り替えられます。large-v3 系のモデルでは常に `0` |
+| `gpu` | `"auto"` | GPU を使うか。`"auto"` は使える GPU があり、CPU より速いときだけ GPU（上の「GPU」）、`"off"` は常に CPU |
+| `gpuAudioCtx` | `0` | GPU で動いているときの枠の大きさ（`audioCtx` と同じ書き方）。既定は 30 秒ぶん全体 |
 | `temperatureFallback` | `false` | うまく読めない区間を条件を変えて読み直すか。`true` にすると精度が少し上がることがありますが、遅くなります |
 | `enabledPacks` | `["developer"]` | 使う用語パック（`packs\*.txt` のファイル名） |
 | `packSources` | `[]` | 共有の用語パックの取り込み元。例 `["gh:owner/repo/path/pack.txt"]`（1 日 1 回、`gh` CLI で取得） |
@@ -111,7 +128,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 **遅い・動かないときは、メニューの「診断情報を書き出す」でできた zip を送ってください。** デスクトップに `Koe-diagnostics-<日時>.zip` ができます。中身は次のとおりで、録音した音声と文字起こしの中身は入りません（設定のうち key / token / secret / password を含む項目の値は `***` に置き換えます）。
 
 - `diagnostics.txt` … Koe と Windows のバージョン、CPU 名、論理プロセッサ数、メモリ、モデル、スレッド数、押し方、録音キー、用語パック、その他の設定
-- `koe.log` の最後の 2000 行、`whisper-server.log` の最後の 500 行、`update.log`（あれば）
+- `koe.log` の最後の 2000 行、`whisper-server.log` の最後の 500 行、`whisper-server-vulkan.log`（GPU 用を起動したことがあれば）、`update.log`（あれば）
 
 文字起こしが遅いときは、`koe.log` の `whisper_ok ms=... audio_sent=...s ms_per_audio_s=... audio_ctx=...`（音声 1 秒あたりにかかったミリ秒と、使った枠の大きさ。`0` は 30 秒ぶん全体）と、`whisper_server system_info: ...`（CPU が使える命令 AVX / AVX2 など）を見ると原因の見当がつきます。
 
@@ -129,6 +146,6 @@ zip を作れないときは、`%LOCALAPPDATA%\Koe` フォルダ（メニュー�
 |---|---|
 | Koe を展開したフォルダ | `Koe.exe`、`whisper-server.exe` と DLL、`packs\`、`assets\` |
 | `%APPDATA%\Koe` | `config.json`、`glossary.txt`、`packs\` |
-| `%LOCALAPPDATA%\Koe` | `koe.log`、`whisper-server.log`、`update.log`、`models\`、`history\` |
+| `%LOCALAPPDATA%\Koe` | `koe.log`、`whisper-server.log`、`whisper-server-vulkan.log`、`update.log`、`backend.json`（GPU と CPU を測った結果）、`models\`、`history\` |
 
 アンインストールは、Koe を終了してから上の 3 つのフォルダを消すだけです。

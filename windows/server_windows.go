@@ -39,6 +39,25 @@ type WhisperServer struct {
 	stopping bool // Stop was called: the exit is expected
 	Threads  int
 	Model    string
+	Exe      string        // core.CPUServerExe (default) or core.VulkanServerExe
+	Probe    core.GPUProbe // what the server said about the GPU
+	OnGPU    bool          // the Vulkan build is running on a GPU (set by App.startServer)
+}
+
+func (s *WhisperServer) exeName() string {
+	if s.Exe == "" {
+		return core.CPUServerExe
+	}
+	return s.Exe
+}
+
+// logName is whisper-server.log for the CPU build, whisper-server-vulkan.log
+// for the Vulkan build (so a GPU attempt's log survives the CPU fallback).
+func (s *WhisperServer) logName() string {
+	if s.exeName() == core.VulkanServerExe {
+		return "whisper-server-vulkan.log"
+	}
+	return "whisper-server.log"
 }
 
 // Start launches whisper-server.exe (or reuses one already listening) and
@@ -50,14 +69,14 @@ func (s *WhisperServer) Start(modelPath string) error {
 		a.log.Printf("server_reuse %s (already running)", base)
 		return nil
 	}
-	exe := filepath.Join(a.exeDir, "whisper-server.exe")
+	exe := filepath.Join(a.exeDir, s.exeName())
 	if _, err := os.Stat(exe); err != nil {
-		return fmt.Errorf("whisper-server.exe が見つかりません: %s", exe)
+		return fmt.Errorf("%s が見つかりません: %s", s.exeName(), exe)
 	}
 	threads := a.cfg.ThreadsFor(runtime.NumCPU())
 	s.Threads, s.Model = threads, modelPath
 	args := core.ServerArgs(a.cfg, modelPath, threads)
-	logPath := filepath.Join(a.localDir, "whisper-server.log")
+	logPath := filepath.Join(a.localDir, s.logName())
 	lf, err := os.Create(logPath)
 	if err != nil {
 		return err
@@ -68,6 +87,7 @@ func (s *WhisperServer) Start(modelPath string) error {
 	// timings are also copied into koe.log
 	filter := &core.LineFilter{Match: core.InterestingServerLine, Fn: func(line string) {
 		a.log.Printf("whisper_server %s", line)
+		s.Probe.Line(line)
 	}}
 	out := io.MultiWriter(lf, filter)
 	cmd.Stdout, cmd.Stderr = out, out
@@ -77,7 +97,7 @@ func (s *WhisperServer) Start(modelPath string) error {
 		lf.Close()
 		return fmt.Errorf("whisper-server を起動できません: %w", err)
 	}
-	a.log.Printf("server_launched pid=%d threads=%d model=%s args=%q log=%s", cmd.Process.Pid, threads, modelPath, args[:len(args)-2], logPath)
+	a.log.Printf("server_launched exe=%s pid=%d threads=%d model=%s args=%q log=%s", s.exeName(), cmd.Process.Pid, threads, modelPath, args[:len(args)-2], logPath)
 	exited := make(chan struct{})
 	s.mu.Lock()
 	s.cmd, s.exited = cmd, exited

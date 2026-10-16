@@ -60,6 +60,30 @@ func readSysInfo() sysInfo {
 	return si
 }
 
+// readGPUAdapters lists the display adapters' names (DriverDesc under the
+// display class key), e.g. "Intel(R) Arc(TM) Graphics".
+func readGPUAdapters() []string {
+	const class = `SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}`
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, class, registry.ENUMERATE_SUB_KEYS)
+	if err != nil {
+		return nil
+	}
+	defer k.Close()
+	subs, _ := k.ReadSubKeyNames(-1)
+	var out []string
+	for _, sub := range subs {
+		sk, err := registry.OpenKey(registry.LOCAL_MACHINE, class+`\`+sub, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		if s, _, err := sk.GetStringValue("DriverDesc"); err == nil && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+		sk.Close()
+	}
+	return out
+}
+
 func desktopDir() string {
 	if p, err := windows.KnownFolderPath(windows.FOLDERID_Desktop, 0); err == nil && p != "" {
 		return p
@@ -93,6 +117,11 @@ func (a *App) diagnosticsText() []byte {
 		threads = a.server.Threads
 	}
 	w("threads = %d (config threads=%d)", threads, a.cfg.Threads)
+	w("gpu = %s (config gpu=%s, gpuAudioCtx=%s)", a.gpuStatus(), a.cfg.GPU, a.cfg.GPUAudioCtx)
+	w("gpu_adapters = %q", a.gpuNames)
+	if c := a.backendChoice(); c.Choice != "" {
+		w("backend_choice = %s (%s; gpu_ms=%d cpu_ms=%d; measured %s for %s / %s)", c.Choice, c.Reason, c.GPUms, c.CPUms, c.At, c.Version, c.Model)
+	}
 	w("pressMode = %s", a.pressMode())
 	w("audioCtx = %s (speed first %s%s)", a.audioCtxSetting(), onOff(a.audioCtxSetting() != 0), map[bool]string{true: "; not applied: model needs the whole window"}[core.FullWindowOnly(a.modelFile()) && a.audioCtxSetting() != 0])
 	w("hotkey = %s", a.hotkey())
@@ -104,7 +133,7 @@ func (a *App) diagnosticsText() []byte {
 	cfgRaw, err := os.ReadFile(a.configPath())
 	if err != nil {
 		w("(could not read: %v)", err)
-	} else if lines, err := core.RedactedConfigLines(cfgRaw, "model", "pressMode", "hotkey", "enabledPacks", "packSources", "threads", "audioCtx"); err != nil {
+	} else if lines, err := core.RedactedConfigLines(cfgRaw, "model", "pressMode", "hotkey", "enabledPacks", "packSources", "threads", "audioCtx", "gpu", "gpuAudioCtx"); err != nil {
 		w("(invalid JSON: %v)", err)
 	} else {
 		for _, l := range lines {
@@ -123,6 +152,9 @@ func (a *App) exportDiagnostics() {
 		{Name: "diagnostics.txt", Data: a.diagnosticsText()},
 		{Name: "koe.log", Data: core.ReadTail(2000, filepath.Join(a.localDir, "koe.log.1"), filepath.Join(a.localDir, "koe.log"))},
 		{Name: "whisper-server.log", Data: core.ReadTail(500, filepath.Join(a.localDir, "whisper-server.log"))},
+	}
+	if _, err := os.Stat(filepath.Join(a.localDir, "whisper-server-vulkan.log")); err == nil {
+		files = append(files, core.ZipFile{Name: "whisper-server-vulkan.log", Data: core.ReadTail(500, filepath.Join(a.localDir, "whisper-server-vulkan.log"))})
 	}
 	if _, err := os.Stat(filepath.Join(a.localDir, "update.log")); err == nil {
 		files = append(files, core.ZipFile{Name: "update.log", Data: core.ReadTail(1000, filepath.Join(a.localDir, "update.log"))})

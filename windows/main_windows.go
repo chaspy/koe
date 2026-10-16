@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -62,6 +63,8 @@ type App struct {
 	model      atomic.Value  // string: model file name / path in use (or being switched to)
 	switching  atomic.Bool   // a model switch is running
 	audioCtx   atomic.Int64  // core.AudioCtx in use; the menu "速さ優先" switches auto / 0
+	gpuOff     atomic.Bool   // config gpu "off"; the menu "GPU を使う" switches it
+	gpuOK      atomic.Bool   // the GPU server has transcribed once (no more first-request fallback)
 	keys       chan keyEvent
 	updating   atomic.Bool
 	tail       sync.WaitGroup
@@ -78,10 +81,14 @@ type App struct {
 	prevByApp map[string]pastedText
 	usage     map[string]int
 	usageAt   time.Time
-	avail     *core.Release // newer release, if any
-	checkedAt time.Time     // when the last update check started
-	checkMu   sync.Mutex    // one update check at a time
-	updateMsg string        // update progress shown as the status
+	avail     *core.Release      // newer release, if any
+	gpuNote   string             // backend in use and why ("gpu Vulkan0" / "cpu: no_device")
+	choice    core.BackendChoice // last GPU / CPU measurement (backend.json)
+	busyMsg   string             // shown as the status while measuring
+	gpuNames  []string           // display adapters from the registry
+	checkedAt time.Time          // when the last update check started
+	checkMu   sync.Mutex         // one update check at a time
+	updateMsg string             // update progress shown as the status
 
 	tray trayItems
 }
@@ -154,16 +161,19 @@ func (a *App) startup() {
 	a.toggle.Store(cfg.PressMode == core.PressToggle)
 	a.model.Store(cfg.Model)
 	a.audioCtx.Store(int64(cfg.AudioCtx))
+	a.gpuOff.Store(cfg.GPU == core.GPUOff)
+	a.gpuNames = readGPUAdapters()
 	a.renderHotkey()
 	a.renderPressMode()
 	a.renderModel()
 	a.renderSpeedFirst()
+	a.renderGPU()
 	a.log.Printf("start Koe %s rev=%s windows=%d.%d.%d cpus=%d exe=%s", version, rev, v.MajorVersion, v.MinorVersion, v.BuildNumber, runtime.NumCPU(), a.exeDir)
 	si := readSysInfo()
 	a.log.Printf("system cpu=%q logical_cpus=%d ram_mb=%d ram_free_mb=%d threads=%d (config threads=%d)",
 		si.CPU, runtime.NumCPU(), si.RAMTotalMB, si.RAMFreeMB, cfg.ThreadsFor(runtime.NumCPU()), cfg.Threads)
-	a.log.Printf("config hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s",
-		cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx)
+	a.log.Printf("config hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s gpu=%s gpuAudioCtx=%s gpu_adapters=%q",
+		cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx, cfg.GPU, cfg.GPUAudioCtx, a.gpuNames)
 	a.log.Printf("input_devices %q", inputDevices())
 
 	if _, err := os.Stat(a.glossaryPath()); os.IsNotExist(err) {
@@ -406,11 +416,133 @@ func (a *App) ensureModel(model, url string) error {
 }
 
 // startServer launches whisper-server with model and marks Koe ready.
+//
+// gpu "auto": the Vulkan build is kept only if it runs on a GPU and was
+// faster than the CPU build on assets/probe.wav (small integrated GPUs can be
+// slower). The measurement is saved in backend.json and reused until the
+// version, the model or the display adapters change.
 func (a *App) startServer(model string) {
 	if fi, err := os.Stat(model); err == nil {
 		a.log.Printf("model %s size_mb=%d", model, fi.Size()>>20)
 	}
 	a.setError("", false)
+	a.gpuOK.Store(false)
+	if a.gpuOff.Load() {
+		a.serveCPU(model, "off")
+		return
+	}
+	size := fileSize(model)
+	if c, ok := core.LoadBackendChoice(a.backendChoicePath()); ok && c.Matches(version, model, size, a.gpuNames) {
+		a.setChoice(c)
+		a.log.Printf("backend_choice saved choice=%s reason=%s gpu_ms=%d cpu_ms=%d at=%s", c.Choice, c.Reason, c.GPUms, c.CPUms, c.At)
+		if c.Choice == core.BackendCPU {
+			a.serveCPU(model, c.Reason)
+			return
+		}
+		s, reason := a.startGPU(model)
+		if reason != "" {
+			a.saveChoice(core.NewBackendChoice(version, model, size, a.gpuNames, core.BackendCPU, reason))
+			a.serveCPU(model, reason)
+			return
+		}
+		a.serve(s)
+		return
+	}
+	a.measureAndServe(model, size)
+}
+
+// measureAndServe times probe.wav on the GPU build, then on the CPU build,
+// and keeps the faster one running.
+func (a *App) measureAndServe(model string, size int64) {
+	s, reason := a.startGPU(model)
+	if reason != "" {
+		a.saveChoice(core.NewBackendChoice(version, model, size, a.gpuNames, core.BackendCPU, reason))
+		a.serveCPU(model, reason)
+		return
+	}
+	a.setBusy("GPU と CPU の速さを測っています（初回だけ）")
+	defer a.setBusy("")
+	wav, sec, err := a.probeWAV()
+	if err != nil {
+		a.log.Printf("backend_measure_skipped err=%v (using the GPU)", err)
+		a.serve(s)
+		return
+	}
+	gpuMS, gerr := core.MeasureTranscribe(context.Background(), core.BaseURL(a.cfg.Port), wav, a.cfg.Prompt, a.cfg.GPUAudioCtx.For(sec, model))
+	s.StopAndWait()
+	cpu := &WhisperServer{app: a}
+	if err := cpu.Start(model); err != nil {
+		a.log.Printf("server_failed err=%v", err)
+		a.setError(err.Error(), true)
+		go messageBox("Koe", err.Error(), 0x10)
+		return
+	}
+	cpuMS, cerr := core.MeasureTranscribe(context.Background(), core.BaseURL(a.cfg.Port), wav, a.cfg.Prompt, a.audioCtxSetting().For(sec, model))
+	if gerr != nil {
+		gpuMS = 0
+	}
+	if cerr != nil {
+		cpuMS = 0
+	}
+	pick := core.PickBackend(gpuMS, cpuMS)
+	why := pick + "_faster"
+	if gerr != nil {
+		why = core.FallbackFirstFailed
+	}
+	c := core.NewBackendChoice(version, model, size, a.gpuNames, pick, why)
+	c.GPUms, c.CPUms = gpuMS, cpuMS
+	a.saveChoice(c)
+	a.log.Printf("backend_measure probe_s=%.2f gpu_ms=%d gpu_err=%v cpu_ms=%d cpu_err=%v choice=%s adapters=%q", sec, gpuMS, gerr, cpuMS, cerr, pick, a.gpuNames)
+	if pick == core.BackendCPU {
+		a.server = cpu
+		a.setGPUNote("cpu: " + why)
+		a.markReady("cpu", why)
+		return
+	}
+	cpu.StopAndWait()
+	if s, reason = a.startGPU(model); reason != "" {
+		a.saveChoice(core.NewBackendChoice(version, model, size, a.gpuNames, core.BackendCPU, reason))
+		a.serveCPU(model, reason)
+		return
+	}
+	a.serve(s)
+}
+
+// startGPU starts the Vulkan build and checks it runs on a GPU; on failure it
+// is stopped and the reason returned. Koe is not marked ready.
+func (a *App) startGPU(model string) (*WhisperServer, string) {
+	if _, err := os.Stat(filepath.Join(a.exeDir, core.VulkanServerExe)); err != nil {
+		return nil, core.FallbackNotBundled
+	}
+	s := &WhisperServer{app: a, Exe: core.VulkanServerExe}
+	if err := s.Start(model); err != nil {
+		a.log.Printf("gpu_server_failed err=%v", err)
+		s.StopAndWait()
+		return nil, core.FallbackStartFailed
+	}
+	if r := s.Probe.FallbackReason(); r != "" {
+		s.StopAndWait()
+		return nil, r
+	}
+	s.OnGPU = true
+	return s, ""
+}
+
+// serve makes the running GPU server the one Koe uses.
+func (a *App) serve(s *WhisperServer) {
+	a.server = s
+	a.setGPUNote("gpu " + s.Probe.Backend())
+	a.log.Printf("server_backend=gpu backend=%s adapters=%q", s.Probe.Backend(), a.gpuNames)
+	a.markReady("gpu", "")
+}
+
+// serveCPU starts the CPU build; reason says why not the GPU.
+func (a *App) serveCPU(model, reason string) {
+	if reason != "off" {
+		a.log.Printf("gpu_fallback reason=%s adapters=%q -> cpu", reason, a.gpuNames)
+	}
+	a.setGPUNote("cpu: " + reason)
+	a.renderGPU()
 	a.server = &WhisperServer{app: a}
 	if err := a.server.Start(model); err != nil {
 		a.log.Printf("server_failed err=%v", err)
@@ -418,9 +550,136 @@ func (a *App) startServer(model string) {
 		go messageBox("Koe", err.Error(), 0x10)
 		return
 	}
+	a.markReady("cpu", reason)
+}
+
+func (a *App) markReady(backend, reason string) {
+	if backend == "cpu" {
+		a.log.Printf("server_backend=cpu reason=%s", reason)
+	}
 	a.ready.Store(true)
 	a.log.Printf("ready")
+	a.renderGPU()
 	a.render()
+}
+
+func (a *App) backendChoicePath() string { return filepath.Join(a.localDir, "backend.json") }
+
+func (a *App) saveChoice(c core.BackendChoice) {
+	a.setChoice(c)
+	if err := core.SaveBackendChoice(a.backendChoicePath(), c); err != nil {
+		a.log.Printf("backend_choice_save_failed %v", err)
+	}
+}
+
+func (a *App) setChoice(c core.BackendChoice) {
+	a.mu.Lock()
+	a.choice = c
+	a.mu.Unlock()
+}
+
+func (a *App) backendChoice() core.BackendChoice {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.choice
+}
+
+func (a *App) setBusy(msg string) {
+	a.mu.Lock()
+	a.busyMsg = msg
+	a.mu.Unlock()
+	a.render()
+}
+
+// probeWAV is assets/probe.wav as Koe would send it (silence trimmed).
+func (a *App) probeWAV() ([]byte, float64, error) {
+	raw, err := os.ReadFile(filepath.Join(a.exeDir, "assets", core.ProbeWAV))
+	if err != nil {
+		return nil, 0, err
+	}
+	pcm := core.TrimSilence(core.WAVSamples(raw))
+	if len(pcm) == 0 {
+		return nil, 0, errors.New("probe.wav has no sound")
+	}
+	return core.EncodeWAV(pcm), core.Seconds(pcm), nil
+}
+
+func fileSize(path string) int64 {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+func (a *App) onGPU() bool {
+	s := a.server
+	return s != nil && s.OnGPU
+}
+
+func (a *App) setGPUNote(s string) {
+	a.mu.Lock()
+	a.gpuNote = s
+	a.mu.Unlock()
+}
+
+func (a *App) gpuStatus() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.gpuNote
+}
+
+// fallbackToCPU restarts on the CPU build after the GPU server failed a
+// request; the caller retries the utterance.
+func (a *App) fallbackToCPU(reason string) {
+	if !a.switching.CompareAndSwap(false, true) {
+		return
+	}
+	defer a.switching.Store(false)
+	a.ready.Store(false)
+	a.render()
+	if a.server != nil {
+		a.server.StopAndWait()
+	}
+	model := a.modelPathFor(a.modelFile())
+	a.saveChoice(core.NewBackendChoice(version, model, fileSize(model), a.gpuNames, core.BackendCPU, reason))
+	a.serveCPU(model, reason)
+}
+
+// changeGPU is the tray handler of "GPU を使う": saves config.json and
+// restarts whisper-server on the chosen build.
+func (a *App) changeGPU() {
+	defer a.recoverLog("change_gpu")
+	if a.recording.Load() || a.processing.Load() > 0 {
+		a.renderGPU()
+		a.setError("録音中・文字起こし中は切り替えられません。終わってからもう一度選んでください", false)
+		return
+	}
+	if !a.switching.CompareAndSwap(false, true) {
+		a.renderGPU()
+		a.setError("準備中です。終わってからもう一度選んでください", false)
+		return
+	}
+	defer a.switching.Store(false)
+	off := !a.gpuOff.Load()
+	v := core.GPUAuto
+	if off {
+		v = core.GPUOff
+	}
+	if err := core.SetConfigValue(a.configPath(), "gpu", v); err != nil {
+		a.log.Printf("gpu_save_failed %v", err)
+		a.setError("設定ファイルに保存できませんでした（今回の起動中だけ切り替えます）: "+err.Error(), false)
+	}
+	a.gpuOff.Store(off)
+	if !off {
+		_ = os.Remove(a.backendChoicePath()) // turned on again: measure again
+	}
+	a.log.Printf("gpu_changed %s", v)
+	a.ready.Store(false)
+	a.render()
+	if a.server != nil {
+		a.server.StopAndWait()
+	}
+	a.startServer(a.modelPathFor(a.modelFile()))
 }
 
 // ---- key handling (single goroutine) ----
@@ -656,29 +915,51 @@ func (a *App) process(u *utterance) {
 func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64, personal, packs []core.Entry) (string, bool) {
 	rec := u.record
 	model := a.modelFile()
-	rec["whisper_audio_ctx"] = a.audioCtxSetting().For(voiced, model)
 	rec["whisper_prompt"] = prompt
-	res := core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
-		BaseURL: core.BaseURL(a.cfg.Port), WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
-		AudioCtx: a.audioCtxSetting(), Fallback: a.cfg.TemperatureFallback,
-		Entries: append(append([]core.Entry{}, personal...), packs...),
-		OnPass: func(attempt int, p core.Pass) {
-			if p.Err != nil {
-				a.log.Printf("whisper_error ms=%d audio_ctx=%d err=%v", p.MS, p.AudioCtx, p.Err)
-				return
+	run := func() core.UtteranceResult {
+		gpu := a.onGPU()
+		setting := a.cfg.AudioCtxSetting(gpu, a.audioCtxSetting())
+		rec["whisper_backend"] = map[bool]string{true: "gpu", false: "cpu"}[gpu]
+		rec["whisper_audio_ctx"] = setting.For(voiced, model)
+		return core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
+			BaseURL: core.BaseURL(a.cfg.Port), WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
+			AudioCtx: setting, Fallback: a.cfg.TemperatureFallback,
+			Entries: append(append([]core.Entry{}, personal...), packs...),
+			OnPass: func(attempt int, p core.Pass) {
+				if p.Err != nil {
+					a.log.Printf("whisper_error ms=%d audio_ctx=%d err=%v", p.MS, p.AudioCtx, p.Err)
+					return
+				}
+				ratio := core.MsPerAudioSecond(p.MS, voiced)
+				rec["ms_per_audio_second"] = int64(ratio)
+				a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
+					p.MS, voiced, ratio, p.AudioCtx, p.Fallback, filepath.Base(model), len([]rune(p.Text)), len([]rune(p.Prompt)), len(p.Applied), attempt)
+				if attempt == 0 && core.IsRepetitive(p.Text) {
+					a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
+				}
+				if attempt == 0 && core.HasStockPhrase(p.Text) {
+					a.log.Printf("whisper_stock_phrase chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
+				}
+			},
+		})
+	}
+	gpu := a.onGPU()
+	res := run()
+	if gpu && !a.gpuOK.Load() {
+		if res.Outcome == core.OutcomeError {
+			// the GPU server started but cannot transcribe (driver, unsupported op): CPU from now on
+			a.log.Printf("gpu_first_request_failed err=%v", res.Err)
+			first := res.TotalMS
+			a.fallbackToCPU(core.FallbackFirstFailed)
+			if a.ready.Load() {
+				rec["retried_on_cpu"] = true
+				res = run()
+				res.TotalMS += first
 			}
-			ratio := core.MsPerAudioSecond(p.MS, voiced)
-			rec["ms_per_audio_second"] = int64(ratio)
-			a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
-				p.MS, voiced, ratio, p.AudioCtx, p.Fallback, filepath.Base(model), len([]rune(p.Text)), len([]rune(p.Prompt)), len(p.Applied), attempt)
-			if attempt == 0 && core.IsRepetitive(p.Text) {
-				a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
-			}
-			if attempt == 0 && core.HasStockPhrase(p.Text) {
-				a.log.Printf("whisper_stock_phrase chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
-			}
-		},
-	})
+		} else {
+			a.gpuOK.Store(true)
+		}
+	}
 	rec["transcribe_ms"] = res.TotalMS
 	if last := res.Passes[len(res.Passes)-1]; last.Err == nil {
 		rec["whisper_prompt"] = last.Prompt
@@ -919,6 +1200,8 @@ func (a *App) statusText() string {
 	switch {
 	case a.updateMsg != "":
 		return a.updateMsg
+	case a.busyMsg != "":
+		return a.busyMsg
 	case a.download >= 0:
 		return fmt.Sprintf("モデル取得中 %.0f%%", a.download)
 	case a.recording.Load() && a.toggle.Load():

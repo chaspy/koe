@@ -43,6 +43,8 @@ type result struct {
 	Threads              int     `json:"threads"`
 	ID                   string  `json:"id"`
 	Expected             string  `json:"expected"`
+	Backend              string  `json:"backend"`           // "gpu" | "cpu"
+	GPUFallback          string  `json:"gpu_fallback"`      // why not the GPU build ("" = on a GPU)
 	Prompt               string  `json:"prompt"`            // "koe" | "short"
 	AudioCtxSetting      string  `json:"audio_ctx_setting"` // "auto" | "0" | frames
 	Seconds              float64 `json:"seconds"`           // sent to whisper, after silence trimming
@@ -58,7 +60,9 @@ type result struct {
 }
 
 func main() {
-	server := flag.String("server", "whisper-server.exe", "whisper-server binary")
+	server := flag.String("server", "whisper-server.exe", "whisper-server binary (the CPU build)")
+	serverGPU := flag.String("server-gpu", "", "Vulkan build to try first, as Koe does with gpu \"auto\" (falls back to -server)")
+	limit := flag.Int("limit", 0, "only the first N sentences (0 = all)")
 	model := flag.String("model", "", "model file")
 	threads := flag.Int("threads", 0, "whisper threads; 0 = Koe's automatic count")
 	runs := flag.Int("runs", 3, "transcriptions per sentence")
@@ -78,6 +82,9 @@ func main() {
 		fail(err.Error())
 	}
 
+	if *limit > 0 && *limit < len(ids) {
+		ids = ids[:*limit]
+	}
 	cfg := core.DefaultConfig()
 	cfg.Port = *port
 	if *threads <= 0 {
@@ -108,9 +115,32 @@ func main() {
 	enc := json.NewEncoder(f)
 
 	name := filepath.Base(*model)
-	stop, err := benchutil.StartServer(*server, core.ServerArgs(cfg, *model, *threads), filepath.Join(filepath.Dir(*out), "server-accept.log"))
-	if err != nil {
-		fail(err.Error())
+	// like App.startServer: the Vulkan build first, kept only if it runs on a GPU
+	backend, fallback := "cpu", "off"
+	var stop func()
+	if *serverGPU != "" {
+		var probe core.GPUProbe
+		s, err := benchutil.StartServerLines(*serverGPU, core.ServerArgs(cfg, *model, *threads), filepath.Join(filepath.Dir(*out), "server-accept-vulkan.log"), probe.Line)
+		switch {
+		case err != nil:
+			fallback = core.FallbackStartFailed + ": " + err.Error()
+		case probe.FallbackReason() != "":
+			fallback = probe.FallbackReason()
+			s()
+		default:
+			backend, fallback, stop = "gpu", "", s
+			fmt.Printf("gpu backend=%s\n", probe.Backend())
+		}
+		if fallback != "" {
+			fmt.Printf("gpu_fallback reason=%s -> cpu\n", fallback)
+		}
+	}
+	if stop == nil {
+		s, err := benchutil.StartServer(*server, core.ServerArgs(cfg, *model, *threads), filepath.Join(filepath.Dir(*out), "server-accept.log"))
+		if err != nil {
+			fail(err.Error())
+		}
+		stop = s
 	}
 	defer stop()
 	base := core.BaseURL(*port)
@@ -152,7 +182,7 @@ func main() {
 						BaseURL: base, WAV: c.wav, Prompt: prompts[m], Voiced: c.voiced, Model: name,
 						AudioCtx: cfg.AudioCtx, AudioCtxFor: actx.fn, Fallback: cfg.TemperatureFallback, Entries: packs,
 					})
-					r := result{Model: name, Threads: *threads, ID: id, Expected: expected[id], Prompt: m, AudioCtxSetting: actx.name, Seconds: core.Round2(c.voiced), Run: run,
+					r := result{Model: name, Threads: *threads, ID: id, Expected: expected[id], Backend: backend, GPUFallback: fallback, Prompt: m, AudioCtxSetting: actx.name, Seconds: core.Round2(c.voiced), Run: run,
 						MS: res.TotalMS, Outcome: res.Outcome, Text: res.Text,
 						RetriedForRepetition: res.RetriedForRepetition, RetriedWithoutPrompt: res.RetriedWithoutPrompt, RetriedForStock: res.RetriedForStock}
 					for _, p := range res.Passes {
