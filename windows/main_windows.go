@@ -79,8 +79,7 @@ type App struct {
 	download  float64 // <0 = not downloading
 	recent    []string
 	prevByApp map[string]pastedText
-	usage     map[string]int
-	usageAt   time.Time
+	usage     core.UsageCache    // recent use of each term; never computed on the transcription path
 	avail     *core.Release      // newer release, if any
 	gpuNote   string             // backend in use and why ("gpu Vulkan0" / "cpu: no_device")
 	choice    core.BackendChoice // last GPU / CPU measurement (backend.json)
@@ -163,6 +162,7 @@ func (a *App) startup() {
 	a.audioCtx.Store(int64(cfg.AudioCtx))
 	a.gpuOff.Store(cfg.GPU == core.GPUOff)
 	a.gpuNames = readGPUAdapters()
+	a.usage.Compute = a.computeUsage
 	a.renderHotkey()
 	a.renderPressMode()
 	a.renderModel()
@@ -206,9 +206,12 @@ func (a *App) startup() {
 	go a.eventLoop(keys)
 	go a.worker()
 
-	a.exportReceivers()
+	// usage counts and the receiver notes off the startup and transcription
+	// paths: the first utterance uses whatever is cached by then
 	go func() {
 		defer a.recoverLog("pack_sync")
+		a.usage.Refresh()
+		a.exportReceivers()
 		a.syncPacks()
 		a.exportReceivers()
 	}()
@@ -853,9 +856,11 @@ func (a *App) worker() {
 
 func (a *App) process(u *utterance) {
 	rec := u.record
+	t0 := time.Now()
 	captured := u.pcm
 	peak := core.Peak(captured)
 	trimmed := core.TrimSilence(captured)
+	tTrim := time.Now()
 	seconds, voiced := core.Seconds(captured), core.Seconds(trimmed)
 	rec["app"] = u.app
 	rec["hold_seconds"] = core.Round2(u.held.Seconds())
@@ -870,6 +875,7 @@ func (a *App) process(u *utterance) {
 		wavPCM = captured
 	}
 	wav := core.EncodeWAV(wavPCM)
+	tWAV := time.Now()
 
 	if seconds >= 0.5 && peak <= core.MutedPeak {
 		rec["outcome"] = "mic_silent"
@@ -889,11 +895,27 @@ func (a *App) process(u *utterance) {
 		return
 	}
 
+	tPrep := time.Now()
 	personal := core.ReadGlossaryFile(a.glossaryPath())
+	tGlossary := time.Now()
 	packs := core.LoadPackEntries(a.packs(), a.cfg.EnabledPacks)
-	terms := core.WhisperTerms(personal, packs, a.usageCounts(append(append([]core.Entry{}, personal...), packs...)), core.WhisperPromptTermLimit)
+	tPacks := time.Now()
+	usage := a.usage.Get() // cached; refreshed after pastes, never here
+	usageAge := a.usage.Age(time.Now())
+	tUsage := time.Now()
+	terms := core.WhisperTerms(personal, packs, usage, core.WhisperPromptTermLimit)
 	prompt := core.BuildWhisperPrompt(a.cfg.Prompt, terms, a.previousText(u))
+	tPrompt := time.Now()
 	rec["whisper_model"] = filepath.Base(a.modelFile())
+	rec["prompt_ms"] = tPrompt.Sub(tPrep).Milliseconds()
+	rec["prepare_ms"] = tPrompt.Sub(t0).Milliseconds()
+	ms := func(a, b time.Time) float64 { return float64(b.Sub(a).Microseconds()) / 1000 }
+	age := "none"
+	if usage != nil {
+		age = fmt.Sprintf("%.0fs", usageAge.Seconds())
+	}
+	a.log.Printf("prepare_ms total=%.1f trim=%.1f wav=%.1f glossary=%.1f packs=%.1f usage=%.1f prompt=%.1f usage_age=%s",
+		ms(t0, tPrompt), ms(t0, tTrim), ms(tTrim, tWAV), ms(tPrep, tGlossary), ms(tGlossary, tPacks), ms(tPacks, tUsage), ms(tUsage, tPrompt), age)
 
 	text, ok := a.transcribe(u, wav, prompt, voiced, personal, packs)
 	if !ok {
@@ -910,6 +932,7 @@ func (a *App) process(u *utterance) {
 	}
 	rec["outcome"] = "pasted"
 	a.save(u, wav, &text)
+	a.usage.RefreshIfStale(time.Now(), core.UsageMaxAge)
 }
 
 func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64, personal, packs []core.Entry) (string, bool) {
@@ -1097,22 +1120,18 @@ func (a *App) packs() []core.Pack {
 	return core.ListPacks(filepath.Join(a.exeDir, "packs"), a.userPacksDir())
 }
 
-func (a *App) usageCounts(entries []core.Entry) map[string]int {
-	a.mu.Lock()
-	if a.usage != nil && time.Since(a.usageAt) < 10*time.Minute {
-		u := a.usage
-		a.mu.Unlock()
-		return u
-	}
-	a.mu.Unlock()
+// computeUsage counts, for every glossary and pack term, how often it was
+// pasted recently (reads up to 600 history files; run off the transcription
+// path via a.usage).
+func (a *App) computeUsage() map[string]int {
+	t0 := time.Now()
+	entries := append(core.ReadGlossaryFile(a.glossaryPath()), core.LoadPackEntries(a.packs(), a.cfg.EnabledPacks)...)
 	var texts []string
 	for _, p := range core.RecentPasted(a.historyDir(), 300) {
 		texts = append(texts, p.Text)
 	}
 	u := core.UsageCounts(entries, texts)
-	a.mu.Lock()
-	a.usage, a.usageAt = u, time.Now()
-	a.mu.Unlock()
+	a.log.Printf("usage_counted terms=%d texts=%d ms=%d", len(entries), len(texts), time.Since(t0).Milliseconds())
 	return u
 }
 
@@ -1149,7 +1168,10 @@ func (a *App) exportReceivers() {
 			withAliases = append(withAliases, e)
 		}
 	}
-	counts := a.usageCounts(withAliases)
+	if a.usage.Get() == nil {
+		a.usage.Refresh()
+	}
+	counts := a.usage.Get()
 	short, full := core.ReceiverNotes(personal, packs, counts, `~\.claude\koe-voice-glossary.full.md`)
 	if err := os.WriteFile(filepath.Join(dir, "koe-voice-glossary.md"), []byte(short), 0o644); err != nil {
 		a.log.Printf("receiver_export_failed %v", err)

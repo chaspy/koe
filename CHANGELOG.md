@@ -4,6 +4,14 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.4.1 — 2026-10-16
+
+### Windows
+- Fixed: the first utterance after about 10 minutes without speaking waited about a second before transcription started (seen on a tester PC: 1.12 s between record_stop and whisper-server starting, 0.02 s the next time). Koe recounted how often each term was used — reading up to 600 history files — right before transcribing. The counts are now refreshed in the background (at start and after a paste when older than 5 minutes) and the transcription only reads the cached counts, as on macOS (#89). The startup no longer waits for it either. koe.log shows each preparation step (`prepare_ms total= trim= wav= glossary= packs= usage= prompt= usage_age=`) and `usage_counted ms=`.
+
+### macOS
+- No changes.
+
 ## 0.4.0 — 2026-10-16
 
 ### Repository

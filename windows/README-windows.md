@@ -130,7 +130,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 - `diagnostics.txt` … Koe と Windows のバージョン、CPU 名、論理プロセッサ数、メモリ、モデル、スレッド数、押し方、録音キー、用語パック、その他の設定
 - `koe.log` の最後の 2000 行、`whisper-server.log` の最後の 500 行、`whisper-server-vulkan.log`（GPU 用を起動したことがあれば）、`update.log`（あれば）
 
-文字起こしが遅いときは、`koe.log` の `whisper_ok ms=... audio_sent=...s ms_per_audio_s=... audio_ctx=...`（音声 1 秒あたりにかかったミリ秒と、使った枠の大きさ。`0` は 30 秒ぶん全体）と、`whisper_server system_info: ...`（CPU が使える命令 AVX / AVX2 など）を見ると原因の見当がつきます。
+話し終えてから文字起こしが始まるまでが遅いときは、`koe.log` の `prepare_ms total=...`（文字起こしの前の準備にかかったミリ秒と、その内訳）を見てください。文字起こしが遅いときは、`koe.log` の `whisper_ok ms=... audio_sent=...s ms_per_audio_s=... audio_ctx=...`（音声 1 秒あたりにかかったミリ秒と、使った枠の大きさ。`0` は 30 秒ぶん全体）と、`whisper_server system_info: ...`（CPU が使える命令 AVX / AVX2 など）を見ると原因の見当がつきます。
 
 zip を作れないときは、`%LOCALAPPDATA%\Koe` フォルダ（メニューの「ログのフォルダを開く」）から:
 
