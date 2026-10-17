@@ -51,6 +51,7 @@ type App struct {
 
 	rec    *Recorder
 	server *WhisperServer
+	asr    *core.SherpaRecognizer // engine "parakeet": Parakeet-ja in this process (server stays nil)
 	hold   core.HoldTracker
 	hookID uint32
 	menuID uint32 // thread of the tray-menu-opened hook
@@ -151,6 +152,9 @@ func (a *App) onExit() {
 	if a.server != nil {
 		a.server.Stop()
 	}
+	if a.asr != nil {
+		a.asr.Close()
+	}
 	if a.rec != nil {
 		a.rec.Close()
 	}
@@ -185,8 +189,8 @@ func (a *App) startup() {
 	si := readSysInfo()
 	a.log.Printf("system cpu=%q logical_cpus=%d ram_mb=%d ram_free_mb=%d threads=%d (config threads=%d)",
 		si.CPU, runtime.NumCPU(), si.RAMTotalMB, si.RAMFreeMB, cfg.ThreadsFor(runtime.NumCPU()), cfg.Threads)
-	a.log.Printf("config hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s gpu=%s gpuAudioCtx=%s gpu_adapters=%q",
-		cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx, cfg.GPU, cfg.GPUAudioCtx, a.gpuNames)
+	a.log.Printf("config engine=%s hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s gpu=%s gpuAudioCtx=%s gpu_adapters=%q",
+		cfg.Engine, cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx, cfg.GPU, cfg.GPUAudioCtx, a.gpuNames)
 	a.log.Printf("input_devices %q", inputDevices())
 
 	if _, err := os.Stat(a.glossaryPath()); os.IsNotExist(err) {
@@ -313,6 +317,10 @@ func (a *App) modelPathFor(file string) string {
 // config.json and restarts whisper-server with it.
 func (a *App) changeModel(file string) {
 	defer a.recoverLog("change_model")
+	if a.engineLocked() {
+		a.renderModel()
+		return
+	}
 	if file == a.modelFile() && a.ready.Load() {
 		a.renderModel()
 		return
@@ -393,11 +401,73 @@ func (a *App) recoverLog(where string) {
 func (a *App) prepareModelAndServer() {
 	a.switching.Store(true)
 	defer a.switching.Store(false)
+	if a.parakeet() {
+		a.prepareParakeet()
+		return
+	}
 	model := a.cfg.ModelPath(a.modelsDir())
 	if err := a.ensureModel(model, a.cfg.ModelDownloadURL()); err != nil {
 		return
 	}
 	a.startServer(model)
+}
+
+func (a *App) parakeet() bool { return a.cfg.Engine == core.EngineParakeet }
+
+// prepareParakeet downloads and unpacks Parakeet-ja on first use (through
+// the same download as whisper's models, with the same progress), then loads
+// it in this process with sherpa-onnx-c-api.dll. No whisper-server and no
+// GPU measurement: Parakeet-ja runs on the CPU.
+func (a *App) prepareParakeet() {
+	dir := core.ParakeetDir(a.modelsDir())
+	if !core.ParakeetReady(dir) {
+		archive := dir + ".tar.bz2"
+		if err := a.ensureModel(archive, core.ParakeetModelURL); err != nil {
+			return
+		}
+		if err := core.CheckSHA256(archive, core.ParakeetModelSHA256); err != nil {
+			a.log.Printf("parakeet_checksum_failed err=%v", err)
+			_ = os.Remove(archive) // fetched again at the next start
+			a.setError("Parakeet-ja のモデルが壊れているか、配布物と違います。消したので、Koe を再起動するともう一度取得します", true)
+			return
+		}
+		a.setBusy("モデルを展開しています（初回だけ、1〜2 分）")
+		t0 := time.Now()
+		err := core.ExtractParakeet(archive, dir)
+		a.setBusy("")
+		if err != nil {
+			a.log.Printf("parakeet_extract_failed err=%v after_ms=%d", err, time.Since(t0).Milliseconds())
+			_ = os.Remove(archive) // broken download: fetch again next time
+			a.setError("Parakeet-ja のモデルを展開できませんでした（Koe を再起動するともう一度取得します）: "+err.Error(), true)
+			return
+		}
+		_ = os.Remove(archive)
+		a.log.Printf("parakeet_extract_done ms=%d dir=%s", time.Since(t0).Milliseconds(), dir)
+	}
+	threads := a.cfg.ParakeetThreads(runtime.NumCPU())
+	t0 := time.Now()
+	r, err := core.NewSherpaRecognizer(filepath.Join(a.exeDir, core.SherpaDLL), dir, threads)
+	if err != nil {
+		a.log.Printf("parakeet_load_failed err=%v", err)
+		msg := err.Error() + "。config.json の engine を \"whisper\" に戻すと、今までの文字起こしで動きます"
+		a.setError(msg, true)
+		go messageBox("Koe", msg, 0x10)
+		return
+	}
+	a.asr = r
+	a.log.Printf("parakeet_ready sherpa=%s threads=%d load_ms=%d model=%s", r.Version(), threads, time.Since(t0).Milliseconds(), dir)
+	a.setGPUNote("cpu: parakeet")
+	a.markReady("cpu", "parakeet")
+}
+
+// engineLocked: with engine "parakeet" the whisper model and GPU menus do
+// nothing; say so instead of starting whisper-server.
+func (a *App) engineLocked() bool {
+	if !a.parakeet() {
+		return false
+	}
+	a.setError("今は Parakeet-ja で文字起こししています（config.json の engine）。whisper のモデルと GPU の設定は、engine を \"whisper\" に戻すと使われます", false)
+	return true
 }
 
 // ensureModel downloads the model to path (resuming a partial download)
@@ -663,6 +733,10 @@ func (a *App) fallbackToCPU(reason string) {
 // restarts whisper-server on the chosen build.
 func (a *App) changeGPU() {
 	defer a.recoverLog("change_gpu")
+	if a.engineLocked() {
+		a.renderGPU()
+		return
+	}
 	if a.recording.Load() || a.processing.Load() > 0 {
 		a.renderGPU()
 		a.setError("録音中・文字起こし中は切り替えられません。終わってからもう一度選んでください", false)
@@ -916,10 +990,17 @@ func (a *App) process(u *utterance) {
 	usage := a.usage.Get() // cached; refreshed after pastes, never here
 	usageAge := a.usage.Age(time.Now())
 	tUsage := time.Now()
-	terms := core.WhisperTerms(personal, packs, usage, core.WhisperPromptTermLimit)
-	prompt := core.BuildWhisperPrompt(a.cfg.Prompt, terms, a.previousText(u))
+	prompt := "" // Parakeet-ja takes no prompt; the terms still go to Autocorrect
+	if !a.parakeet() {
+		terms := core.WhisperTerms(personal, packs, usage, core.WhisperPromptTermLimit)
+		prompt = core.BuildWhisperPrompt(a.cfg.Prompt, terms, a.previousText(u))
+	}
 	tPrompt := time.Now()
+	rec["engine"] = a.cfg.Engine
 	rec["whisper_model"] = filepath.Base(a.modelFile())
+	if a.parakeet() {
+		rec["whisper_model"] = core.ParakeetModelName
+	}
 	rec["prompt_ms"] = tPrompt.Sub(tPrep).Milliseconds()
 	rec["prepare_ms"] = tPrompt.Sub(t0).Milliseconds()
 	ms := func(a, b time.Time) float64 { return float64(b.Sub(a).Microseconds()) / 1000 }
@@ -963,29 +1044,37 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 	run := func() core.UtteranceResult {
 		gpu := a.onGPU()
 		setting := a.cfg.AudioCtxSetting(gpu, a.audioCtxSetting())
-		rec["whisper_backend"] = map[bool]string{true: "gpu", false: "cpu"}[gpu]
-		rec["whisper_audio_ctx"] = setting.For(voiced, model)
-		return core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
+		req := core.UtteranceRequest{
 			BaseURL: core.BaseURL(a.cfg.Port), WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
 			AudioCtx: setting, Fallback: a.cfg.TemperatureFallback,
 			Entries: append(append([]core.Entry{}, personal...), packs...),
-			OnPass: func(attempt int, p core.Pass) {
-				if p.Err != nil {
-					a.log.Printf("whisper_error ms=%d audio_ctx=%d err=%v", p.MS, p.AudioCtx, p.Err)
-					return
-				}
-				ratio := core.MsPerAudioSecond(p.MS, voiced)
-				rec["ms_per_audio_second"] = int64(ratio)
-				a.log.Printf("whisper_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
-					p.MS, voiced, ratio, p.AudioCtx, p.Fallback, filepath.Base(model), len([]rune(p.Text)), len([]rune(p.Prompt)), len(p.Applied), attempt)
-				if attempt == 0 && core.IsRepetitive(p.Text) {
-					a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
-				}
-				if attempt == 0 && core.HasStockPhrase(p.Text) {
-					a.log.Printf("whisper_stock_phrase chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
-				}
-			},
-		})
+		}
+		key := "whisper"
+		if a.asr != nil {
+			key, model = "parakeet", core.ParakeetModelName
+			req.Recognizer, req.SingleShot, req.Model = a.asr, true, model
+			rec["whisper_backend"] = "cpu"
+		} else {
+			rec["whisper_backend"] = map[bool]string{true: "gpu", false: "cpu"}[gpu]
+			rec["whisper_audio_ctx"] = setting.For(voiced, model)
+		}
+		req.OnPass = func(attempt int, p core.Pass) {
+			if p.Err != nil {
+				a.log.Printf("%s_error ms=%d audio_ctx=%d err=%v", key, p.MS, p.AudioCtx, p.Err)
+				return
+			}
+			ratio := core.MsPerAudioSecond(p.MS, voiced)
+			rec["ms_per_audio_second"] = int64(ratio)
+			a.log.Printf("%s_ok ms=%d audio_sent=%.2fs ms_per_audio_s=%.0f audio_ctx=%d fallback=%v model=%s chars=%d prompt_chars=%d corrections=%d retry=%d",
+				key, p.MS, voiced, ratio, p.AudioCtx, p.Fallback, filepath.Base(model), len([]rune(p.Text)), len([]rune(p.Prompt)), len(p.Applied), attempt)
+			if !req.SingleShot && attempt == 0 && core.IsRepetitive(p.Text) {
+				a.log.Printf("whisper_repetition chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
+			}
+			if !req.SingleShot && attempt == 0 && core.HasStockPhrase(p.Text) {
+				a.log.Printf("whisper_stock_phrase chars=%d audio_ctx=%d fallback=%v -> retry audio_ctx=0 fallback=true", len([]rune(p.Text)), p.AudioCtx, p.Fallback)
+			}
+		}
+		return core.TranscribeUtterance(context.Background(), req)
 	}
 	gpu := a.onGPU()
 	res := run()

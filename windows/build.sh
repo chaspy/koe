@@ -7,6 +7,13 @@ cd "$(dirname "$0")"
 
 WHISPER_TAG="${WHISPER_TAG:-v1.9.2}"
 WHISPER_ASSET="whisper-bin-x64.zip"
+# sherpa-onnx for engine "parakeet" (core.SherpaVersion; core.sherpaRecognizerConfig matches its c-api.h)
+SHERPA_TAG="${SHERPA_TAG:-v1.13.8}"
+SHERPA_NAME="sherpa-onnx-$SHERPA_TAG-win-x64-shared-MT-Release-no-tts"
+# sha256 of $SHERPA_NAME.tar.bz2: the "digest" GitHub shows for the asset in the
+# k2-fsa/sherpa-onnx v1.13.8 release, checked 2026-10-17 against a download.
+# Set both when changing SHERPA_TAG.
+SHERPA_SHA256="${SHERPA_SHA256:-4b0a94f7b5c606b1b64a19a831c2127559e4b3d34e195465ebc7be73d9ed4783}"
 CACHE=".cache"
 STAGE="dist/Koe"
 ZIP="dist/Koe-windows-x64.zip"
@@ -64,6 +71,25 @@ else
   echo "warning: no whisper-server-vulkan.exe (run the whisper-vulkan workflow, or SKIP_VULKAN=1); building without GPU support" >&2
 fi
 
+echo "== sherpa-onnx $SHERPA_TAG (engine \"parakeet\") =="
+# static CRT (MT) build: no Visual C++ runtime needed. Only the C API DLL and
+# onnxruntime are shipped; Koe.exe loads them at run time when engine is parakeet.
+SDIR="$CACHE/sherpa-$SHERPA_TAG"
+if [ ! -f "$SDIR/sherpa-onnx-c-api.dll" ]; then
+  STAR="$CACHE/$SHERPA_NAME.tar.bz2"
+  [ -s "$STAR" ] || { curl -fL --retry 3 -o "$STAR.tmp" "https://github.com/k2-fsa/sherpa-onnx/releases/download/$SHERPA_TAG/$SHERPA_NAME.tar.bz2" && mv "$STAR.tmp" "$STAR"; }
+  got=$( (shasum -a 256 "$STAR" 2>/dev/null || sha256sum "$STAR") | awk '{print $1}')
+  if [ "$got" != "$SHERPA_SHA256" ]; then
+    rm -f "$STAR"
+    echo "sha256 mismatch for $SHERPA_NAME.tar.bz2: got $got, want $SHERPA_SHA256 (removed; not shipped)" >&2
+    exit 1
+  fi
+  mkdir -p "$SDIR"
+  tar -xjf "$STAR" -C "$SDIR" --strip-components=2 \
+    "$SHERPA_NAME/lib/sherpa-onnx-c-api.dll" "$SHERPA_NAME/lib/onnxruntime.dll" "$SHERPA_NAME/lib/onnxruntime_providers_shared.dll"
+  [ -f "$SDIR/sherpa-onnx-c-api.dll" ] || { echo "sherpa-onnx-c-api.dll not in $STAR" >&2; exit 1; }
+fi
+
 echo "== build Koe.exe ($VERSION, $REV) =="
 mkdir -p "$STAGE"
 find "$STAGE" -mindepth 1 -delete
@@ -72,10 +98,12 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
   -ldflags "-H windowsgui -s -w -X main.version=$VERSION -X main.rev=$REV" -o "$STAGE/Koe.exe" .
 cp "$WDIR"/whisper-server.exe "$WDIR"/*.dll "$STAGE/"
 [ -f "$VDIR/whisper-server-vulkan.exe" ] && cp "$VDIR/whisper-server-vulkan.exe" "$STAGE/"
+cp "$SDIR"/*.dll "$STAGE/"
 cp ../packs/*.txt "$STAGE/packs/"
 cp assets/*.wav "$STAGE/assets/"
 cp README-windows.md "$STAGE/"
 cp ../CONTRIBUTING.md "$STAGE/"
+cp THIRD_PARTY_NOTICES.md "$STAGE/"
 
 echo "== zip =="
 rm -f "$ZIP"

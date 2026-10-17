@@ -41,6 +41,8 @@ enum Settings {
         return downloadedModel
     }
     static var language: String { defaults.string(forKey: "language") ?? "ja" }
+    // whisper の窓の大きさ: "auto"（既定。話した長さに合わせて縮める）/ 0（毎回 30 秒ぶん全体）/ フレーム数（AudioWindow.swift）
+    static var audioCtx: Int { AudioWindow.setting(defaults.object(forKey: "audioCtx")) }
     static var port: Int {
         let p = defaults.integer(forKey: "port")
         return p > 0 ? p : 18080
@@ -171,6 +173,9 @@ enum Settings {
         set { defaults.set(newValue, forKey: "micName") }
     }
     // 貼り付け後にクリップボードを元に戻すか。既定はオフ＝文字起こしが残るので、貼り付けに失敗しても ⌘V で貼り直せる
+    // iTerm に貼ったあと、文が画面に出るまでの時間を測る（画面の中身を AppleScript で読む。オンにして初めて測るときにオートメーションの許可を求める）。
+    // 既定はオフ: オンだと iTerm を使う人全員に「Koe が iTerm を制御しようとしています」のダイアログが出るため。オフの間は許可を聞かない
+    static var measureVisible: Bool { defaults.object(forKey: "measureVisible") as? Bool ?? false }
     static var restoreClipboard: Bool {
         get { defaults.object(forKey: "restoreClipboard") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "restoreClipboard") }
@@ -319,7 +324,7 @@ final class WhisperServer {
         }
     }
 
-    // audioCtx / temperatureInc: nil = サーバーの既定（全体の枠・温度のフォールバックあり）。繰り返しのやり直しでは明示して送る
+    // audioCtx / temperatureInc: nil = サーバーの既定（全体の枠・温度のフォールバックあり）
     func transcribe(wav: URL, prompt: String, keepLines: Bool = false, seconds: Double = 0,
                     audioCtx: Int? = nil, temperatureInc: String? = nil,
                     done: @escaping (Result<String, Error>) -> Void) {
@@ -1411,6 +1416,17 @@ enum History {
             try? data.write(to: day.appendingPathComponent("\(id).json"))
         }
     }
+
+    // 保存済みの記録に欄を書き足す
+    static func merge(id: String, _ fields: [String: Any]) {
+        let url = dir.appendingPathComponent(String(id.prefix(10)), isDirectory: true).appendingPathComponent("\(id).json")
+        guard let data = try? Data(contentsOf: url),
+              var rec = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        rec.merge(fields) { _, b in b }
+        if let out = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) {
+            try? out.write(to: url)
+        }
+    }
 }
 
 // MARK: - Improvement loop
@@ -1892,7 +1908,7 @@ enum ConfigImport {
         ("improveAPIKey", "改善ループの API キー"), ("improveTokenCommand", "改善ループのトークン取得コマンド"),
         ("improveEnabled", "改善ループを有効にする"), ("improveBatch", "改善ループの件数"),
         ("llmEndpoint", "整形の送り先"), ("llmModel", "整形のモデル"), ("llmAPIKey", "整形の API キー"), ("llmEnabled", "整形を有効にする"),
-        ("hotkeyKeyCode", "ホットキー"), ("language", "言語"),
+        ("hotkeyKeyCode", "ホットキー"), ("language", "言語"), ("audioCtx", "文字起こしの窓（auto / 0 = 全体）"),
         ("packFiles", "取り込む用語パック"), ("enabledPacks", "有効にする用語パック"),
         ("packSources", "共有の用語パックの取り込み元（gh:… / https:…）"),
         ("peopleSources", "社員名簿の取り込み元（gh:… / https:…。改善ループに渡す）"),
@@ -1988,13 +2004,16 @@ enum Typist {
         return min(2.0, base * (1 + max(0, l - 4) / 10))
     }
 
-    static func pasteAndMaybeEnter(_ text: String, enter: Bool) {
+    // ⌘V を送った時刻を返す（paste_at。画面に出た・Claude Code に届いたまでの時間の起点）
+    @discardableResult
+    static func pasteAndMaybeEnter(_ text: String, enter: Bool) -> Date {
         let pb = NSPasteboard.general
         let previous = pb.string(forType: .string)
         pb.clearContents()
         pb.setString(text, forType: .string)
 
         postKey(9, flags: .maskCommand) // ⌘V
+        let pastedAt = Date()
         if enter {
             // 貼り付け直後の Enter は TUI 側で貼り付けの一部として扱われることがあるので少し待つ。
             // Mac が重いと貼り付けの取り込みが遅れ、0.25 秒では Enter が貼り付けに吸われる（負荷 20 で実際に起きた）ので、負荷に応じて待ちを延ばす
@@ -2015,6 +2034,14 @@ enum Typist {
                 pb.setString(previous, forType: .string)
             }
         }
+        return pastedAt
+    }
+
+    // paste_at の書式: UTC・ミリ秒（例 2026-10-17T02:39:12.345Z）。Claude Code のセッション記録の timestamp と同じ形
+    static func utcMillis(_ d: Date) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: d)
     }
 
     private static func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
@@ -2025,6 +2052,92 @@ enum Typist {
         up?.flags = flags
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
+    }
+}
+
+// MARK: - Paste visibility (iTerm)
+//
+// 貼ったあと、iTerm の今のセッションの画面（AppleScript の contents）を 150ms ごとに読み、貼った文の末尾が出るまでの時間を測る。
+// Herdr の中のペインも iTerm の画面に描かれるので同じ方法で拾える。画面の中身は比べるのにだけ使い、どこにも書かない。
+// オートメーション（Apple Events）の許可が要る。許可が無い・拒否されたときは測れなかった（visible_unknown）として、失敗には数えない
+
+enum ITermScreen {
+    static let bundleID = "com.googlecode.iterm2"
+    // NSAppleScript はこの queue の上だけで使う（同時に動かさない）
+    static let queue = DispatchQueue(label: "io.github.chaspy.koe.visible", qos: .utility)
+    enum Read { case ok(session: String, contents: String), denied, failed }
+    private static let script: NSAppleScript? = {
+        let s = NSAppleScript(source: "tell application id \"\(bundleID)\" to tell current session of current window to return {id, contents}")
+        var err: NSDictionary?
+        return s?.compileAndReturnError(&err) == true ? s : nil
+    }()
+
+    // 許可を聞かずに確かめる（noErr / errAEEventNotPermitted / errAEEventWouldRequireUserConsent / procNotFound）
+    static func permission() -> OSStatus {
+        let target = NSAppleEventDescriptor(bundleIdentifier: bundleID)
+        return AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, false)
+    }
+
+    // まだ聞いていなければ、ここで macOS が許可のダイアログを出す（答えるまで戻らない）
+    static func read() -> Read {
+        guard let script else { return .failed }
+        var err: NSDictionary?
+        let r = script.executeAndReturnError(&err)
+        if let err { return (err[NSAppleScript.errorNumber] as? Int) == Int(errAEEventNotPermitted) ? .denied : .failed }
+        guard r.numberOfItems == 2, let id = r.atIndex(1)?.stringValue, let c = r.atIndex(2)?.stringValue else { return .failed }
+        return .ok(session: id, contents: c)
+    }
+}
+
+enum VisibleWatch {
+    // readMax: 画面を 1 回読むのにかかった最長の時間（iTerm が応答しない時間帯があり、そのときは画面の描き直しも遅れていると見られる）
+    enum Result { case visible(ms: Int, readMax: Int), notVisible(readMax: Int), unknown(String) }
+    static let timeout = 10.0
+    static let interval = 0.15
+    private static var denied = false  // queue の上だけで触る
+
+    // done は main で呼ぶ
+    static func start(_ text: String, pastedAt: Date, done: @escaping (Result) -> Void) {
+        let tail = PasteVisible.tail(text)
+        let finish = { (r: Result) in DispatchQueue.main.async { done(r) } }
+        guard !tail.isEmpty else { return finish(.unknown("empty")) }
+        var session: String?
+        var readMax = 0
+        var asking = false  // まだ許可を聞いていない（初回の読み取りで macOS がダイアログを出す）
+        func poll() {
+            let started = Date()
+            let read = ITermScreen.read()
+            let took = Date().timeIntervalSince(started)
+            switch read {
+            case .denied:
+                denied = true
+                finish(.unknown("no_permission"))
+            case .failed:
+                finish(.unknown("error"))
+            case .ok(let id, let contents):
+                // 初回は許可のダイアログに答えるまで戻らないことがある。そのあいだに 10 秒過ぎたら測れなかったとする
+                if asking, Date().timeIntervalSince(pastedAt) > timeout { return finish(.unknown("waited_permission")) }
+                asking = false
+                if let session, session != id { return finish(.unknown("session_changed")) }
+                session = id
+                readMax = max(readMax, Int(took * 1000))
+                // 読み終えた時刻で測る（画面を読んだのはこの時刻より前なので、出るまでの時間を短く見積もることはない）
+                let elapsed = Date().timeIntervalSince(pastedAt)
+                if PasteVisible.visible(tail: tail, in: contents) { return finish(.visible(ms: Int(elapsed * 1000), readMax: readMax)) }
+                if elapsed >= timeout { return finish(.notVisible(readMax: readMax)) }
+                // iTerm の応答が遅いときは、読むのに掛かった分だけ間を空ける（貼った先の負荷を増やさない）
+                ITermScreen.queue.asyncAfter(deadline: .now() + max(interval, took)) { poll() }
+            }
+        }
+        ITermScreen.queue.asyncAfter(deadline: .now() + 0.1) {
+            if denied { return finish(.unknown("no_permission")) }
+            switch ITermScreen.permission() {
+            case OSStatus(errAEEventNotPermitted): denied = true; finish(.unknown("no_permission"))
+            case OSStatus(procNotFound): finish(.unknown("not_running"))
+            case OSStatus(errAEEventWouldRequireUserConsent): asking = true; poll()
+            default: poll()
+            }
+        }
     }
 }
 
@@ -2071,7 +2184,7 @@ enum KoeIcon {
 // 押下ごとの結果を events.jsonl に 1 行ずつ残す。貼られなかった発話（取りこぼし）を後から数えられる。
 
 enum Events {
-    static let failures: Set<String> = ["not_ready", "start_failed", "no_voice", "mic_silent", "hallucination", "error", "cancelled"]
+    static let failures: Set<String> = ["not_ready", "start_failed", "no_voice", "mic_silent", "hallucination", "error", "cancelled", "not_visible"]
 
     static var url: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -2102,10 +2215,25 @@ enum Events {
                   let o = d["outcome"] as? String, let t = (d["t"] as? String).flatMap(f.date(from:)),
                   Calendar.current.isDateInToday(t) else { continue }
             if o == "pasted" { ok += 1 }
+            else if o == "not_visible" { ok -= 1; ng += 1 }  // 貼ったが 10 秒たっても画面に出なかった（iTerm）
             else if ["no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press", "no_accessibility", "target_changed"].contains(o) { ng += 1 }
             else if o == "cancelled", d["reason"] as? String != "mouse", (d["hold_seconds"] as? Double ?? 0) >= 1.0 { ng += 1 }
         }
         return (ok, ok + ng)
+    }
+
+    // 今日 iTerm に貼った文が画面に出るまで（visible_ms）と、出なかった件数
+    static func visibleToday() -> (ms: [Int], notVisible: Int) {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return ([], 0) }
+        var ms: [Int] = [], nv = 0
+        let f = ISO8601DateFormatter()
+        for line in text.split(separator: "\n") where line.contains("visible") {
+            guard let d = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let o = d["outcome"] as? String, let t = (d["t"] as? String).flatMap(f.date(from:)),
+                  Calendar.current.isDateInToday(t) else { continue }
+            if o == "visible", let m = d["visible_ms"] as? Int { ms.append(m) } else if o == "not_visible" { nv += 1 }
+        }
+        return (ms.sorted(), nv)
     }
 
     static func failuresToday() -> Int {
@@ -2165,11 +2293,12 @@ enum Diagnostics {
         lines.append("個人の辞書 \(Glossary.personal.count) 語 / パック \(Glossary.packs.count) 語 / 組織の辞書 \(Glossary.org.count) 語 / 社員名簿 \(PeopleStore.all.count) 人")
         lines.append("")
         lines.append("## 直近 300 回の速さと結果（数字だけ）")
-        lines.append("id\tapp\taudio_s\tvoiced_s\ttranscribe_ms\trelease_to_paste_ms\tload1\tpeak\tlevel_db\tpasted\tcommunication\timpact")
+        lines.append("id\tapp\taudio_s\tvoiced_s\ttranscribe_ms\trelease_to_paste_ms\tload1\tpeak\tlevel_db\tpasted\tcommunication\timpact\tvisible\tvisible_ms")
         for r in History.recentRecords(300) {
             let q = r["quality"] as? [String: Any]
             let row: [Any?] = [r["id"], r["app"], r["audio_seconds"], r["voiced_seconds"], r["transcribe_ms"], r["release_to_paste_ms"],
-                               r["load1"], r["peak"], q?["level_db"], (r["pasted"] is String), r["communication"], r["communication_impact"]]
+                               r["load1"], r["peak"], q?["level_db"], (r["pasted"] is String), r["communication"], r["communication_impact"],
+                               r["visible"], r["visible_ms"]]
             lines.append(row.map { $0.map { "\($0)" } ?? "" }.joined(separator: "\t"))
         }
         try lines.joined(separator: "\n").write(to: work.appendingPathComponent("diagnostics.txt"), atomically: true, encoding: .utf8)
@@ -2302,6 +2431,8 @@ final class Utterance {
     var locked = false
     // トグルの押し方で始めた録音（もう一度押すまで続き、終わったら普通に貼る）
     var toggled = false
+    // 履歴に保存したときの id（貼ったあとに分かった値を後から書き足す）
+    var historyID: String?
     init(app: String) { record = ["app": app] }
 }
 
@@ -2797,8 +2928,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let started = Date()
         u.record["whisper_model"] = (Settings.model as NSString).lastPathComponent
         u.record["whisper_prompt"] = prompt
+        // 窓は送る音声（無音を削った後）の長さに合わせる。繰り返しのやり直しは 30 秒の枠全体
+        let actx = loopRetry ? 0 : AudioWindow.ctx(setting: Settings.audioCtx, seconds: cap.voicedSeconds > 0 ? cap.voicedSeconds : cap.seconds)
+        u.record[loopRetry ? "whisper_audio_ctx_retry" : "whisper_audio_ctx"] = actx
         server.transcribe(wav: cap.url, prompt: prompt, keepLines: u.locked || Settings.keepLines, seconds: cap.seconds,
-                          audioCtx: loopRetry ? 0 : nil, temperatureInc: loopRetry ? "0.2" : nil) { result in
+                          audioCtx: actx, temperatureInc: loopRetry ? "0.2" : nil) { result in
             DispatchQueue.main.async {
                 u.record["transcribe_ms"] = Int(Date().timeIntervalSince(started) * 1000) + (u.record["transcribe_ms"] as? Int ?? 0)
                 switch result {
@@ -2934,8 +3068,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if blockedWithoutAccessibility(u, raw) { return }
             if blockedTargetChanged(u, raw) { return }
             markPasted(u)
-            Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter)
-            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? ""])
+            let at = Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter)
+            u.record["paste_at"] = Typist.utcMillis(at)
+            watchVisible(u, raw, at)
+            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""])
             finish(u, pasted: raw)
             return
         }
@@ -2961,10 +3097,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self.blockedWithoutAccessibility(u, text) { return }
                 if self.blockedTargetChanged(u, text) { return }
                 self.markPasted(u)
-                Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter)
-                Events.log("pasted", ["llm": true, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? ""])
+                let at = Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter)
+                u.record["paste_at"] = Typist.utcMillis(at)
+                self.watchVisible(u, text, at)
+                Events.log("pasted", ["llm": true, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""])
                 self.finish(u, pasted: text)
             }
+        }
+    }
+
+    // iTerm に貼ったときだけ、画面に出るまでを測って events と履歴に書く（数字と outcome だけ）。
+    // 結果が出るのは finish で履歴に保存した後なので、履歴には後から書き足す
+    private func watchVisible(_ u: Utterance, _ text: String, _ at: Date) {
+        guard Settings.measureVisible, (u.record["paste_app"] as? String)?.lowercased() == ITermScreen.bundleID else { return }
+        VisibleWatch.start(text, pastedAt: at) { r in
+            var outcome = "visible_unknown", extra: [String: Any] = [:]
+            switch r {
+            case .visible(let ms, let readMax): outcome = "visible"; extra["visible_ms"] = ms; extra["read_ms_max"] = readMax
+            case .notVisible(let readMax): outcome = "not_visible"; extra["waited_ms"] = Int(VisibleWatch.timeout * 1000); extra["read_ms_max"] = readMax
+            case .unknown(let why): extra["reason"] = why
+            }
+            Events.log(outcome, extra.merging(["app": ITermScreen.bundleID, "paste_at": u.record["paste_at"] ?? ""]) { a, _ in a })
+            var fields: [String: Any] = ["visible": outcome]
+            if let ms = extra["visible_ms"] { fields["visible_ms"] = ms }
+            if let why = extra["reason"] { fields["visible_reason"] = why }
+            if let m = extra["read_ms_max"] { fields["visible_read_ms_max"] = m }
+            u.record.merge(fields) { _, b in b }
+            if let id = u.historyID { History.merge(id: id, fields) }
         }
     }
 
@@ -2987,7 +3146,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defer { if current == nil && transcribing == 0 { improver.runIfNeeded() } }
         if Settings.saveHistory {
             u.record["pasted"] = pasted ?? NSNull()
-            History.save(id: History.newID(), wav: cap.url, record: u.record, alt: cap.alt?.url)
+            let id = History.newID()
+            u.historyID = id
+            History.save(id: id, wav: cap.url, record: u.record, alt: cap.alt?.url)
         } else {
             try? FileManager.default.removeItem(at: cap.url)
             if let a = cap.alt?.url { try? FileManager.default.removeItem(at: a) }
@@ -3205,6 +3366,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !recentLatency.isEmpty {
                 let m = recentLatency.sorted()[recentLatency.count / 2]
                 speed = String(format: " / 離して→貼る %.1f 秒（直近 %d 回の中央）", Double(m) / 1000, recentLatency.count)
+            }
+            let v: (ms: [Int], notVisible: Int) = Settings.measureVisible ? Events.visibleToday() : ([], 0)
+            if !v.ms.isEmpty || v.notVisible > 0 {
+                let med = v.ms.isEmpty ? "-" : String(format: "%.1f", Double(v.ms[v.ms.count / 2]) / 1000)
+                let p90 = v.ms.isEmpty ? "-" : String(format: "%.1f", Double(v.ms[min(v.ms.count - 1, v.ms.count * 9 / 10)]) / 1000)
+                speed += " / 貼る→画面に出る \(med) 秒（p90 \(p90) 秒）・出ず \(v.notVisible) 件（今日の iTerm）"
             }
             metricsLine?.title = "今日の入力成功 \(pct(p1.ok, p1.total))（\(p1.ok)/\(p1.total)） / 直近 \(p2.judged) 件: 誤解したまま作業 \(pct1(p2.misacted, p2.judged))・言い直し \(pct1(p2.redo, p2.judged))" + speed
             return

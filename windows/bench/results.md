@@ -77,3 +77,15 @@ Speed (run 38770834199, Intel Xeon Platinum 8573C, 2 logical processors; synthet
 | auto, min 1000 | 9.56 s | 9.16 | 9.69 | 10.20 |
 
 For reference, the whole window took 16–22 s per utterance on the 2-core EPYC runner (2026-10-15 above).
+
+## accept: small-q5_1 vs Parakeet-ja (2026-10-17)
+
+Runs 38995199549 (small; Parakeet-ja crashed: System32's onnxruntime.dll 1.17 was loaded, fixed) and 38998454848 (Parakeet-ja), AMD EPYC 7763, 2 logical processors; synthetic `accept` sentences, 3 runs each, Koe's prompt for small. 14 + 1 + 3 min billed ≈ $0.18 in total (the 1-min run failed on a missing `.cache`).
+
+| engine | utterances | median s | 1–3 s | 3–6 s | 6–10 s | mean match | looped |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| small-q5_1 (audioCtx auto, 2 threads) | 60 | 9.54 | | | | 0.990 | 0 |
+| Parakeet-ja (CTC greedy, 1 thread) | 60 | **0.52** | 0.30 | 0.57 | 1.13 | 0.900 | 0 |
+
+- Parakeet-ja: unpacking the 466 MB archive with Go took 44–53 s, loading the model 2.0 s.
+- Most of Parakeet-ja's lower match is script, not words: it wrote common words in kana where the expected text has kanji (りょうかいしました / 了解しました, おつかれさまです, たすかります, かくにん). Content words were right; the synthetic voice (`say -v Kyoko`) and the kanji-based expected texts both favour whisper here.

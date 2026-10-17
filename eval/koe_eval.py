@@ -310,6 +310,77 @@ def cmd_context(a):
     print(json.dumps(out, ensure_ascii=False, indent=1))
 
 
+# ---------- 届くまで（delivered_ms） ----------
+# Koe が ⌘V を送った時刻（paste_at）から、その文が Claude Code のセッション記録にユーザー発話
+# （type=user、作業中なら queue-operation の enqueue）として残った時刻まで。全セッションから探す。
+# 作業中のキューで複数の発話が 1 つにまとまって送られることがあるので、まとまった文に含まれていれば一致とする。
+# 文は照合にだけ使い、出力には数字・件数・理由だけを出す
+
+DELIVER_WINDOW = timedelta(minutes=5)
+DELIVER_SLACK = timedelta(seconds=1)  # 時計の丸めで記録の timestamp が paste_at より少し前になることがある
+TERMINAL_APPS = ("com.googlecode.iterm2", "com.apple.terminal", "com.mitchellh.ghostty", "dev.warp.warp-stable",
+                 "com.github.wez.wezterm", "org.alacritty", "io.alacritty", "net.kovidgoyal.kitty")
+
+
+def _parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def _paste_time(r):
+    """⌘V を送った時刻。paste_at を記録する前の版は、履歴の id（貼った直後の finish で付くローカル時刻）で代える"""
+    return _parse_ts(r["paste_at"]) if r.get("paste_at") else _record_time(r)
+
+
+def delivered_match(pasted, sent):
+    """貼った文が、送られた文と一致するか（正規化して、送られた文に含まれれば一致。手で少し直したものも一致）"""
+    p, q = normalize(pasted), normalize(sent)
+    if not p or not q:
+        return False
+    return p in q or difflib.SequenceMatcher(None, p, q).ratio() >= 0.9
+
+
+def _human_events(session_events):
+    """セッション記録のユーザー発話を (時刻, 正規化した文) の時刻順の列にする"""
+    out = []
+    for _, rows in session_events:
+        for d in rows:
+            if _is_human(d):
+                try:
+                    out.append((_parse_ts(d["timestamp"]), _human_text(d)))
+                except ValueError:
+                    continue
+    out.sort(key=lambda x: x[0])
+    return out
+
+
+def delivery(r, humans):
+    """(delivered_ms, None) か (None, 届かなかった理由)。humans は _human_events の結果。理由:
+    no_message = 5 分以内にどのセッションにもユーザー発話が無い（送っていない・Claude Code 以外のペインに貼った）
+    edited     = 似た文（一致の 6 割以上）はあった（手で直してから送った可能性）
+    no_match   = 発話はあったが一致しない（別のペインに貼って、そのあと別の発話をしたなど）
+    Claude Code 以外のペインに貼ったのか、送らずに消したのかは、セッション記録からは区別できない"""
+    import bisect
+    t = _paste_time(r)
+    i = bisect.bisect_left(humans, t - DELIVER_SLACK, key=lambda x: x[0])
+    window = []
+    for ts, sent in humans[i:]:
+        if ts > t + DELIVER_WINDOW:
+            break
+        if delivered_match(r.get("pasted"), sent):
+            return max(0, int((ts - t).total_seconds() * 1000)), None
+        window.append(sent)
+    if not window:
+        return None, "no_message"
+    p = normalize(r.get("pasted"))
+    if any(difflib.SequenceMatcher(None, p, normalize(s)).ratio() >= 0.6 for s in window):
+        return None, "edited"
+    return None, "no_match"
+
+
+def _is_terminal_paste(r):
+    return (r.get("paste_app") or r.get("app") or "").lower() in TERMINAL_APPS
+
+
 # ① 入力された の失敗として数える events.jsonl の outcome（daily / misses / trend で共通）。
 # tracks・mic_restarted・enter_scheduled などは押下の結果ではない記録なので数えない
 PRESS_FAILS = ("no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press",
@@ -353,7 +424,12 @@ def _press_counts(since, events=None):
         t = _record_time(r).astimezone()
         if t < since:
             continue
-        if r.get("pasted") or r.get("locked"):
+        if r.get("visible") == "not_visible":
+            # 貼ったが 10 秒たっても iTerm の画面に出なかった（visible_unknown＝測れなかった、は失敗にしない）
+            d = t.strftime("%m/%d")
+            day[d]["fail"] += 1
+            fails[d]["not_visible"] += 1
+        elif r.get("pasted") or r.get("locked"):
             day[t.strftime("%m/%d")]["ok"] += 1
     return day, fails
 
@@ -552,6 +628,7 @@ def cmd_daily(a):
     since = now - timedelta(days=a.days)
     day = defaultdict(Counter)
     lat = defaultdict(list)
+    vis = defaultdict(list)
     added = defaultdict(list)
     notes = defaultdict(list)
     path = HISTORY.parent / "events.jsonl"
@@ -576,6 +653,10 @@ def cmd_daily(a):
         d = t.strftime("%m/%d")
         if r.get("release_to_paste_ms"):
             lat[d].append(r["release_to_paste_ms"])
+        if r.get("visible") == "visible" and r.get("visible_ms") is not None:
+            vis[d].append(r["visible_ms"])
+        elif r.get("visible") == "not_visible":
+            day[d]["not_visible"] += 1
         if r.get("autocorrected"):
             day[d]["autocorrect"] += 1
         c = r.get("communication")
@@ -589,22 +670,53 @@ def cmd_daily(a):
             notes[d].append(f"{k}: {r.get('communication_note') or ''}")
     for d, v in _press_counts(since.astimezone())[0].items():
         day[d].update(v)
+    # 届くまで: ターミナルに貼った発話だけ
+    deliv, undelivered = defaultdict(list), defaultdict(Counter)
+    targets = [r for r in load_records() if isinstance(r.get("pasted"), str) and r["pasted"] and _is_terminal_paste(r)
+               and _record_time(r).astimezone().replace(tzinfo=None) >= since]
+    if targets:
+        humans = _human_events(_load_session_events(min(_paste_time(r) for r in targets) - timedelta(hours=1)))
+        for r in targets:
+            d = _record_time(r).astimezone().strftime("%m/%d")
+            ms, why = delivery(r, humans)
+            if ms is None:
+                undelivered[d][why] += 1
+            else:
+                deliv[d].append(ms)
 
     def pct(k, n):
         return f"{k / n:.1%}" if n else "-"
     lines = [f"# Koe 日次の振り返り（{now:%Y-%m-%d %H:%M}、直近 {a.days} 日）", "",
-             "| 日付 | 押下 | ①入力された | ②判定 | 誤解したまま作業 | 言い直し・聞き返し | 一部落ち | 判定不能 | 離して→貼る 中央/p90 | 自動置き換え | 辞書に追加 |",
-             "|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| 日付 | 押下 | ①入力された | ②判定 | 誤解したまま作業 | 言い直し・聞き返し | 一部落ち | 判定不能 | 離して→貼る 中央/p90 | 貼る→画面に出る 中央/p90 | 出ず | 貼る→届く 中央/p90 | 届かず | 自動置き換え | 辞書に追加 |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for d in sorted(day):
         v = day[d]
         presses = v["ok"] + v["fail"]
         judged = v["understood"] + v["misacted"] + v["redo"] + v["dropped"]
         l = sorted(lat[d])
         sp = f"{st.median(l) / 1000:.2f}s / {l[int(len(l) * .9)] / 1000:.2f}s" if l else "-"
+        dl = sorted(deliv[d])
+        dsp = f"{st.median(dl) / 1000:.2f}s / {dl[int(len(dl) * .9)] / 1000:.2f}s" if dl else "-"
+        vl = sorted(vis[d])
+        vsp = f"{st.median(vl) / 1000:.2f}s / {vl[int(len(vl) * .9)] / 1000:.2f}s" if vl else "-"
+        nvt = f"{v['not_visible']}/{v['not_visible'] + len(vl)}" if v["not_visible"] + len(vl) else "-"
+        nd = sum(undelivered[d].values())
+        ndt = f"{nd}/{nd + len(dl)}" if nd + len(dl) else "-"
         lines.append(f"| {d} | {presses} | {pct(v['ok'], presses)} | {judged} | {v['misacted']} ({pct(v['misacted'], judged)}) | "
-                     f"{v['redo']} ({pct(v['redo'], judged)}) | {v['dropped']} | {v['unclear']} | {sp} | {v['autocorrect']} | {len(added[d])} |")
+                     f"{v['redo']} ({pct(v['redo'], judged)}) | {v['dropped']} | {v['unclear']} | {sp} | {vsp} | {nvt} | {dsp} | {ndt} | {v['autocorrect']} | {len(added[d])} |")
     today = now.strftime("%m/%d")
-    lines += ["", "目安: ①入力された 95% 以上 / 誤解したまま作業 1% 未満 / 言い直し・聞き返し 5% 未満（直近 300 件で見る。日ごとの数字は揺れる）", ""]
+    lines += ["", "目安: ①入力された 95% 以上 / 誤解したまま作業 1% 未満 / 言い直し・聞き返し 5% 未満（直近 300 件で見る。日ごとの数字は揺れる）",
+              "貼る→画面に出る: iTerm に貼った発話の、⌘V から貼った文の末尾が iTerm の画面に出るまで（Koe が画面を読んで測る）。"
+              "出ず = 10 秒たっても出なかった件数 / 測れた件数（オートメーションの許可が無いなど測れなかったものは数えない。出ずは①の失敗に数える）",
+              "貼る→届く: ターミナルに貼った発話の、⌘V（paste_at。記録の無い古い版は履歴の id の時刻）から Claude Code のセッション記録に残るまで。Enter までの待ちを含む。"
+              "届かず = 5 分以内にどのセッションにも一致する発話が無かった件数 / 対象の件数", ""]
+    if undelivered.get(today):
+        u = undelivered[today]
+        lines += [f"## 今日（{today}）届かなかったものの理由", "",
+                  f"- どのセッションにも発話が無い（送っていない・Claude Code 以外のペインに貼った） {u['no_message']}",
+                  f"- 似た文はあった（手で直してから送った可能性） {u['edited']}",
+                  f"- 発話はあったが一致しない {u['no_match']}",
+                  "- ※ Claude Code 以外のペインに貼ったのか、送らずに消したのかは区別できない", ""]
     if notes.get(today):
         lines += [f"## 今日（{today}）伝わらなかったもの（理由メモ）", ""] + [f"- {x}" for x in notes[today]] + [""]
     if added.get(today):

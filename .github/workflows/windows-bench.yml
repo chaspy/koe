@@ -2,6 +2,13 @@
 #   suite=speed  : whisper-server speed by model x audio_ctx x threads
 #   suite=accept : Koe's transcription path (core.TranscribeUtterance) on 20
 #                  sentences with small-q5_1 + audioCtx auto; pass / fail
+#                  engine=parakeet / both adds Parakeet-ja (sherpa-onnx, CTC
+#                  greedy, no prompt; the int8 model has no TDT head, so no
+#                  hotwords) through the same path, as Koe's engine "parakeet"
+#                  Estimate (2-core runner): parakeet alone ~6 min with runs 3
+#                  (466 MB download on a cache miss, unpack ~1-2 min, 60
+#                  utterances < 1 min); both ~15 min with runs 3 and prompts koe
+#                  (~$0.15), ~20 min with prompts koe,short (~$0.20)
 # Cost: windows runners are billed per minute
 # ($0.010/min for 2 cores on private repositories), so the job is capped at
 # 45 minutes, large-v3-turbo runs once per combination with all threads only,
@@ -25,6 +32,11 @@ on:
       audioctx:
         description: "accept: window policies, e.g. auto | 0 | auto:768 | full<6 (comma-separated)"
         default: auto
+      engine:
+        description: "accept: whisper (small-q5_1) | parakeet (Parakeet-ja) | both"
+        type: choice
+        options: [whisper, parakeet, both]
+        default: whisper
 
 permissions:
   contents: read
@@ -40,6 +52,11 @@ jobs:
         working-directory: windows
     env:
       WHISPER_TAG: v1.9.2
+      SHERPA_TAG: v1.13.8 # same as windows/build.sh and core.SherpaVersion
+      SHERPA_SHA256: 4b0a94f7b5c606b1b64a19a831c2127559e4b3d34e195465ebc7be73d9ed4783 # same as windows/build.sh
+      PARAKEET: sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8
+      WANT_WHISPER: ${{ inputs.suite == 'speed' || inputs.engine != 'parakeet' }}
+      WANT_PARAKEET: ${{ inputs.suite == 'accept' && inputs.engine != 'whisper' }}
       MODELS: ggml-base-q5_1.bin ggml-small-q5_1.bin ggml-large-v3-turbo-q5_0.bin
     steps:
       - uses: actions/checkout@v4
@@ -60,6 +77,7 @@ jobs:
           echo "$cpu, $NUMBER_OF_PROCESSORS logical processors"
 
       - name: whisper.cpp ${{ env.WHISPER_TAG }} (same zip as windows/build.sh)
+        if: env.WANT_WHISPER == 'true'
         timeout-minutes: 5
         run: |
           mkdir -p .cache
@@ -70,6 +88,7 @@ jobs:
 
       - name: Restore models
         id: models
+        if: env.WANT_WHISPER == 'true'
         uses: actions/cache/restore@v4
         timeout-minutes: 5
         with:
@@ -77,7 +96,7 @@ jobs:
           key: whisper-models-v1-base-q5_1-small-q5_1-large-v3-turbo-q5_0
 
       - name: Download models
-        if: steps.models.outputs.cache-hit != 'true'
+        if: env.WANT_WHISPER == 'true' && steps.models.outputs.cache-hit != 'true'
         timeout-minutes: 15
         run: |
           mkdir -p .cache/models
@@ -87,24 +106,65 @@ jobs:
           ls -la .cache/models
 
       - name: Save models
-        if: steps.models.outputs.cache-hit != 'true'
+        if: env.WANT_WHISPER == 'true' && steps.models.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         timeout-minutes: 5
         with:
           path: windows/.cache/models
           key: ${{ steps.models.outputs.cache-primary-key }}
 
+      - name: sherpa-onnx ${{ env.SHERPA_TAG }} DLLs (same as windows/build.sh)
+        if: env.WANT_PARAKEET == 'true'
+        timeout-minutes: 5
+        run: |
+          name="sherpa-onnx-$SHERPA_TAG-win-x64-shared-MT-Release-no-tts"
+          mkdir -p .cache
+          curl -fsSL --retry 3 -o .cache/sherpa.tar.bz2 "https://github.com/k2-fsa/sherpa-onnx/releases/download/$SHERPA_TAG/$name.tar.bz2"
+          echo "$SHERPA_SHA256  .cache/sherpa.tar.bz2" | sha256sum -c -
+          python -c "import os,sys,tarfile; t=tarfile.open(sys.argv[1]); os.makedirs(sys.argv[2],exist_ok=True); [open(os.path.join(sys.argv[2],os.path.basename(m.name)),'wb').write(t.extractfile(m).read()) for m in t.getmembers() if m.name.startswith(sys.argv[3]+'/lib/') and m.name.endswith('.dll')]" .cache/sherpa.tar.bz2 .cache/sherpa "$name"
+          ls -la .cache/sherpa
+
+      - name: Restore Parakeet-ja
+        id: parakeet
+        if: env.WANT_PARAKEET == 'true'
+        uses: actions/cache/restore@v4
+        timeout-minutes: 5
+        with:
+          path: windows/.cache/parakeet
+          key: parakeet-ja-35000-int8-v1
+
+      - name: Download Parakeet-ja (466 MB)
+        if: env.WANT_PARAKEET == 'true' && steps.parakeet.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: |
+          mkdir -p .cache/parakeet
+          curl -fsSL --retry 3 -o ".cache/parakeet/$PARAKEET.tar.bz2" "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$PARAKEET.tar.bz2"
+          ls -la .cache/parakeet
+
+      - name: Save Parakeet-ja
+        if: env.WANT_PARAKEET == 'true' && steps.parakeet.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        timeout-minutes: 5
+        with:
+          path: windows/.cache/parakeet
+          key: ${{ steps.parakeet.outputs.cache-primary-key }}
+
       - name: Build bench
         timeout-minutes: 5
         run: go build -o .cache/bench.exe ./bench && go build -o .cache/accept.exe ./bench/accept
 
       - name: accept — small-q5_1, Koe's path (${{ inputs.runs }} runs x 20 sentences; prompts ${{ inputs.prompts }}; audioctx ${{ inputs.audioctx }})
-        if: inputs.suite == 'accept'
+        if: inputs.suite == 'accept' && inputs.engine != 'parakeet'
         timeout-minutes: 25
         env:
           PROMPTS: ${{ inputs.prompts }}
           AUDIOCTX: ${{ inputs.audioctx }}
         run: .cache/accept.exe -server .cache/whisper/whisper-server.exe -model .cache/models/ggml-small-q5_1.bin -runs "${{ inputs.runs }}" -prompts "$PROMPTS" -audioctx "$AUDIOCTX" -out bench-out/accept.jsonl
+
+      - name: accept — Parakeet-ja, Koe's engine "parakeet" (${{ inputs.runs }} runs x 20 sentences; unpack timed)
+        if: ${{ !cancelled() && inputs.suite == 'accept' && inputs.engine != 'whisper' }}
+        timeout-minutes: 12
+        run: .cache/accept.exe -engine parakeet -parakeet-archive ".cache/parakeet/$PARAKEET.tar.bz2" -parakeet-model ".cache/models/$PARAKEET" -sherpa-dll .cache/sherpa/sherpa-onnx-c-api.dll -runs "${{ inputs.runs }}" -out bench-out/accept-parakeet.jsonl
 
       - name: base-q5_1 (threads 2 / 4 / all, ${{ inputs.runs }} runs)
         if: inputs.suite == 'speed'
@@ -131,7 +191,14 @@ jobs:
           minutes=$(python -c "import datetime,sys; s=sys.argv[1]; print('%.2f' % ((datetime.datetime.now(datetime.timezone.utc)-datetime.datetime.fromisoformat(s.replace('Z','+00:00'))).total_seconds()/60) if s else '')" "$started")
           args=(--cpu "$CPU_NAME" --logical-cpus "$LOGICAL_CPUS" ${minutes:+--minutes "$minutes"} --usd-per-minute 0.010)
           if [ "${{ inputs.suite }}" = accept ]; then
-            python bench/accept/summary.py bench-out/accept.jsonl "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"  # exits 1 on FAIL
+            rc=0
+            if [ "${{ inputs.engine }}" != parakeet ]; then
+              python bench/accept/summary.py bench-out/accept.jsonl "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1  # exits 1 on FAIL
+            fi
+            if [ "${{ inputs.engine }}" != whisper ]; then
+              python bench/accept/summary.py bench-out/accept-parakeet.jsonl "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY" || rc=1
+            fi
+            exit $rc
           else
             python bench/summary.py bench-out/results.jsonl "${args[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
           fi

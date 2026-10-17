@@ -2,7 +2,20 @@
 
 Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each release's notes on GitHub are taken from its section here.
 
-## Unreleased
+## 0.7.0 — 2026-10-17
+
+### Repository
+- Developer pack (both apps): misrecognitions seen in the test set are added — マージュ → マージ, クロードコード → Claude Code, and new terms アプルーブ (アプローブ), STG (エステージ), インシデント (インシエント), リファクタ (リラクター), BQ (`~B級`, only a note for the receiving AI). On the stored turbo outputs of the test set (755 clips) the developer terms are spelled right 38 times instead of 33 out of 44.
+- `koe_bench.py term-forms` lists "reference word → form whisper actually produced" from the test set's stored turbo outputs without running whisper (words and counts only), and `compare-terms` gains `--developer` (another pack file), `--extra-terms` (score the same words before and after), `--forms` (missed term → form, no transcripts) and `--sleep`. `eval/compare_pack_change.sh` runs the before/after comparison of a pack change (runs thinly beside other work: nice 19, 2 threads, 1 s pause per clip).
+- `koe_eval.py daily` shows 貼る→届く (median / p90) and 届かず for pastes into a terminal: the time from ⌘V (`paste_at`) until the text shows up as a user message (`type=user` or a queued `queue-operation`) in any Claude Code session log (`~/.claude/projects/*/*.jsonl`) within 5 minutes. A paste counts as delivered when its normalized text is contained in the sent message (several queued utterances merged into one also match) or nearly equal to it (small hand edits). Undelivered pastes are split by reason for today: no user message in any session / a similar message was sent (edited) / messages were sent but none matched. Whether a paste went to a non-Claude-Code pane or was deleted without sending cannot be told apart. Records from before `paste_at` use the history id time, which is set right after the paste. Only numbers and counts are printed; the session logs and the pasted text are used only for matching.
+
+### macOS
+- Transcription is a little faster: whisper's window is now sized to the utterance (same rule as Windows: at least 15 s, the whole 30 s window from 30 s on). On an M2 Max with large-v3-turbo the median went 0.55 → 0.51 s and p95 0.73 → 0.63 s with the same accuracy. `defaults write io.github.chaspy.koe audioCtx 0` goes back to the whole window; repetition retries always use the whole window.
+- Optional, off by default: with `defaults write io.github.chaspy.koe measureVisible -bool true`, after pasting into iTerm Koe reads the current iTerm session's screen (AppleScript `contents`) every 150 ms for up to 10 s and records how long until the end of the pasted text appears (`visible_ms`, events `visible` / `not_visible`), so "pasted" and "you can see it" can be told apart. Panes inside Herdr are found too (the screen is split on box-drawing borders and the text may wrap across rows of the same pane). Not shown within 10 s counts as a failure in 今日の入力成功 and in `koe_eval.py daily` (new columns 貼る→画面に出る median / p90 and 出ず). The screen and the pasted text are used only for comparison and are never written anywhere. When turned on, the first measurement asks for the Automation permission for iTerm (Info.plist `NSAppleEventsUsageDescription`); while it is off Koe never asks and the menu shows no screen numbers. Without the permission the paste works as before and the measurement is recorded as `visible_unknown`, not as a failure. When iTerm is slow to answer, Koe waits as long as the last read took before reading again; the longest read is recorded as `visible_read_ms_max`. Other terminals are not measured.
+- History and the `pasted` event record `paste_at`: when ⌘V was sent, in UTC with milliseconds (the same format as Claude Code's session log timestamps).
+
+### Windows
+- Trial engine: `"engine": "parakeet"` in config.json transcribes with Parakeet-ja (NVIDIA, CC BY 4.0) through sherpa-onnx in Koe's own process, on the CPU — no prompt, the glossary still corrects afterwards. The model (466 MB) is downloaded from the sherpa-onnx GitHub release on first use. The default stays `"whisper"`; the zip now also ships `sherpa-onnx-c-api.dll`, `onnxruntime.dll` and `THIRD_PARTY_NOTICES.md`.
 
 ## 0.6.0 — 2026-10-17
 

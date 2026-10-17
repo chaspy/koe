@@ -64,6 +64,10 @@ test:
 	./build/people-test
 	swiftc -O -o build/redaction-test Sources/Koe/Redaction.swift Tests/redaction/main.swift
 	./build/redaction-test
+	swiftc -O -o build/window-test Sources/Koe/AudioWindow.swift Tests/window/main.swift
+	./build/window-test
+	swiftc -O -o build/visible-test Sources/Koe/PasteVisible.swift Tests/visible/main.swift
+	./build/visible-test
 
 clean:
 	rm -rf .build build

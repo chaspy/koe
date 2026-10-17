@@ -8,7 +8,7 @@
 プルリクエスト	プロリクエスト／フルリクエスト／プロリクルド
 プルリク	プロリク／プロリック／プロレクト
 PR
-マージ	~マジ／マジ>(され|し|する|した|でき|済)
+マージ	~マジ／マジ>(され|し|する|した|でき|済)／マージュ
 コンフリクト
 リベース
 ブランチ
@@ -22,6 +22,7 @@ Issue
 レビュー
 レビュアー
 Approve
+アプルーブ	アプローブ
 LGTM
 ドラフト
 diff
@@ -33,11 +34,15 @@ CI
 CI/CD
 デプロイ
 ステージング
+STG	エステージ
 本番
 ロールバック
+インシデント	インシエント
+リファクタ	リラクター
 リリース
 タグ
 README
 Dependabot
 Copilot
-Claude Code	ClodeCode／Clodecode／Cloud Code
+Claude Code	ClodeCode／Clodecode／Cloud Code／クロードコード
+BQ	~B級

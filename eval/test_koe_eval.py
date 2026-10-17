@@ -30,6 +30,8 @@ class PressRateTest(unittest.TestCase):
 
         # 履歴: 貼れた 8、ロック録音 1、貼れなかった 1（no_voice などで履歴だけ残ったもの）
         recs = [{"pasted": True}] * 8 + [{"locked": True}, {}]
+        recs[0] = {"pasted": True, "visible": "visible", "visible_ms": 300}
+        recs[1] = {"pasted": True, "visible": "visible_unknown", "visible_reason": "no_permission"}  # 測れなかった: 成功のまま
         for i, r in enumerate(recs):
             t = at(i * 10)
             d = koe_eval.HISTORY / t.strftime("%Y-%m-%d")
@@ -110,6 +112,130 @@ class PerfStagesTest(unittest.TestCase):
         self.assertEqual(g["音声 30 秒以上"], ["09-00-30"])
         self.assertEqual(g["改善ループが裏で動いていた"], ["09-20-00"])
         self.assertEqual(g["whisper を起こし直した"], ["09-20-05"])
+
+
+class MissFormsTest(unittest.TestCase):
+    """koe_bench.miss_forms: 準正解の語と、出力に実際に出た形の組だけを返す"""
+
+    def test_pairs(self):
+        import koe_bench
+        f = koe_bench.miss_forms
+        self.assertEqual(f("プルリクをマージした", "プロリクをマジした"), [("プルリク", "プロリク"), ("マージ", "マジ")])
+        self.assertEqual(f("Claude Code で直す", "クロードコードで直す"), [("ClaudeCode", "クロードコード")])
+        self.assertEqual(f("インストールして", "インストールして"), [])
+        # 漢字・かなだけの食い違いと、語の外まで広がった食い違いは拾わない
+        self.assertEqual(f("今日は晴れ", "今日は春"), [])
+        self.assertEqual(f("テストを書く", "それはまた別の話で長い"), [])
+
+
+class DeliveredTest(unittest.TestCase):
+    """貼る→届く（delivered_ms）: 貼った文とセッション記録のユーザー発話の照合"""
+
+    T0 = datetime(2026, 10, 17, 1, 0, 0, tzinfo=timezone.utc)
+
+    def at(self, sec):
+        return self.T0 + timedelta(seconds=sec)
+
+    def rec(self, text):
+        return {"pasted": text, "paste_at": self.T0.strftime("%Y-%m-%dT%H:%M:%S.000Z")}
+
+    def test_match_normalizes(self):
+        m = koe_eval.delivered_match
+        self.assertTrue(m("テストを回して。", "テストを回して"))                    # 句読点
+        self.assertTrue(m("make test を回して", "make test を\n回して"))            # 改行・空白（折り返し）
+        self.assertTrue(m("ＡＢＣを直して", "ABCを直して"))                         # 全角・半角（NFKC）
+        self.assertTrue(m("二つ目の話", "一つ目の話\n二つ目の話\n三つ目"))           # キューでまとまった文に含まれる
+        self.assertTrue(m("この関数のテストを足してください", "この関数のテストを足して下さい"))  # 手で少し直した
+        self.assertFalse(m("この関数のテストを足して", "デプロイの手順を教えて"))
+        self.assertFalse(m("", "何か"))
+        self.assertFalse(m("。", "何か"))                                            # 正規化すると空
+
+    def test_delivery_time_and_window(self):
+        humans = [(self.at(-30), "前に送った文"), (self.at(0.4), "別の話"), (self.at(21), "それを直して"), (self.at(40), "それを直して")]
+        self.assertEqual(koe_eval.delivery(self.rec("それを直して"), humans), (21000, None))  # いちばん早いもの
+        self.assertEqual(koe_eval.delivery(self.rec("前に送った文"), humans)[1], "no_match")  # paste_at より前は数えない
+        # 時計の丸めで少し前（1 秒以内）は 0 ms
+        self.assertEqual(koe_eval.delivery(self.rec("ほぼ同時"), [(self.at(-0.3), "ほぼ同時")]), (0, None))
+        # 5 分を過ぎたものは数えない
+        self.assertEqual(koe_eval.delivery(self.rec("遅い"), [(self.at(301), "遅い")]), (None, "no_message"))
+
+    def test_delivery_reasons(self):
+        self.assertEqual(koe_eval.delivery(self.rec("何か"), []), (None, "no_message"))
+        humans = [(self.at(5), "このファイルにはユニットテストも足しておいて")]
+        self.assertEqual(koe_eval.delivery(self.rec("このファイルのテストを足しといて"), humans)[1], "edited")
+        self.assertEqual(koe_eval.delivery(self.rec("デプロイの手順"), humans)[1], "no_match")
+
+    def test_paste_time_falls_back_to_id(self):
+        r = {"id": "2026-10-17T10-00-00-250"}
+        self.assertEqual(koe_eval._paste_time(r), koe_eval._record_time(r))
+        self.assertEqual(koe_eval._paste_time(self.rec("x")), self.T0)
+
+    def test_human_events_include_queue(self):
+        rows = [
+            {"type": "queue-operation", "operation": "enqueue", "content": "一つ目\n二つ目", "timestamp": "2026-10-17T01:00:03.000Z"},
+            {"type": "user", "message": {"content": "三つ目"}, "timestamp": "2026-10-17T01:00:01.500Z"},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "二つ目"}]}, "timestamp": "2026-10-17T01:00:00.500Z"},
+            {"type": "assistant", "message": {"content": "二つ目"}, "timestamp": "2026-10-17T01:00:00.600Z"},
+        ]
+        humans = koe_eval._human_events([(None, rows)])
+        self.assertEqual([h[1] for h in humans], ["三つ目", "一つ目\n二つ目"])  # 時刻順、ツールの結果と返答は除く
+        self.assertEqual(koe_eval.delivery(self.rec("二つ目"), humans), (3000, None))
+
+    def test_not_visible_counts_as_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            orig = koe_eval.HISTORY
+            koe_eval.HISTORY = Path(tmp) / "history"
+            try:
+                base = datetime.now().replace(microsecond=0) - timedelta(minutes=30)
+                for i, r in enumerate([{"visible": "visible", "visible_ms": 400}, {"visible": "visible", "visible_ms": 1200},
+                                       {"visible": "not_visible"}, {"visible": "visible_unknown", "visible_reason": "no_permission"}]):
+                    rid = (base + timedelta(seconds=i)).strftime("%Y-%m-%dT%H-%M-%S-000")
+                    d = koe_eval.HISTORY / rid[:10]
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"{rid}.json").write_text(json.dumps({"id": rid, "pasted": "文", "app": "com.example", **r}))
+                day, fails = koe_eval._press_counts(base.astimezone() - timedelta(minutes=1), events=[])
+                (v,) = day.values()
+                self.assertEqual((v["ok"], v["fail"]), (3, 1))
+                self.assertEqual(dict(next(iter(fails.values()))), {"not_visible": 1})
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    koe_eval.cmd_daily(argparse.Namespace(days=1))
+                self.assertIn("| 0.80s / 1.20s | 1/3 |", out.getvalue())  # 出た 2 件の中央 0.8 秒、出ず 1 件 / 測れた 3 件
+            finally:
+                koe_eval.HISTORY = orig
+
+    def test_daily_prints_numbers_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            orig = koe_eval.HISTORY, koe_eval.CLAUDE_PROJECTS
+            koe_eval.HISTORY, koe_eval.CLAUDE_PROJECTS = root / "history", root / "projects"
+            try:
+                now = datetime.now().astimezone().replace(microsecond=0) - timedelta(minutes=30)
+                texts = ["秘密の文その一です", "秘密の文その二です", "どこにも届かなかった文"]
+                (root / "projects/p").mkdir(parents=True)
+                rows = []
+                for i, text in enumerate(texts):
+                    t = now + timedelta(minutes=i * 10)
+                    rid = t.strftime("%Y-%m-%dT%H-%M-%S-000")
+                    d = koe_eval.HISTORY / rid[:10]
+                    d.mkdir(parents=True, exist_ok=True)
+                    utc = t.astimezone(timezone.utc)
+                    (d / f"{rid}.json").write_text(json.dumps({"id": rid, "pasted": text, "app": "com.googlecode.iterm2",
+                                                               "paste_at": utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")}))
+                    if i < 2:
+                        ts = (utc + timedelta(seconds=[0.2, 31][i])).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                        rows.append({"type": "user", "message": {"content": text}, "timestamp": ts})
+                (root / "projects/p/s.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    koe_eval.cmd_daily(argparse.Namespace(days=1))
+                daily = out.getvalue()
+            finally:
+                koe_eval.HISTORY, koe_eval.CLAUDE_PROJECTS = orig
+        self.assertIn("| 15.60s / 31.00s | 1/3 |", daily)  # 0.2 秒と 31 秒の 2 件。届かず 1 件 / 対象 3 件
+        self.assertIn("どのセッションにも発話が無い（送っていない・Claude Code 以外のペインに貼った） 1", daily)
+        for text in texts:
+            self.assertNotIn(text, daily)
 
 
 if __name__ == "__main__":

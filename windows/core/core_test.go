@@ -138,10 +138,10 @@ func TestReceiverNotes(t *testing.T) {
 	if !strings.Contains(short, "## よく起きる誤変換（正しい表記 ← 化けた形）\n\n- Herdr ← ハーダー（文脈によっては「ハード」と化ける）\n") {
 		t.Fatal(short)
 	}
-	if !strings.Contains(short, "- マージ ← マジ（直後が (して) のとき）、マジ（直後が (され|し|する|した|でき|済) のとき）（文脈によっては「マジ」と化ける）") {
+	if !strings.Contains(short, "- マージ ← マジ（直後が (して) のとき）、マジ（直後が (され|し|する|した|でき|済) のとき）、マージュ（文脈によっては「マジ」と化ける）") {
 		t.Fatal(short)
 	}
-	if !strings.Contains(short, "`~\\.claude\\koe-voice-glossary.full.md` を grep してから読み替える（6 語）") {
+	if !strings.Contains(short, "`~\\.claude\\koe-voice-glossary.full.md` を grep してから読み替える（11 語）") {
 		t.Fatal(short)
 	}
 	if !strings.Contains(full, "## よく使う語（この表記が正しい）\n\nPR、コンフリクト") {

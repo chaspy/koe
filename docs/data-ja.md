@@ -1,6 +1,6 @@
 # Koe が扱うデータ
 
-Koe は、声を自分のパソコンの中で文字にします。文字起こしをするのは、Koe が自分で起動する whisper-server です。この whisper-server は `127.0.0.1`（自分のパソコンの中だけ）で待ち受けるので、録音を外に送ることはありません。
+Koe は、声を自分のパソコンの中で文字にします。文字起こしをするのは、Koe が自分で起動する whisper-server です。この whisper-server は `127.0.0.1`（自分のパソコンの中だけ）で待ち受けるので、録音を外に送ることはありません。Windows で `config.json` の `engine` を `"parakeet"`（試験中）にしたときは、Koe 自身のプロセスの中で Parakeet-ja が文字にします（待ち受けるポートもありません）。
 **既定の設定では、録音も文字も外に送りません。** 外に出るのは、更新の確認などの通信（下の 2）と、自分でオンにした機能（下の 3）だけです。
 
 このページは、ソースコード（macOS は `macos/Sources/Koe/`、Windows は `windows/`）に書かれている動作をまとめたものです。
@@ -27,6 +27,8 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 **履歴を残す期間**: メニュー →「履歴を残す期間」で、7 / 14（既定）/ 30 / 90 日 / ずっと から選べます。文字と記録は、録音の約 2 倍の期間残ります。history 全体が 1GB を超えたときは、古い日の録音から消します。消す処理は、起動したときと 1 日 1 回、裏で動きます。直近 1 日のうちに変わったファイルは消しません。
 メニュー →「録音と結果を保存（評価用）」をオフにすると、履歴は残りません（録音は文字にしたあと消します）。
 
+**iTerm の画面を読む（macOS、既定はオフ）**: `defaults write io.github.chaspy.koe measureVisible -bool true` でオンにしたときだけ、iTerm に貼ったあと最大 10 秒、iTerm の今のセッションの画面の文字（AppleScript の contents）を読み、貼った文の末尾が出るまでの時間を測ります。読んだ画面の中身と貼った文は比べるのにだけ使い、どこにも書きません（履歴と動作の記録には `visible`・`visible_ms` などの数字と結果だけが残ります）。オンにして初めて測るときに macOS がオートメーション（Koe が iTerm を操作する）の許可を求めます。オフの間は画面を読まず、許可も聞きません。許可しなくても貼り付けはそのまま使えます（測れなかった、と記録するだけ）。止めるには `defaults write io.github.chaspy.koe measureVisible -bool false`。
+
 ### Windows
 
 | もの | 場所 | 中身 | 消えるタイミング |
@@ -35,7 +37,7 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 | 動作の記録 | `%LOCALAPPDATA%\Koe\koe.log`（と 1 つ前の `koe.log.1`） | 押した・貼った・失敗した理由・かかった時間など（話した文は書かない） | 5MB を超えたら `koe.log.1` に回し、その前のものは消える |
 | whisper-server のログ | `%LOCALAPPDATA%\Koe\whisper-server.log`（GPU 版は `whisper-server-vulkan.log`） | 起動と処理時間の記録 | 起動するたびに作り直す |
 | 更新の記録 | `%LOCALAPPDATA%\Koe\update.log` | 更新の確認と入れ替えの記録 | — |
-| 文字起こし用のモデル | `%LOCALAPPDATA%\Koe\models\` | whisper のモデル | 消さない |
+| 文字起こし用のモデル | `%LOCALAPPDATA%\Koe\models\` | whisper のモデル。`config.json` の `engine` を `"parakeet"` にしたときは、Parakeet-ja のモデル（`models\sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8\` に `model.int8.onnx` と `tokens.txt`、約 630MB。取得中は同じ場所に `.tar.bz2` と `.part` が一時的にできる） | 消さない |
 | 設定・個人の辞書・用語パック | `%APPDATA%\Koe\config.json`、`glossary.txt`、`packs\` | 設定と語の一覧 | 消さない |
 | 受け取る AI 向けのメモ | `%USERPROFILE%\.claude\koe-voice-glossary.md` と `.full.md` | macOS と同じ | `%USERPROFILE%\.claude` が無ければ書かない |
 
@@ -52,6 +54,7 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 | Windows 版があるかの確認（Windows のみ） | `https://github.com/<repo>/releases/download/v<版>/Koe-<版>-windows-x64.zip` に `HEAD` | 新しい版が見つかったとき | 同上 |
 | 更新のダウンロード | macOS は `…/releases/download/v<版>/Koe-<版>.dmg`、Windows は上の zip（GitHub の配布用サーバーへ転送される） | 「今すぐ更新」かメニューの「新しい版 vX があります」を押したときだけ | 同上 |
 | 初回のモデル取得 | `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/<モデル>`（macOS は `ggml-large-v3-turbo.bin`、Windows は `ggml-small-q5_1.bin`。設定 `modelURL` で変えられる） | モデルが手元に無いとき | 同上 |
+| Parakeet-ja のモデル取得（Windows のみ） | `https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2`（GitHub の配布用サーバーへ転送される） | `config.json` の `engine` を `"parakeet"` にして、モデルが手元に無いとき | 同上 |
 | 共有の用語パック | `packSources` に書いた取り込み元。`gh:owner/repo/path` は gh CLI（`gh api …/contents/…`）で取る。macOS は `https://…` の URL も使える（Windows は `gh:` だけ） | `packSources` を設定したときだけ。1 日 1 回 | gh CLI の場合は、gh にログインしているアカウントで要求する |
 | 組織の辞書（macOS のみ） | `orgGlossary` に書いた `http(s)://` の URL | `orgGlossary` に URL を設定したときだけ。1 日 1 回 | ふつうの HTTP の要求だけ |
 | 社員名簿（macOS のみ） | `peopleSources` に書いた取り込み元（`gh:owner/repo/path` か `https://…`。用語パックと同じ取り方） | `peopleSources` を設定したときだけ。1 日 1 回 | 用語パックと同じ |

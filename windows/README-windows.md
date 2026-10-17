@@ -102,6 +102,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 |---|---|---|
 | `hotkey` | `"ralt"` | 録音キー。`"ralt"`（右 Alt）か `"rctrl"`（右 Ctrl） |
 | `pressMode` | `"hold"` | 押し方。`"hold"`（押している間だけ録音）か `"toggle"`（押すたびに開始・終了） |
+| `engine` | `"whisper"` | 文字起こしのエンジン（試験中）。`"whisper"`（今までどおり）か `"parakeet"`（Parakeet-ja。下の「文字起こしエンジン（試験中）」） |
 | `model` | `"ggml-small-q5_1.bin"` | モデルのファイル名（`%LOCALAPPDATA%\Koe\models` 内）か絶対パス。`"small-q5_1"` のような短い名前も可 |
 | `threads` | `0` | 文字起こしに使うスレッド数。`0` は自動（論理プロセッサ数、最大 16） |
 | `audioCtx` | `"auto"` | 文字起こしの枠の大きさ。`"auto"` は話した長さに合わせる（最小 15 秒ぶん＝768、それより長い発話は長さに合わせて広げる。30 秒以上は全体）、`0` は毎回 30 秒ぶん全体（遅いが元の精度）、数値は固定（1 秒 = 50、最大 1500）。メニューの「速さ優先」で `"auto"` / `0` を切り替えられます。large-v3 系のモデルでは常に `0` |
@@ -118,6 +119,17 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `historyKeepDays` | `14` | 録音を残す日数（文字と記録はその約 2 倍：7→14、14→30、30→60、90→180）。`0` は消さない。メニューの「履歴を残す期間」でも変えられます |
 | `updateCheck` | `true` | 新しい版が出ていないか確かめる（起動時、24 時間ごと、メニューを開いたとき〔前回から 1 分以上たっていれば〕） |
 | `updateRepo` | `"chaspy/koe"` | 新しい版を探す GitHub のリポジトリ（`owner/repo`） |
+
+## 文字起こしエンジン（試験中）
+
+`config.json` に `"engine": "parakeet"` と書いて Koe を起動し直すと、whisper の代わりに **Parakeet-ja**（NVIDIA の日本語専用モデルを sherpa-onnx で動かしたもの）で文字起こしします。既定は今までどおり `"whisper"` です。
+
+- 初回だけモデル（約 466MB）をダウンロードして展開します（`%LOCALAPPDATA%\Koe\models\sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8\`、展開後 約 630MB）。進み具合はアイコンにマウスを乗せると出ます
+- CPU だけで動きます（GPU の設定は使いません）。whisper-server は起動しません。スレッド数は `threads`（`0` は論理プロセッサ数の半分、最大 4）
+- whisper の初期プロンプト（`prompt` と用語パックの語）は使えません。用語は、文字起こしの後の置き換え（辞書の「誤変換された形 → 正しい表記」）だけが効きます
+- トレイの「モデル」と「GPU を使う」は whisper 用なので、`"parakeet"` の間は切り替わりません
+- 戻すときは `"engine": "whisper"` にして起動し直します。ダウンロードしたモデルは、要らなければ上のフォルダを消してください
+- モデルのライセンスは CC BY 4.0 です（帰属表示は同梱の `THIRD_PARTY_NOTICES.md`）
 
 ## 用語の辞書
 
@@ -147,7 +159,7 @@ zip を作れないときは、`%LOCALAPPDATA%\Koe` フォルダ（メニュー�
 
 | 場所 | 中身 |
 |---|---|
-| Koe を展開したフォルダ | `Koe.exe`、`whisper-server.exe` と DLL、`packs\`、`assets\` |
+| Koe を展開したフォルダ | `Koe.exe`、`whisper-server.exe` と DLL、`sherpa-onnx-c-api.dll` と `onnxruntime.dll`（`engine` が `"parakeet"` のときだけ使う）、`packs\`、`assets\`、`THIRD_PARTY_NOTICES.md` |
 | `%APPDATA%\Koe` | `config.json`、`glossary.txt`、`packs\` |
 | `%LOCALAPPDATA%\Koe` | `koe.log`、`whisper-server.log`、`whisper-server-vulkan.log`、`update.log`、`backend.json`（GPU と CPU を測った結果）、`models\`、`history\` |
 

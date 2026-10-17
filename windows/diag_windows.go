@@ -117,6 +117,12 @@ func (a *App) diagnosticsText() []byte {
 		threads = a.server.Threads
 	}
 	w("threads = %d (config threads=%d)", threads, a.cfg.Threads)
+	if a.parakeet() {
+		dir := core.ParakeetDir(a.modelsDir())
+		w("engine = parakeet (%s, ready=%v, threads=%d; the model / gpu / backend_choice lines are whisper's and not used)", dir, core.ParakeetReady(dir), a.cfg.ParakeetThreads(runtime.NumCPU()))
+	} else {
+		w("engine = whisper")
+	}
 	w("gpu = %s (config gpu=%s, gpuAudioCtx=%s)", a.gpuStatus(), a.cfg.GPU, a.cfg.GPUAudioCtx)
 	w("gpu_adapters = %q", a.gpuNames)
 	if c := a.backendChoice(); c.Choice != "" {

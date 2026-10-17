@@ -60,7 +60,7 @@ make dist SIGN_IDENTITY="<your codesigning identity>"      # build/Koe-<version>
 
 The dmg is not notarized yet; on another Mac, right-click → Open the first time.
 
-Settings (`defaults write io.github.chaspy.koe <key> <value>`): `hotkeyKeyCode` (54 = right ⌘, 61 = right ⌥), `model`, `language`, `prompt`, `port`, `minHoldSeconds`, `warmMic`, `sounds`, `startSound` / `stopSound` (bundled `start`/`stop` or a macOS sound name such as `Ping`).
+Settings (`defaults write io.github.chaspy.koe <key> <value>`): `hotkeyKeyCode` (54 = right ⌘, 61 = right ⌥), `model`, `language`, `prompt`, `port`, `minHoldSeconds`, `warmMic`, `sounds`, `startSound` / `stopSound` (bundled `start`/`stop` or a macOS sound name such as `Ping`), `audioCtx` (`auto` = whisper's window sized to the utterance, the default; `0` = the whole 30 s window every time).
 
 ### LLM cleanup (optional)
 
@@ -134,8 +134,12 @@ python3 eval/koe_eval.py run --tag small --model ~/.local/src/whisper.cpp/models
 
 Results are saved under `~/Library/Application Support/Koe/evals/`.
 
+`koe_eval.py daily` also shows 貼る→届く: how long after ⌘V the text shows up as your message in a Claude Code session log. To also measure 貼る→画面に出る for iTerm (how long until the pasted text appears on screen), turn it on with `defaults write io.github.chaspy.koe measureVisible -bool true` (off by default). Koe then reads the iTerm screen for up to 10 s after each paste, only to compare it with the pasted text, and macOS asks once to let Koe control iTerm (Automation).
+
 If you dictate into [Claude Code](https://claude.com/claude-code), `koe_eval.py context` matches each utterance with your Claude Code session logs (`~/.claude/projects/`) and shows the message actually sent, Claude's reply and your next message. Manual edits, the way Claude interpreted it, and your corrections are strong hints for what you meant, which makes drafting references (`set-draft`) much easier.
 
 ## License
 
 MIT
+
+The Windows zip also ships whisper.cpp (MIT), sherpa-onnx (Apache-2.0) and ONNX Runtime (MIT). With `"engine": "parakeet"` the Windows app downloads Parakeet-ja ([nvidia/parakeet-tdt_ctc-0.6b-ja](https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja) by NVIDIA, CC BY 4.0, converted to ONNX int8 by sherpa-onnx). See [windows/THIRD_PARTY_NOTICES.md](windows/THIRD_PARTY_NOTICES.md).

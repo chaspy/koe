@@ -13,13 +13,15 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.6.0</string>
+	<string>0.7.0</string>
 	<key>CFBundleVersion</key>
 	<string>0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>iTerm に貼った文が画面に出るまでの時間を測るため、iTerm の今の画面の文字を読みます。読んだ中身は比べるのにだけ使い、保存も送信もしません。</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>押している間の音声を録音し、この Mac の中だけで文字起こしします。</string>
 </dict>

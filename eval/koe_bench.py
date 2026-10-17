@@ -20,6 +20,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -327,8 +328,11 @@ def compare_terms(a):
     org = _parse_glossary(KOE / "org_glossary.txt")
     # 公式のパック（developer）と、自分で入れたパック（~/Library/Application Support/Koe/packs/*.txt）
     user_packs = [e for f in sorted((KOE / "packs").glob("*.txt")) if f.stem != "developer" for e in _parse_glossary(f)]
-    layers = {"developer": load("developer"), "user": user_packs, "org": org}
+    # --developer: 開発者向けパックを別のファイル（別名を足した候補など）に差し替えて、前後を同じ区間で比べる
+    layers = {"developer": _parse_glossary(a.developer) if a.developer else load("developer"), "user": user_packs, "org": org}
     terms = {t for es in layers.values() for t, _ in es if len(t) >= 2}
+    # --extra-terms: プロンプトにも置き換えにも使わず、採点する語だけに足す（前後で同じ語を数えるため）
+    terms |= {t for t, _ in (_parse_glossary(a.extra_terms) if a.extra_terms else []) if len(t) >= 2}
     recent = [(r.get("pasted") or "").lower() for r in ke.load_records()[-300:]]
 
     def prompt_with(entries):
@@ -362,12 +366,13 @@ def compare_terms(a):
                 clips.append((d / (it["id"].split("/")[1] + ".wav"), ref, found))
     print(f"用語が出てくる区間: {len(clips)}（用語の出現 {sum(len(f) for _, _, f in clips)} 回）")
     server = ke.start_server(ke.WHISPER_HOME / "models" / "ggml-large-v3-turbo.bin", None)
-    detail = {}
+    detail, dump = {}, {}
     try:
         for name, (pentries, aentries) in configs.items():
             prompt = prompt_with(pentries)
             ok = total = 0
             misses = []
+            dump[name] = {"ok": 0, "total": 0, "missed": {}}
             for wav, ref, found in clips:
                 out = _autocorrect(ke.transcribe(wav, prompt=prompt), aentries)
                 for t in found:
@@ -376,13 +381,108 @@ def compare_terms(a):
                         ok += 1
                     else:
                         misses.append(t)
+                        # 外れた語が実際にどう出たか（語と形だけ。本文は残さない）
+                        k = ke.normalize(t).lower()
+                        f = [g for w, g in miss_forms(ref, out) if k in w.lower() or w.lower() in k]
+                        dump[name]["missed"].setdefault(t, []).append(f[0] if f else "")
+                if a.sleep:
+                    time.sleep(a.sleep)
             detail[name] = misses
+            dump[name].update(ok=ok, total=total)
             print(f"  {name:<22} 用語の正解率 {ok / total:.0%}（{ok}/{total}）", flush=True)
     finally:
         server.terminate()
     from collections import Counter
     for name, m in detail.items():
         print(f"  {name} で外した語: " + "、".join(f"{k}({v})" for k, v in Counter(m).most_common(10)))
+    if a.forms:
+        Path(a.forms).write_text(json.dumps({"developer": a.developer or "packs/developer.txt", "conditions": dump}, ensure_ascii=False, indent=1))
+        print(f"  外れた語と出た形 -> {a.forms}")
+
+
+WORD_CHARS = r"\u30A0-\u30FFA-Za-z0-9"  # カタカナ（ー を含む）と英数字: 化けた形を拾う語の単位
+
+
+def miss_forms(ref, hyp):
+    """準正解と出力を文字で突き合わせ、食い違った箇所の (準正解の語, 出力の形) を返す。
+    語は食い違いを含むカタカナ・英数字の並び（前後に広げる）。漢字・かなだけの食い違いは拾わない"""
+    import difflib
+    import re
+    r, h = ke.normalize(ref), ke.normalize(hyp)
+    ops = difflib.SequenceMatcher(None, r, h, autojunk=False).get_opcodes()
+
+    def to_h(i):  # 準正解の位置 → 出力の位置
+        for tag, i1, i2, j1, j2 in ops:
+            if i1 <= i < i2 or (i == i2 == len(r)):
+                return j1 + (i - i1 if tag == "equal" else (0 if i == i1 else j2 - j1))
+        return len(h)
+    out = []
+    word = re.compile(f"[{WORD_CHARS}]")
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal" or not (word.search(r[i1:i2]) or word.search(h[j1:j2])):
+            continue
+        a, b = i1, i2
+        while a > 0 and word.match(r[a - 1]):
+            a -= 1
+        while b < len(r) and word.match(r[b]):
+            b += 1
+        x, y = to_h(a), to_h(b) if b > i2 else j2
+        x = min(x, j1)
+        while x > 0 and word.match(h[x - 1]):
+            x -= 1
+        while y < len(h) and word.match(h[y]):
+            y += 1
+        # 語の中だけの食い違い（語の外まで広がった食い違い・長い取りこぼしは、化けた形として使えない）
+        if r[a:b] and r[a:b] != h[x:y] and re.fullmatch(f"[{WORD_CHARS}]+", r[a:b]) and len(h[x:y]) <= 2 * (b - a) + 2:
+            out.append((r[a:b], h[x:y]))
+    return out
+
+
+def _layers():
+    packs_dir = Path(__file__).resolve().parent.parent / "packs"
+    return {"developer": _parse_glossary(packs_dir / "developer.txt"),
+            "user": [e for f in sorted((KOE / "packs").glob("*.txt")) if f.stem != "developer" for e in _parse_glossary(f)],
+            "org": _parse_glossary(KOE / "org_glossary.txt"), "personal": _parse_glossary(KOE / "glossary.txt")}
+
+
+def term_forms(a):
+    """試験セット（corpus）の準正解と、準正解を作ったときの turbo の出力（items.json の whisper_turbo）を突き合わせ、
+    「準正解の語 → 実際に出た形」を数える。whisper は回さない。辞書の語（どの層か）と、辞書にない普通の語の両方を拾う。
+    出力は語・形・回数だけ（発話の本文は書かない）。辞書の自動置き換えは辞書にある別名で当てたうえで比べる"""
+    from collections import Counter, defaultdict
+    layers = _layers()
+    entries = [e for es in layers.values() for e in es]
+    layer_of = {}
+    for name, es in layers.items():
+        for t, _ in es:
+            layer_of.setdefault(ke.normalize(t).lower(), name)
+    forms, seen = defaultdict(Counter), Counter()
+    clips = 0
+    for d in sorted((KOE / "corpus").iterdir()):
+        if not (d / "items.json").exists():
+            continue
+        for it in json.loads((d / "items.json").read_text())["items"]:
+            ref, hyp = it.get("reference"), it.get("whisper_turbo")
+            if not ref or hyp is None or it.get("unaligned"):
+                continue
+            clips += 1
+            import re
+            for w in set(re.findall(f"[{WORD_CHARS}]{{2,}}", ke.normalize(ref))):
+                seen[w.lower()] += 1
+            for w, f in miss_forms(ref, _autocorrect(hyp, entries)):
+                forms[w.lower()][f] += 1
+    rows = []
+    for w, c in forms.items():
+        n = sum(c.values())
+        if n < a.min:
+            continue
+        rows.append({"word": w, "layer": layer_of.get(w, "none"), "seen": seen.get(w, n), "missed": n, "forms": dict(c.most_common())})
+    rows.sort(key=lambda r: (-r["missed"], r["word"]))
+    out = Path(a.out) if a.out else KOE / "evals" / "term-forms.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps({"clips": clips, "rows": rows}, ensure_ascii=False, indent=1))
+    by = Counter(r["layer"] for r in rows)
+    print(f"区間 {clips} / 食い違いのあった語 {len(rows)}（" + "、".join(f"{k} {v}" for k, v in by.most_common()) + f"） -> {out}")
 
 
 def show(a):
@@ -440,7 +540,15 @@ def main():
     s.add_argument("--packs", default="developer")
     s.set_defaults(func=compare_corpus)
     s = sub.add_parser("compare-terms")
+    s.add_argument("--developer", help="開発者向けパックの代わりに使うファイル（別名を足す前後を比べる）")
+    s.add_argument("--extra-terms", help="採点だけに足す語のファイル（パックの書式。前後で同じ語を数える）")
+    s.add_argument("--forms", help="外れた語と実際に出た形を JSON で書き出す先（本文は書かない）")
+    s.add_argument("--sleep", type=float, default=0, help="1 区間ごとに休む秒数（ほかの作業と並べて薄く長く回すとき）")
     s.set_defaults(func=compare_terms)
+    s = sub.add_parser("term-forms")
+    s.add_argument("--min", type=int, default=1, help="この回数以上食い違った語だけ出す")
+    s.add_argument("-o", "--out", help="既定は ~/Library/Application Support/Koe/evals/term-forms.json")
+    s.set_defaults(func=term_forms)
     s = sub.add_parser("show")
     s.add_argument("file")
     s.set_defaults(func=show)

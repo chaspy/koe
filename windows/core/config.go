@@ -24,6 +24,7 @@ const ModelBaseURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/
 // Config is %APPDATA%\Koe\config.json. Missing keys keep the defaults.
 type Config struct {
 	Hotkey    string `json:"hotkey"`    // "ralt" | "rctrl"
+	Engine    string `json:"engine"`    // "whisper" (default) | "parakeet" (Parakeet-ja via sherpa-onnx, CPU)
 	PressMode string `json:"pressMode"` // "hold" (record while held) | "toggle" (tap to start, tap to stop)
 	Model     string `json:"model"`     // file name in the models dir, or an absolute path
 	ModelURL  string `json:"modelURL"`  // empty = ModelBaseURL + Model
@@ -58,6 +59,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Hotkey:          "ralt",
+		Engine:          EngineWhisper,
 		PressMode:       PressHold,
 		Model:           DefaultModel,
 		Language:        "ja",
@@ -94,6 +96,10 @@ func ParseConfig(data []byte) (Config, error) {
 	c.Hotkey = strings.ToLower(strings.TrimSpace(c.Hotkey))
 	if c.Hotkey != "ralt" && c.Hotkey != "rctrl" {
 		c.Hotkey = d.Hotkey
+	}
+	c.Engine = strings.ToLower(strings.TrimSpace(c.Engine))
+	if c.Engine != EngineParakeet {
+		c.Engine = EngineWhisper
 	}
 	c.PressMode = strings.ToLower(strings.TrimSpace(c.PressMode))
 	if c.PressMode != PressToggle {

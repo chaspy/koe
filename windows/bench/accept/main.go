@@ -11,7 +11,12 @@
 // only in -out, on the machine). Used by
 // .github/workflows/windows-bench.yml (suite: accept).
 //
+// -engine parakeet (Windows only) runs Parakeet-ja in this process as Koe does
+// with engine "parakeet": no prompt, no window, no retries, the same
+// autocorrect. -parakeet-archive unpacks the release archive first (timed).
+//
 //	go run ./bench/accept -server whisper-server.exe -model models/ggml-small-q5_1.bin -runs 3
+//	accept.exe -engine parakeet -parakeet-archive .cache/parakeet/<name>.tar.bz2 -sherpa-dll .cache/sherpa/sherpa-onnx-c-api.dll
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/chaspy/koe/windows/bench/internal/benchutil"
 	"github.com/chaspy/koe/windows/core"
@@ -39,6 +45,7 @@ type pass struct {
 }
 
 type result struct {
+	Engine               string  `json:"engine"` // "whisper" | "parakeet"
 	Model                string  `json:"model"`
 	Threads              int     `json:"threads"`
 	ID                   string  `json:"id"`
@@ -73,7 +80,19 @@ func main() {
 	ctxList := flag.String("audioctx", "auto", "comma-separated window policies: auto | 0 | frames | auto:MIN (auto with another minimum) | full<S (whole window under S seconds, else auto) | full<S+auto:MIN")
 	quiet := flag.Bool("quiet", false, "do not print transcripts (numbers only)")
 	promptList := flag.String("prompts", "koe", "comma-separated: koe (Koe's prompt with the default packs) | short (the default sentence only)")
+	engine := flag.String("engine", core.EngineWhisper, "whisper | parakeet (Windows only)")
+	parakeetDir := flag.String("parakeet-model", ".cache/models/"+core.ParakeetModelName, "parakeet: directory with model.int8.onnx and tokens.txt")
+	parakeetArchive := flag.String("parakeet-archive", "", "parakeet: release .tar.bz2 to unpack into -parakeet-model when it is not there yet")
+	sherpaDLL := flag.String("sherpa-dll", core.SherpaDLL, "parakeet: path to sherpa-onnx-c-api.dll (onnxruntime.dll next to it)")
 	flag.Parse()
+	parakeet := *engine == core.EngineParakeet
+	if !parakeet && *engine != core.EngineWhisper {
+		fail("unknown -engine " + *engine)
+	}
+	if parakeet {
+		// no prompt and no window: one mode is enough
+		*model, *promptList, *ctxList = core.ParakeetModelName, "koe", "auto"
+	}
 	if *model == "" {
 		fail("-model is required")
 	}
@@ -89,6 +108,9 @@ func main() {
 	cfg.Port = *port
 	if *threads <= 0 {
 		*threads = cfg.ThreadsFor(runtime.NumCPU())
+		if parakeet {
+			*threads = cfg.ParakeetThreads(runtime.NumCPU())
+		}
 	}
 	// Koe's prompt for a first utterance with no personal glossary
 	packs := core.LoadPackEntries(core.ListPacks(*packsDir), cfg.EnabledPacks)
@@ -118,7 +140,28 @@ func main() {
 	// like App.startServer: the Vulkan build first, kept only if it runs on a GPU
 	backend, fallback := "cpu", "off"
 	var stop func()
-	if *serverGPU != "" {
+	var asr core.Recognizer
+	if parakeet {
+		fallback = core.EngineParakeet
+		if !core.ParakeetReady(*parakeetDir) && *parakeetArchive != "" {
+			if err := core.CheckSHA256(*parakeetArchive, core.ParakeetModelSHA256); err != nil {
+				fail(err.Error())
+			}
+			t0 := time.Now()
+			if err := core.ExtractParakeet(*parakeetArchive, *parakeetDir); err != nil {
+				fail(err.Error())
+			}
+			fmt.Printf("parakeet_extract ms=%d\n", time.Since(t0).Milliseconds())
+		}
+		t0 := time.Now()
+		r, closeFn, err := newParakeet(*sherpaDLL, *parakeetDir, *threads)
+		if err != nil {
+			fail(err.Error())
+		}
+		fmt.Printf("parakeet_load ms=%d threads=%d\n", time.Since(t0).Milliseconds(), *threads)
+		asr, stop = r, closeFn
+	}
+	if *serverGPU != "" && !parakeet {
 		var probe core.GPUProbe
 		s, err := benchutil.StartServerLines(*serverGPU, core.ServerArgs(cfg, *model, *threads), filepath.Join(filepath.Dir(*out), "server-accept-vulkan.log"), probe.Line)
 		switch {
@@ -144,6 +187,9 @@ func main() {
 	}
 	defer stop()
 	base := core.BaseURL(*port)
+	if asr == nil {
+		asr = core.WhisperHTTP{BaseURL: base}
+	}
 	var ctxs []policy
 	for _, c := range strings.Split(*ctxList, ",") {
 		p, err := parsePolicy(strings.TrimSpace(c))
@@ -170,7 +216,7 @@ func main() {
 		clips[id] = clip{core.EncodeWAV(trimmed), core.Seconds(trimmed)}
 	}
 	// the first request after start is slower; not measured
-	_, _ = core.Transcribe(context.Background(), base, clips[ids[0]].wav, prompts[modes[0]], false, 0)
+	_, _ = asr.Recognize(context.Background(), clips[ids[0]].wav, prompts[modes[0]], false, 0)
 
 	// prompts alternate per utterance so a slow patch of the runner hits both
 	for run := 1; run <= *runs; run++ {
@@ -179,10 +225,10 @@ func main() {
 				for _, actx := range ctxs {
 					c := clips[id]
 					res := core.TranscribeUtterance(context.Background(), core.UtteranceRequest{
-						BaseURL: base, WAV: c.wav, Prompt: prompts[m], Voiced: c.voiced, Model: name,
+						BaseURL: base, Recognizer: asr, SingleShot: parakeet, WAV: c.wav, Prompt: prompts[m], Voiced: c.voiced, Model: name,
 						AudioCtx: cfg.AudioCtx, AudioCtxFor: actx.fn, Fallback: cfg.TemperatureFallback, Entries: packs,
 					})
-					r := result{Model: name, Threads: *threads, ID: id, Expected: expected[id], Backend: backend, GPUFallback: fallback, Prompt: m, AudioCtxSetting: actx.name, Seconds: core.Round2(c.voiced), Run: run,
+					r := result{Engine: *engine, Model: name, Threads: *threads, ID: id, Expected: expected[id], Backend: backend, GPUFallback: fallback, Prompt: m, AudioCtxSetting: actx.name, Seconds: core.Round2(c.voiced), Run: run,
 						MS: res.TotalMS, Outcome: res.Outcome, Text: res.Text,
 						RetriedForRepetition: res.RetriedForRepetition, RetriedWithoutPrompt: res.RetriedWithoutPrompt, RetriedForStock: res.RetriedForStock}
 					for _, p := range res.Passes {
