@@ -266,6 +266,28 @@ func TestLineFilter(t *testing.T) {
 	}
 }
 
+// The zip's settings section must not show what the user wrote in prompt and
+// the other private keys (same as the mac), only the length.
+func TestDiagnosticsHidesPrivateSettings(t *testing.T) {
+	cfg := []byte(`{"prompt":"社外秘の案件名です。","contextPrompt":true,"Prompt":"大文字のキー","glossaryPath":"C:\\Users\\taro\\g.txt","orgGlossary":"https://example.invalid/org.txt","improveCommand":"claude -p","oauthHeader":"Bearer x","language":"ja"}`)
+	lines, err := RedactedConfigLines(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(lines, "\n")
+	for _, leak := range []string{"社外秘", "大文字", "taro", "example.invalid", "claude", "Bearer"} {
+		if strings.Contains(joined, leak) {
+			t.Fatalf("private value %s leaked:\n%s", leak, joined)
+		}
+	}
+	for _, want := range []string{`prompt = "（10 文字・伏せた）"`, `contextPrompt = "（4 文字・伏せた）"`, `Prompt = "（6 文字・伏せた）"`,
+		`oauthHeader = "***"`, `language = "ja"`} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %s:\n%s", want, joined)
+		}
+	}
+}
+
 func TestDiagnosticsRedaction(t *testing.T) {
 	cfg := []byte(`{"hotkey":"rctrl","menuMaskKey":true,"apiKey":"abc","githubToken":"ghp_x","Password":"p","nested":{"clientSecret":"s","ok":1},"model":"m.bin","pressMode":"toggle"}`)
 	lines, err := RedactedConfigLines(cfg, "model", "pressMode")

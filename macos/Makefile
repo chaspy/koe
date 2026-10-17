@@ -54,10 +54,16 @@ test:
 	mkdir -p build
 	swiftc -O -o build/text-test Sources/Koe/Repeats.swift Tests/text/main.swift
 	./build/text-test
+	swiftc -O -o build/update-test Sources/Koe/UpdatePrompt.swift Tests/update/main.swift
+	./build/update-test
 	swiftc -O -o build/paste-test Sources/Koe/PasteTarget.swift Tests/paste/main.swift
 	./build/paste-test
 	swiftc -O -o build/history-test Sources/Koe/Retention.swift Tests/history/main.swift
 	./build/history-test
+	swiftc -O -o build/people-test Sources/Koe/People.swift Sources/Koe/AliasReplace.swift Tests/people/main.swift
+	./build/people-test
+	swiftc -O -o build/redaction-test Sources/Koe/Redaction.swift Tests/redaction/main.swift
+	./build/redaction-test
 
 clean:
 	rm -rf .build build

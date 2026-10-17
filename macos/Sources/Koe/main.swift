@@ -118,6 +118,8 @@ enum Settings {
     // 有効にする用語パック（packs/*.txt のファイル名）。既定は開発者向け
     // 共有の用語パックの取り込み元（gh:owner/repo/path か https の URL）
     static var packSources: [String] { defaults.stringArray(forKey: "packSources") ?? [] }
+    // 社員名簿（<ID><TAB><本名>）の取り込み元（gh:owner/repo/path か https の URL）。設定したときだけ改善ループに渡す（People.swift）
+    static var peopleSources: [String] { defaults.stringArray(forKey: "peopleSources") ?? [] }
     static var enabledPacks: [String] {
         get { defaults.stringArray(forKey: "enabledPacks") ?? ["developer"] }
         set { defaults.set(newValue, forKey: "enabledPacks") }
@@ -434,22 +436,7 @@ enum Glossary {
                 let dest = dir.appendingPathComponent(name)
                 if !force, let m = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.modificationDate] as? Date,
                    Date().timeIntervalSince(m) < 86400 { continue }
-                var data: Data?
-                if src.hasPrefix("gh:") {
-                    let parts = src.dropFirst(3).split(separator: "/", maxSplits: 2).map(String.init)
-                    guard parts.count == 3 else { continue }
-                    let p = Process()
-                    p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                    p.arguments = ["-lc", "gh api repos/\(parts[0])/\(parts[1])/contents/\(parts[2]) -H 'Accept: application/vnd.github.raw'"]
-                    let out = Pipe()
-                    p.standardOutput = out
-                    p.standardError = Pipe()
-                    try? p.run()
-                    p.waitUntilExit()
-                    if p.terminationStatus == 0 { data = out.fileHandleForReading.readDataToEndOfFile() }
-                } else if let url = URL(string: src) {
-                    data = try? Data(contentsOf: url)
-                }
+                let data = fetch(src)
                 // 中身がパックの形式（テキスト）であることだけ確かめて差し替える
                 if let d = data, let text = String(data: d, encoding: .utf8), !text.isEmpty, !text.hasPrefix("{") {
                     try? d.write(to: dest)
@@ -461,6 +448,27 @@ enum Glossary {
             DispatchQueue.main.async { exportForReceivers() }
         }
     }
+
+    // 取り込み元（gh:owner/repo/path は gh CLI で、https はそのまま）から中身を取る。失敗は nil
+    static func fetch(_ src: String) -> Data? {
+        if src.hasPrefix("gh:") {
+            let parts = src.dropFirst(3).split(separator: "/", maxSplits: 2).map(String.init)
+            guard parts.count == 3 else { return nil }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            p.arguments = ["-lc", "gh api repos/\(parts[0])/\(parts[1])/contents/\(parts[2]) -H 'Accept: application/vnd.github.raw'"]
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = Pipe()
+            guard (try? p.run()) != nil else { return nil }
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return p.terminationStatus == 0 ? data : nil
+        }
+        guard let url = URL(string: src) else { return nil }
+        return try? Data(contentsOf: url)
+    }
+
     static func ambiguous(_ aliases: [String]) -> [String] { aliases.filter { $0.hasPrefix("~") }.map { String($0.dropFirst()) } }
 
     private static var orgCacheURL: URL {
@@ -545,19 +553,14 @@ enum Glossary {
     // 置き換えた内容も返す（効き目の計測用。履歴に autocorrected として残す）
     static func autocorrectWithLog(_ text: String) -> (text: String, applied: [String]) {
         var applied: [String] = []
-        // 「マジ>(され|し|する)」のように > の後に続く語の条件を書いた別名は、その語が続くときだけ置き換える
+        // 「マジ>(され|し|する)」のように > の後に続く語の条件を書いた別名は、その語が続くときだけ置き換える（AliasReplace）
         let pairs = (personal + packs).flatMap { e in sure(e.aliases).filter { $0.count >= 2 && $0 != e.term }.map { ($0, e.term) } }
             .sorted { $0.0.count > $1.0.count }
         var t = text
-        for (wrong, right) in pairs where t.contains(String(wrong.split(separator: ">").first ?? "")) {
-            // 長いカタカナ語・英単語の一部（「フォールバック」の「フォール」等）は置き換えない
-            let parts = wrong.split(separator: ">", maxSplits: 1).map(String.init)
-            let follow = parts.count > 1 ? "(?=\(parts[1]))" : ""
-            let pattern = "(?<![\\p{Katakana}ーA-Za-z0-9])" + NSRegularExpression.escapedPattern(for: parts[0]) + "(?![\\p{Katakana}ーA-Za-z0-9])" + follow
-            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
-            let range = NSRange(t.startIndex..., in: t)
-            if re.numberOfMatches(in: t, range: range) > 0 { applied.append("\(parts[0])→\(right)") }
-            t = re.stringByReplacingMatches(in: t, range: range, withTemplate: NSRegularExpression.escapedTemplate(for: right))
+        for (wrong, right) in pairs {
+            let r = AliasReplace.apply(t, wrong: wrong, right: right)
+            if r.hit { applied.append("\(wrong.split(separator: ">").first ?? "")→\(right)") }
+            t = r.text
         }
         return (t, applied)
     }
@@ -572,6 +575,10 @@ enum Glossary {
     // 全部入りの版（常時は読み込まない。意味が取れない語があったときに受け取る側が grep する）
     static var receiverFullURL: URL {
         receiverURL.deletingPathExtension().appendingPathExtension("full.md")
+    }
+    // 社員の名前と呼び方の一覧（peopleSources を設定したときだけ）。分からない名前に出会ったときだけ引く
+    static var receiverPeopleURL: URL {
+        receiverURL.deletingLastPathComponent().appendingPathComponent("koe-people.md")
     }
     // 常時読み込む版は短くする（毎回の会話の文脈を食うため）。最近の発話に出た語を優先して上位だけ載せ、残りは全部入りの版へ
     static let receiverShortRows = 20
@@ -607,6 +614,13 @@ enum Glossary {
 
         var short = head
         short += "意味が取れない語があって下の一覧に無いときは、全部入りの一覧 `\(fullPath)` を grep してから読み替える（\(withAliases.count + orgRows.count) 語）。\n\n"
+        let people = PeopleStore.all
+        if !people.isEmpty {
+            let peoplePath = receiverPeopleURL.path.replacingOccurrences(of: FileManager.default.homeDirectoryForCurrentUser.path, with: "~")
+            short += "人の名前・呼び名が誰のことか分からないときは `\(peoplePath)` を grep する（社員の ID・本名と、分かった呼び方）。\n\n"
+            let k = PeopleStore.known()
+            try? People.receiverNote(people, called: k.called, wrongs: k.wrongs).write(to: receiverPeopleURL, atomically: true, encoding: .utf8)
+        }
         if !ranked.isEmpty { short += "## よく起きる誤変換（正しい表記 ← 化けた形）\n\n" + ranked.prefix(receiverShortRows).map(row).joined(separator: "\n") + "\n" }
         try? short.write(to: receiverURL, atomically: true, encoding: .utf8)
 
@@ -625,6 +639,64 @@ enum Glossary {
             let al = e.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }
             return al.isEmpty ? e.term : "\(e.term) ← \(al.joined(separator: "／"))"
         }.joined(separator: "\n")
+    }
+}
+
+// MARK: - People
+
+// 社員名簿（peopleSources）の取り込み・キャッシュと、改善ループで分かった呼び方の記録。判定は People.swift。
+// 名簿の中身はログ・診断情報に出さない（件数だけ）。whisper の初期プロンプト・LLM 整形には使わない
+enum PeopleStore {
+    private static var koeDir: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe")
+    }
+    private static var cacheDir: URL { koeDir.appendingPathComponent("people") }
+    // 改善ループで分かった呼び方・化けた形（{"called": {ID: [...]}, "wrongs": {ID: [...]}}）
+    private static var knownURL: URL { koeDir.appendingPathComponent("people_known.json") }
+
+    // 取り込んだ名簿（peopleSources が空なら空）
+    static var all: [People.Person] {
+        guard !Settings.peopleSources.isEmpty else { return [] }
+        var seen = Set<String>()
+        return Settings.peopleSources.flatMap { src in
+            People.parse((try? String(contentsOf: cacheDir.appendingPathComponent((src as NSString).lastPathComponent), encoding: .utf8)) ?? "")
+        }.filter { seen.insert($0.id.lowercased()).inserted }
+    }
+
+    // 1 日 1 回取り直す（パックと同じ口）。記録には件数だけ残し、取り込み元も中身も書かない
+    static func refresh(force: Bool = false) {
+        let sources = Settings.peopleSources
+        guard !sources.isEmpty else { return }
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        DispatchQueue.global(qos: .utility).async {
+            for src in sources {
+                let dest = cacheDir.appendingPathComponent((src as NSString).lastPathComponent)
+                if !force, let m = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.modificationDate] as? Date,
+                   Date().timeIntervalSince(m) < 86400 { continue }
+                if let d = Glossary.fetch(src), let text = String(data: d, encoding: .utf8), !text.hasPrefix("{"), !People.parse(text).isEmpty {
+                    try? d.write(to: dest)
+                    Events.log("people_synced", ["people": People.parse(text).count])
+                } else {
+                    Events.log("people_sync_failed")
+                }
+            }
+            DispatchQueue.main.async { Glossary.exportForReceivers() }
+        }
+    }
+
+    static func known() -> (called: [String: [String]], wrongs: [String: [String]]) {
+        let j = (try? JSONSerialization.jsonObject(with: Data(contentsOf: knownURL))) as? [String: [String: [String]]] ?? [:]
+        return (j["called"] ?? [:], j["wrongs"] ?? [:])
+    }
+
+    static func remember(called: [(who: String, called: String)], wrongs: [(who: String, wrong: String)]) {
+        guard !called.isEmpty || !wrongs.isEmpty else { return }
+        var (c, w) = known()
+        for x in called where !(c[x.who] ?? []).contains(x.called) { c[x.who, default: []].append(x.called) }
+        for x in wrongs where !(w[x.who] ?? []).contains(x.wrong) { w[x.who, default: []].append(x.wrong) }
+        if let data = try? JSONSerialization.data(withJSONObject: ["called": c, "wrongs": w], options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: knownURL)
+        }
     }
 }
 
@@ -1464,6 +1536,7 @@ final class Improver {
     func runIfNeeded(force: Bool = false) {
         guard Settings.improveEnabled, !running else { return }
         if Settings.improveProvider == "api" && Settings.improveEndpoint.isEmpty { return }
+        PeopleStore.refresh()  // 起動しっぱなしでも 1 日 1 回は取り直す（新しければ何もしない）
         var items = unscanned()
         var judgeOnly = false
         if !(force ? !items.isEmpty : items.count >= Settings.improveBatch) {
@@ -1498,11 +1571,15 @@ final class Improver {
         let humans = SessionLog.load(since: (times.min() ?? Date()).addingTimeInterval(-3600))
         var lines: [String] = []
         var replyOwner: [String: Int] = [:]
+        // 人の名前を辞書に足すかの判定（People.judge）に使う、発話ごとの文字起こしと前後
+        var transcripts: [Int: String] = [:], contexts: [Int: String] = [:]
         for (i, (_, r)) in items.enumerated() {
             let raw = r["raw"] as? String ?? ""
+            transcripts[i] = raw
             var line = "[\(i)] 文字起こし: \(raw)"
             if let t = (r["id"] as? String).flatMap({ Improver.idFormat.date(from: $0) }),
                let h = SessionLog.match(r["pasted"] as? String ?? raw, at: t, in: humans) {
+                contexts[i] = [h.text, h.reply, h.next].joined(separator: "\n")
                 if SessionLog.normalize(h.text) != SessionLog.normalize(raw) { line += "\n  実際に送った文: \(h.text.prefix(300))" }
                 if h.reply.isEmpty {
                     line += "\n  Claude の返答: （なし。次の発話が先に入った）"
@@ -1519,8 +1596,12 @@ final class Improver {
             lines.append(line)
         }
         let known = (Glossary.personal + Glossary.org).map(\.term).prefix(400).joined(separator: "、")
-        let system = Improver.prompt
-        let user = "既に辞書にある語: \(known)\n\n" + lines.joined(separator: "\n\n")
+        // 社員名簿（peopleSources を設定したときだけ）は毎回全員分を渡す。人の名前の化けを、名簿の誰かに結びつけるため
+        let people = PeopleStore.all
+        let system = Improver.prompt + (people.isEmpty ? "" : Improver.peoplePrompt)
+        var user = "既に辞書にある語: \(known)\n\n"
+        if !people.isEmpty { user += "社員名簿（ID<TAB>本名、\(people.count) 人）:\n\(People.promptBlock(people))\n\n" }
+        user += lines.joined(separator: "\n\n")
         func ask() throws -> [String: Any] {
             let content = Settings.improveProvider == "api"
                 ? try LLM.chat(endpoint: Settings.improveEndpoint, model: Settings.improveModel, auth: Settings.improveAuth(),
@@ -1569,7 +1650,15 @@ final class Improver {
         }
         // 語を候補に積み、条件を満たしたら個人の辞書へ（判定のやり直しでは、語は前回数えたので数えない）
         if judgeOnly { return "判定のやり直し \(items.count) 件（判定 \(judged)、伝わらなかった \(failed)）" }
-        let added = mergeTerms(json["terms"] as? [[String: Any]] ?? [])
+        let added = mergeTerms(json["terms"] as? [[String: Any]] ?? [], people: people, transcripts: transcripts, contexts: contexts)
+        if !people.isEmpty {
+            let called = (json["people"] as? [[String: Any]] ?? []).compactMap { x -> (who: String, called: String)? in
+                guard let c = x["called"] as? String, let w = x["who"] as? String, let i = x["i"] as? Int, let t = transcripts[i] else { return nil }
+                return People.judgeCalled(.init(called: c, who: w, confidence: x["confidence"] as? String, transcript: t), people: people)
+            }
+            PeopleStore.remember(called: called, wrongs: [])
+            if !called.isEmpty { Glossary.exportForReceivers() }
+        }
         return "\(items.count) 件を処理（判定 \(judged)、伝わらなかった \(failed)）。辞書に追加: \(added.isEmpty ? "なし" : added.joined(separator: "、"))"
     }
 
@@ -1597,11 +1686,35 @@ final class Improver {
         return true
     }
 
-    private func mergeTerms(_ terms: [[String: Any]]) -> [String] {
+    private func mergeTerms(_ terms: [[String: Any]], people: [People.Person] = [], transcripts: [Int: String] = [:],
+                            contexts: [Int: String] = [:]) -> [String] {
         let candURL = koeDir.appendingPathComponent("glossary_candidates.json")
         var cand = (try? JSONSerialization.jsonObject(with: Data(contentsOf: candURL))) as? [String: [String: Any]] ?? [:]
         var promote: [String: [String]] = [:]
-        for t in terms {
+        var learned: [(who: String, called: String)] = [], learnedWrongs: [(who: String, wrong: String)] = []
+        let knownCalled = people.isEmpty ? [:] : PeopleStore.known().called
+        for var t in terms {
+            // 近い読みの形は People.judge の守りを通したものだけ使う（人の名前でない語に付いてきたものは捨てる）
+            let raw = t.removeValue(forKey: "variants") as? [String] ?? []
+            // 人の名前・呼び名（名簿にある名前を kind: "term" で返したものも）は、文字起こしと前後から確かなときだけ足す（People.judge）
+            if t["kind"] as? String == "person" || People.isPersonName(t["right"] as? String ?? "", people) {
+                let wrong = t["wrong"] as? String ?? ""
+                let core = People.splitHonorific(wrong).core
+                // 発話の番号が無い・合わないときは、化けた形を含む発話を探す
+                let i = (t["i"] as? Int).flatMap { transcripts[$0]?.contains(core) == true ? $0 : nil }
+                    ?? transcripts.keys.sorted().first { !core.isEmpty && transcripts[$0]!.contains(core) }
+                let d = People.judge(.init(wrong: wrong, right: t["right"] as? String ?? "", who: t["who"] as? String,
+                                           explicit: t["explicit"] as? Bool == true, confidence: t["confidence"] as? String,
+                                           transcript: i.flatMap { transcripts[$0] } ?? "", context: i.flatMap { contexts[$0] } ?? "",
+                                           variants: raw),
+                                     people: people, knownCalled: knownCalled)
+                guard case .add(let a) = d else { continue }
+                t = ["wrong": a.alias, "right": a.term, "kind": "person", "explicit": t["explicit"] as? Bool == true, "variants": a.variants]
+                if let who = a.who {
+                    learned.append((who, a.called))
+                    learnedWrongs += ([a.alias] + a.variants).map { (who, $0.replacingOccurrences(of: ">", with: "")) }
+                }
+            }
             guard let right = (t["right"] as? String)?.trimmingCharacters(in: .whitespaces), (2...30).contains(right.count),
                   let wrong = (t["wrong"] as? String)?.trimmingCharacters(in: .whitespaces), !wrong.isEmpty, wrong != right,
                   // 語ではなく文・注記になっているもの（「(聞き取り不能)」「〜、〜のやつ」）は辞書に入れない
@@ -1612,19 +1725,28 @@ final class Improver {
             if t["kind"] as? String == "person" { c["person"] = true }
             c["count"] = (c["count"] as? Int ?? 0) + 1
             var wrongs = c["wrongs"] as? [String] ?? []
-            if !wrongs.contains(wrong) { wrongs.append(wrong) }
+            // 人の名前は、近い読みの形（People.judge が守りを通したもの）も一緒に別名にする
+            for w in [wrong] + (t["variants"] as? [String] ?? []) where !wrongs.contains(w) { wrongs.append(w) }
             c["wrongs"] = wrongs
             if t["explicit"] as? Bool == true { c["explicit"] = true }
             cand[right] = c
-            // 本人が正しい表記を示した語は確かな置き換え、回数だけで上げた語は「~」（受け取る AI へのメモだけ。勝手に置き換えない）
+            // 本人が正しい表記を示した語は確かな置き換え、回数だけで上げた語は「~」（受け取る AI へのメモだけ。勝手に置き換えない）。
             let sure = c["explicit"] as? Bool == true
+            // 人の名前で「化けた形>敬称」の別名は、敬称が続くときだけ置き換わる（「パン粉を買う」は変わらない）ので、
+            // 確かに検出した 1 回目で辞書に上げて置き換えてよい（出現が少ない名前は 2 回を待つと覚えきれない。IMP-8）
+            let anchored = c["person"] as? Bool == true && wrongs.allSatisfy { $0.contains(">") }
             // ひらがな・漢字だけの形（「かぶる」等）や 3 文字以下は普通の言葉と重なりやすいので、明示されても勝手に置き換えない
             func common(_ w: String) -> Bool {
                 w.count <= 3 || !w.unicodeScalars.contains { (0x30A0...0x30FF).contains($0.value) || CharacterSet.letters.contains($0) && $0.isASCII }
             }
-            if (c["count"] as? Int ?? 0) >= 2 || sure { promote[right] = wrongs.map { sure && !common($0) ? $0 : "~" + $0 } }
+            // 人の名前の、敬称の条件が無い別名は置き換えない（受け取る AI へのメモだけ）
+            let person = c["person"] as? Bool == true
+            if (c["count"] as? Int ?? 0) >= 2 || sure || anchored {
+                promote[right] = wrongs.map { (sure || anchored) && !common($0) && (!person || $0.contains(">")) ? $0 : "~" + $0 }
+            }
         }
         if let data = try? JSONSerialization.data(withJSONObject: cand, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: candURL) }
+        PeopleStore.remember(called: learned, wrongs: learnedWrongs)
         guard !promote.isEmpty else { return [] }
         // 個人の辞書を更新（既にある語は別名を足す。上限 300 語。whisper に渡すのは最近使った語だけなので、辞書は大きくてよい）
         let path = (Settings.glossaryPath as NSString).expandingTildeInPath
@@ -1654,6 +1776,10 @@ final class Improver {
        - 技術用語・英字略語・サービス名・社内用語・プロダクト名、人の名前・呼び名（ハンドル名・あだ名）が対象
        - 1 つの語だけ。句や言い回し（「〜の〜」「〜を〜する」）、普通の日本語の言葉（「遅延」「返事不要」等）、文の一部は出さない
        - 人の名前・呼び名には kind: "person"、それ以外は kind: "term" を付ける（人の名前は本人の Mac の個人の辞書にだけ入り、共有されない）
+       - 人の名前は、普通の言葉と取り違えやすい（「パン粉を買う」の「パン粉」は人ではない）。「〜さん」などの敬称が付き、前後に人とのやりとり（Slack・レビュー・PR・会議など）がある場合だけ出す。wrong は敬称つきで書く（例: "パン粉さん"）
+       - 人の名前の right は、本人が言った呼び方の正しい表記にする。わざと言ったあだ名・ハンドル名を本名に書き換えない
+       - 人の名前の term には、同じ名前が化けそうな近い読みの形を variants に最大 5 つ付ける（例: right が "panko" で wrong が "パン粉さん" なら ["パンコ", "パンコア", "バンコ"]）。敬称は付けない。正しい表記そのもの・その人のほかの正しい呼び方やあだ名は入れない。思いつかなければ空の配列
+       - 各 term に、その語が出てきた発話の番号 i と、確度 confidence（"high" / "medium" / "low"）を付ける。人の名前は "high" のときだけ辞書に入る
        - wrong は文字起こしに実際に含まれる文字列。right は正しい表記（2〜30 文字）
        - 本人の次の発話や送った文の手直しで正しい表記が明示されているか、Claude が「〜と読みました」「〜のことですか？」と読み替えて本人が否定していなければ explicit: true
        - 確信がなければ出さない。既に辞書にある語でも、新しい誤変換の形が見つかれば出す
@@ -1669,7 +1795,18 @@ final class Improver {
        - reason は 30 文字以内。発話の本文は写さない
        - judgements は、すべての発話 [0]〜[最後] について 1 件ずつ必ず出す（terms が空でも省かない）
 
-    {"terms": [{"wrong": "...", "right": "...", "kind": "term", "explicit": false}], "judgements": [{"i": 0, "error": false, "read_ok": true, "impact": null, "unknown": false, "reason": "..."}]}
+    {"terms": [{"i": 0, "wrong": "...", "right": "...", "kind": "term", "explicit": false, "confidence": "high"}, {"i": 1, "wrong": "...さん", "right": "...", "kind": "person", "explicit": false, "confidence": "high", "variants": ["...", "..."]}], "judgements": [{"i": 0, "error": false, "read_ok": true, "impact": null, "unknown": false, "reason": "..."}]}
+    """
+
+    // 社員名簿を渡すときだけ足す指示
+    static let peoplePrompt = """
+
+    社員名簿（ID<TAB>本名）も渡します。人の名前・呼び名については次も答えてください。
+    - terms の kind: "person" には、名簿の誰のことかを who に ID で書く（分からなければ who を付けない）。音の近い ID・本名・呼び方から判断する
+    - 3. people: 化けずに正しく文字になった呼び方・あだ名が、名簿の誰のことか確かに分かるとき（例: 「〜さん」に Slack・レビュー・PR の話が続く）だけ、{"i": 発話の番号, "called": "呼び方（敬称なし）", "who": "ID", "confidence": "high"} を出す。あだ名を本名に書き換えない
+    - 名簿に無い人や、人の名前か普通の言葉か迷う語は出さない
+
+    terms の kind: "person" には "who": "ID" を足し、返す JSON に "people": [{"i": 0, "called": "...", "who": "...", "confidence": "high"}] を足す（無ければ空の配列）。
     """
 }
 
@@ -1758,6 +1895,7 @@ enum ConfigImport {
         ("hotkeyKeyCode", "ホットキー"), ("language", "言語"),
         ("packFiles", "取り込む用語パック"), ("enabledPacks", "有効にする用語パック"),
         ("packSources", "共有の用語パックの取り込み元（gh:… / https:…）"),
+        ("peopleSources", "社員名簿の取り込み元（gh:… / https:…。改善ループに渡す）"),
     ]
 
     static func run() {
@@ -1832,6 +1970,7 @@ enum ConfigImport {
         for (k, v) in cfg { UserDefaults.standard.set(v, forKey: k) }
         Glossary.refreshOrgIfNeeded()
         Glossary.refreshPackSources(force: true)
+        PeopleStore.refresh(force: true)
         Glossary.exportForReceivers()
         Events.log("config_imported", ["keys": cfg.keys.sorted().joined(separator: ",")])
     }
@@ -1985,26 +2124,6 @@ enum Events {
 // 送ってもらう用の診断情報。版・機種・設定・動作の記録・速さ・whisper のログをまとめる。
 // 文字起こしの本文・録音・辞書の中身は入れない（設定の秘密の値と、語や本文が入りうる欄は伏せる）
 enum Diagnostics {
-    static let secretWords = ["key", "token", "secret", "password", "auth"]
-    // 値に語・本文・個人の情報が入りうる設定
-    static let privateKeys: Set<String> = ["prompt", "contextPrompt", "improveCommand", "improveTokenCommand", "llmPrompt", "glossaryPath", "orgGlossary"]
-    // 動作の記録で、語や本文が入りうる欄
-    static let privateEventFields: Set<String> = ["summary", "text", "raw", "pasted", "added", "terms", "error"]
-
-    static func redactSetting(_ key: String, _ value: Any) -> String {
-        let k = key.lowercased()
-        if secretWords.contains(where: { k.contains($0) }) { return "***" }
-        if privateKeys.contains(key) { return "（\(String(describing: value).count) 文字・伏せた）" }
-        return String(describing: value).replacingOccurrences(of: "\n", with: " ")
-    }
-
-    static func redactEvent(_ line: String) -> String? {
-        guard var e = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any] else { return nil }
-        for f in privateEventFields where e[f] != nil { e[f] = "（伏せた）" }
-        guard let d = try? JSONSerialization.data(withJSONObject: e, options: [.sortedKeys]) else { return nil }
-        return String(data: d, encoding: .utf8)
-    }
-
     static func sh(_ cmd: String) -> String {
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", cmd]
         let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
@@ -2034,7 +2153,7 @@ enum Diagnostics {
         lines.append("")
         lines.append("## 設定（秘密の値・本文が入りうる値は伏せた）")
         let dom = UserDefaults.standard.persistentDomain(forName: Bundle.main.bundleIdentifier ?? "io.github.chaspy.koe") ?? [:]
-        for k in dom.keys.sorted() where !k.hasPrefix("NS") { lines.append("- \(k) = \(redactSetting(k, dom[k]!))") }
+        for k in dom.keys.sorted() where !k.hasPrefix("NS") { lines.append("- \(k) = \(Redaction.redactSetting(k, dom[k]!))") }
         lines.append("")
         let keep = Settings.historyKeepDays
         let hu = Retention.usage(History.dir)
@@ -2043,7 +2162,7 @@ enum Diagnostics {
         lines.append(String(format: "大きさ: %.1f MB・%d ファイル・いちばん古い日 %@", Double(hu.bytes) / 1_048_576, hu.files, hu.oldest ?? "なし"))
         lines.append("")
         lines.append("## 辞書の大きさ（中身は入れない）")
-        lines.append("個人の辞書 \(Glossary.personal.count) 語 / パック \(Glossary.packs.count) 語 / 組織の辞書 \(Glossary.org.count) 語")
+        lines.append("個人の辞書 \(Glossary.personal.count) 語 / パック \(Glossary.packs.count) 語 / 組織の辞書 \(Glossary.org.count) 語 / 社員名簿 \(PeopleStore.all.count) 人")
         lines.append("")
         lines.append("## 直近 300 回の速さと結果（数字だけ）")
         lines.append("id\tapp\taudio_s\tvoiced_s\ttranscribe_ms\trelease_to_paste_ms\tload1\tpeak\tlevel_db\tpasted\tcommunication\timpact")
@@ -2056,7 +2175,7 @@ enum Diagnostics {
         try lines.joined(separator: "\n").write(to: work.appendingPathComponent("diagnostics.txt"), atomically: true, encoding: .utf8)
         // 動作の記録（直近 3000 行。語・本文が入りうる欄は伏せる）
         if let ev = try? String(contentsOf: koeDir.appendingPathComponent("events.jsonl"), encoding: .utf8) {
-            let tail = ev.split(separator: "\n").suffix(3000).compactMap { redactEvent(String($0)) }
+            let tail = ev.split(separator: "\n").suffix(3000).compactMap { Redaction.redactEvent(String($0)) }
             try tail.joined(separator: "\n").write(to: work.appendingPathComponent("events.jsonl"), atomically: true, encoding: .utf8)
         }
         // whisper のログ（末尾 500 行。音声認識の結果の文は whisper-server のログには出さない設定）
@@ -2116,6 +2235,17 @@ enum Updater {
                   let dmg = URL(string: "https://github.com/\(repo)/releases/download/v\(v)/Koe-\(v).dmg"),
                   let page = URL(string: "https://github.com/\(repo)/releases/tag/v\(v)") else { return done(nil) }
             done(Release(version: v, dmg: dmg, page: page))
+        }.resume()
+    }
+
+    // その版の CHANGELOG（タグの CHANGELOG.md。API は使わない）から macOS の最初の項目を 1 行で取る
+    static func summary(_ r: Release, done: @escaping ((line: String?, noChanges: Bool)) -> Void) {
+        guard let url = URL(string: "https://raw.githubusercontent.com/\(repo)/v\(r.version)/CHANGELOG.md") else { return done((nil, false)) }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 20
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            guard (resp as? HTTPURLResponse)?.statusCode == 200, let data, let md = String(data: data, encoding: .utf8) else { return done((nil, false)) }
+            done(UpdatePrompt.summary(changelog: md, version: r.version, platform: "macOS"))
         }.resume()
     }
 
@@ -2202,6 +2332,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateItem: NSMenuItem!
     private var lockItem: NSMenuItem!
     private var availableUpdate: Updater.Release?
+    // 了承型の更新通知（UpdatePrompt）
+    private var lastUsedAt: Date?                 // 最後に押した / 貼った時刻
+    private var updateSnoozedUntil: Date?         // 「あとで」から 24 時間（この起動中だけ）
+    private var updateSummary: (version: String, line: String?, noChanges: Bool)?
+    private var updatePromptTimer: Timer?
+    private var updateAlert: NSAlert?
     private var packMenu: NSMenu!
     private var recentMenu: NSMenu!
     private var clipboardItem: NSMenuItem!
@@ -2257,6 +2393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Glossary.refreshOrgIfNeeded()
         Glossary.exportForReceivers()
         Glossary.refreshPackSources()
+        PeopleStore.refresh()
         improver.onFinish = { _ in self.render() }
 
         prepareModelThenStart()
@@ -2448,6 +2585,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         let u = Utterance(app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        lastUsedAt = Date()
         // 押した瞬間に whisper-server が生きているかを見る。止まっていたら、話している間に起こし直しておく
         server.isAlive { alive in
             guard !alive else { return }
@@ -2838,6 +2976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func finish(_ u: Utterance, pasted: String?) {
+        lastUsedAt = Date()
         if let text = pasted {
             Glossary.refreshUsage(ifOlderThan: 300)
             recentByApp[u.record["app"] as? String ?? ""] = (Date(), text)
@@ -3131,7 +3270,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             let a = NSAlert()
             a.messageText = "改善ループをオンにしますか？"
-            a.informativeText = "発話の文字起こしと、Claude Code のセッション記録の該当部分（送った文・返答・次の発話）を、次の送り先に送って辞書を育てます。\n\n送り先: \(Settings.improveTarget)"
+            let people = PeopleStore.all.count
+            a.informativeText = "発話の文字起こしと、Claude Code のセッション記録の該当部分（送った文・返答・次の発話）を、次の送り先に送って辞書を育てます。"
+                + (people > 0 ? "社員名簿（peopleSources、\(people) 人の ID と本名）も毎回送ります。" : "")
+                + "\n\n送り先: \(Settings.improveTarget)"
             a.addButton(withTitle: "オンにする")
             a.addButton(withTitle: "やめる")
             NSApp.activate(ignoringOtherApps: true)
@@ -3352,6 +3494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateItem.title = "新しい版 v\(r.version) があります（クリックで更新）"
                     self.updateItem.isHidden = false
                     Events.log("update_available", ["version": r.version])
+                    self.prepareUpdatePrompt(r)
                 } else if manual {
                     self.showError("最新です（v\(Updater.current)）")
                 }
@@ -3360,6 +3503,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func checkUpdateNow() { checkUpdate(manual: true) }
+
+    // 新しい版の 1 行の要約を取り、落ち着いたときに聞く（15 秒ごとに見る）
+    private func prepareUpdatePrompt(_ r: Updater.Release) {
+        if updateSummary?.version != r.version {
+            Updater.summary(r) { s in
+                DispatchQueue.main.async { self.updateSummary = (r.version, s.line, s.noChanges) }
+            }
+        }
+        guard updatePromptTimer == nil else { return }
+        updatePromptTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.maybePromptUpdate() }
+    }
+
+    private func maybePromptUpdate() {
+        guard updateAlert == nil, let r = availableUpdate, let sum = updateSummary, sum.version == r.version else { return }
+        let busy = current != nil || transcribing > 0 || cleaning > 0
+        guard UpdatePrompt.shouldPrompt(now: Date(), available: r.version, busy: busy, lastUsed: lastUsedAt,
+                                        snoozedUntil: updateSnoozedUntil, noChanges: sum.noChanges) else { return }
+        // 同じ版は 24 時間（この起動中）もう聞かない。答えなくても同じ
+        updateSnoozedUntil = Date().addingTimeInterval(UpdatePrompt.snooze)
+        Events.log("update_prompt", ["version": r.version])
+        // モーダルにしない（開いている間も右⌘で話せるように）。フォーカスも奪わない（打っている文字や Enter を吸わない）
+        let a = UpdatePrompt.makeAlert(version: r.version, line: sum.line, target: self,
+                                       now: #selector(updatePromptNow), later: #selector(updatePromptLater))
+        a.window.center()
+        updateAlert = a
+        a.window.orderFrontRegardless()
+    }
+
+    @objc private func updatePromptNow() {
+        updateAlert?.window.orderOut(nil)
+        updateAlert = nil
+        Events.log("update_prompt_answer", ["answer": "now"])
+        installUpdate()
+    }
+
+    @objc private func updatePromptLater() {
+        updateAlert?.window.orderOut(nil)
+        updateAlert = nil
+        Events.log("update_prompt_answer", ["answer": "later"])
+    }
 
     @objc private func installUpdate() {
         guard let r = availableUpdate else { return }

@@ -9,7 +9,7 @@
   koe_eval.py pending                     # 正解も下書きもない発話を JSON で出す
   koe_eval.py unscanned                   # 用語辞書の更新にまだ使っていない発話を JSON で出す
   koe_eval.py mark-scanned <id>... | --all  # 用語辞書の更新に使った印を付ける
-  koe_eval.py misses [--days N]           # 貼られなかった押下（取りこぼし）を理由別に数える
+  koe_eval.py misses [--days N]           # 貼られなかった押下（取りこぼし）を理由別に数える（成功率は daily の①と同じ定義）
   koe_eval.py context [<id>...]           # Claude Code のセッション記録から、送信文・返答・次の発話を引く
   koe_eval.py set-comm <id> understood|corrected|unclear [--note "..."]
                                           # Claude に意図が通じたか（伝達）を記録する
@@ -310,37 +310,81 @@ def cmd_context(a):
     print(json.dumps(out, ensure_ascii=False, indent=1))
 
 
-def cmd_misses(a):
-    from collections import Counter
+# ① 入力された の失敗として数える events.jsonl の outcome（daily / misses / trend で共通）。
+# tracks・mic_restarted・enter_scheduled などは押下の結果ではない記録なので数えない
+PRESS_FAILS = ("no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press",
+               "no_accessibility", "target_changed", "paste_failed")
+
+
+def _is_press_fail(e):
+    o = e.get("outcome")
+    if o in PRESS_FAILS:
+        return True
+    # 1 秒以上押してから別のキーで取り消したもの（マウス操作と押し間違いは除く）
+    return o == "cancelled" and e.get("reason") != "mouse" and (e.get("hold_seconds") or 0) >= 1.0
+
+
+def _load_events(since):
+    """events.jsonl のうち since（aware）以降を、ローカル時刻の _t を付けて返す"""
     path = HISTORY.parent / "events.jsonl"
-    if not path.exists():
-        sys.exit("events.jsonl がありません")
-    since = datetime.now(timezone.utc) - timedelta(days=a.days)
     events = []
-    for line in path.read_text().splitlines():
+    for line in (path.read_text().splitlines() if path.exists() else []):
         try:
             e = json.loads(line)
-            e["_t"] = datetime.fromisoformat(e["t"].replace("Z", "+00:00"))
+            e["_t"] = datetime.fromisoformat(e["t"].replace("Z", "+00:00")).astimezone()
         except (json.JSONDecodeError, KeyError, ValueError):
             continue
         if e["_t"] >= since:
             events.append(e)
-    c = Counter(e["outcome"] for e in events)
+    return events
+
+
+def _press_counts(since, events=None):
+    """① 入力された を日ごとに数える。分子 ok = 履歴で貼れた（pasted か locked）発話、
+    分母 = ok + 失敗（_is_press_fail の押下）。fails[日付] は失敗の理由別の件数"""
+    from collections import Counter, defaultdict
+    day, fails = defaultdict(Counter), defaultdict(Counter)
+    for e in (_load_events(since) if events is None else events):
+        if _is_press_fail(e):
+            d = e["_t"].strftime("%m/%d")
+            day[d]["fail"] += 1
+            fails[d][e["outcome"]] += 1
+    for r in load_records():
+        t = _record_time(r).astimezone()
+        if t < since:
+            continue
+        if r.get("pasted") or r.get("locked"):
+            day[t.strftime("%m/%d")]["ok"] += 1
+    return day, fails
+
+
+def cmd_misses(a):
+    from collections import Counter
+    if not (HISTORY.parent / "events.jsonl").exists():
+        sys.exit("events.jsonl がありません")
+    since = (datetime.now() - timedelta(days=a.days)).astimezone()
+    events = _load_events(since)
+    day, fails = _press_counts(since, events)
+    c = sum(fails.values(), Counter())
     for k, v in c.most_common():
         print(f"  {k:<16} {v}")
-    total = sum(v for k, v in c.items() if k not in ("mic_restarted", "too_short"))
-    pasted = c.get("pasted", 0)
+    ok = sum(v["ok"] for v in day.values())
+    total = ok + sum(c.values())
     if total:
-        print(f"\n  貼り付け成功率 {pasted / total:.0%}（{pasted}/{total}、too_short と誤操作の取り消しは除く）")
+        print(f"\n  貼り付け成功率 {ok / total:.1%}（{ok}/{total}、日次レポートの①入力された と同じ数え方）")
+        for d in sorted(day):
+            n = day[d]["ok"] + day[d]["fail"]
+            print(f"    {d}  {day[d]['ok'] / n:.1%}（{day[d]['ok']}/{n}）" if n else f"    {d}  -")
+        print(f"  ※ {since:%m/%d %H:%M} 以降を集計（その日は途中から）")
     # 失敗のあと 30 秒以内に貼れていれば「言い直して復帰」とみなす
-    fails = [e for e in events if e["outcome"] in ("no_voice", "mic_silent", "hallucination", "error", "cancelled")]
+    failed = [e for e in events if _is_press_fail(e)]
     lost = recovered = 0
-    for f in fails:
-        if any(e["outcome"] == "pasted" and timedelta(0) < e["_t"] - f["_t"] <= timedelta(seconds=30) for e in events):
+    for f in failed:
+        if any(e.get("outcome") == "pasted" and timedelta(0) < e["_t"] - f["_t"] <= timedelta(seconds=30) for e in events):
             recovered += 1
         lost += f.get("est_lost_chars", 0)
-    if fails:
-        print(f"  失敗 {len(fails)} 件のうち 30 秒以内に言い直して復帰 {recovered} 件 / 推定ロス {lost} 文字（記録のある分のみ）")
+    if failed:
+        print(f"  失敗 {len(failed)} 件のうち 30 秒以内に言い直して復帰 {recovered} 件 / 推定ロス {lost} 文字（記録のある分のみ）")
 
 
 COMM = ("understood", "corrected", "unclear")
@@ -400,17 +444,47 @@ def cmd_perf(a):
         rate = [r["transcribe_ms"] / max(r.get("voiced_seconds") or r.get("audio_seconds") or 1, 0.5) for r in rs]
         print(f"  {d[5:]}  {len(rs):>5}  {fmt(e2e):>22}  {fmt(stop):>13}  {fmt(tr):>13}  {st.median(rate):>6.0f}")
     timed = [r for r in recs if r.get("release_to_paste_ms")]
-    if timed:
-        print("\n  条件別（離して→貼る、中央/p90 ms）")
-        groups = {
-            "Mac の負荷 < 8": [r for r in timed if (r.get("load1") or 0) < 8],
-            "Mac の負荷 >= 8": [r for r in timed if (r.get("load1") or 0) >= 8],
-            "改善ループが裏で動いていた": [r for r in timed if r.get("improve_running")],
-        }
-        for k, rs in groups.items():
-            print(f"  {k:<16} {len(rs):>4} 件  {fmt([r['release_to_paste_ms'] for r in rs])}")
-    else:
+    if not timed:
         print("\n  離して→貼るの計測は、計測を入れた版から記録される")
+        return
+    print("\n  段階別・条件別（中央/p90 ms）。その他 = 離して→貼る から 録り足し・プロンプト・文字起こし を引いた残り（後処理と待ち）")
+    print("  件数    離して→貼る       録り足し     プロンプト     文字起こし         その他  条件")
+    for k, rs in _perf_groups(timed, load_records()):
+        st_ = [_perf_stages(r) for r in rs]
+        cols = [fmt([s[c] for s in st_ if s[c] is not None]) for c in ("e2e", "stop", "prompt", "transcribe", "other")]
+        print(f"  {len(rs):>4}  " + "  ".join(f"{c:>13}" for c in cols) + f"  {k}")
+    print("  ※ プロンプトは 10/15 の版から記録（それより前はその他に含まれる）。⌘V を送ってから画面に出るまでと、Enter までの待ち（events の enter_scheduled）は含まない")
+
+
+def _perf_stages(r):
+    """離して→貼る（e2e）を、録り足し・プロンプト作り・文字起こし・その他（後処理と待ち）に分ける。記録の無い段階は None"""
+    e2e, tr = r.get("release_to_paste_ms"), r.get("transcribe_ms")
+    stop, prompt = r.get("stop_ms"), r.get("prompt_ms")
+    other = None
+    if e2e is not None and tr is not None and stop is not None:
+        other = e2e - stop - (prompt or 0) - tr
+    return {"e2e": e2e, "stop": stop, "prompt": prompt, "transcribe": tr, "other": other}
+
+
+def _perf_groups(timed, all_recs):
+    """条件別の行: 全体、Mac の負荷（load1）3 区分、前の発話からの間隔、改善ループ、発話の長さ"""
+    prev, last = {}, None
+    for r in sorted(all_recs, key=lambda r: r["id"]):
+        t = _record_time(r)
+        if last is not None:
+            prev[r["id"]] = (t - last).total_seconds()
+        last = t
+    load = lambda r: r.get("load1") or 0
+    return [
+        ("全体", timed),
+        ("Mac の負荷 < 8", [r for r in timed if load(r) < 8]),
+        ("Mac の負荷 8〜16", [r for r in timed if 8 <= load(r) < 16]),
+        ("Mac の負荷 >= 16", [r for r in timed if load(r) >= 16]),
+        ("前の発話から 10 分以上", [r for r in timed if prev.get(r["id"], 0) >= 600]),
+        ("音声 30 秒以上", [r for r in timed if (r.get("audio_seconds") or 0) >= 30]),
+        ("改善ループが裏で動いていた", [r for r in timed if r.get("improve_running")]),
+        ("whisper を起こし直した", [r for r in timed if r.get("server_restarted")]),
+    ]
 
 
 def cmd_trend(a):
@@ -432,12 +506,10 @@ def cmd_trend(a):
             o = e["outcome"]
             if o == "pasted":
                 pass  # 貼り付け件数は履歴から数える
-            elif o in ("no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed"):
-                day[d]["koe_fail"] += 1
-            elif o == "cancelled" and e.get("reason") != "mouse" and (e.get("hold_seconds") or 0) >= 1.0:
-                day[d]["koe_fail"] += 1
             elif o == "missed_press":
                 day[d]["key_lost"] += 1
+            elif _is_press_fail(e):
+                day[d]["koe_fail"] += 1
     recs = [r for r in load_records() if _record_time(r) >= since]
     events = _load_session_events(since - timedelta(days=1)) if recs else []
     for r in recs:
@@ -493,11 +565,7 @@ def cmd_daily(a):
             continue
         d = t.strftime("%m/%d")
         o = e.get("outcome")
-        if o in ("no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press"):
-            day[d]["fail"] += 1
-        elif o == "cancelled" and e.get("reason") != "mouse" and (e.get("hold_seconds") or 0) >= 1.0:
-            day[d]["fail"] += 1
-        elif o == "improve" and "辞書に追加: " in (e.get("summary") or ""):
+        if o == "improve" and "辞書に追加: " in (e.get("summary") or ""):
             w = e["summary"].split("辞書に追加: ", 1)[1]
             if w != "なし":
                 added[d] += [x for x in w.split("、") if x]
@@ -506,8 +574,6 @@ def cmd_daily(a):
         if t.replace(tzinfo=None) < since:
             continue
         d = t.strftime("%m/%d")
-        if r.get("pasted") or r.get("locked"):
-            day[d]["ok"] += 1
         if r.get("release_to_paste_ms"):
             lat[d].append(r["release_to_paste_ms"])
         if r.get("autocorrected"):
@@ -521,6 +587,9 @@ def cmd_daily(a):
             k = r.get("communication_impact") or "redo"
             day[d][k] += 1
             notes[d].append(f"{k}: {r.get('communication_note') or ''}")
+    for d, v in _press_counts(since.astimezone())[0].items():
+        day[d].update(v)
+
     def pct(k, n):
         return f"{k / n:.1%}" if n else "-"
     lines = [f"# Koe 日次の振り返り（{now:%Y-%m-%d %H:%M}、直近 {a.days} 日）", "",

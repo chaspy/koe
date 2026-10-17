@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ---- whisper-server output → koe.log ----
@@ -88,7 +89,29 @@ func MsPerAudioSecond(ms int64, audioSeconds float64) float64 {
 // ---- diagnostics export ----
 
 // secretKeyWords: a config key containing one of these has its value hidden.
-var secretKeyWords = []string{"key", "token", "secret", "password"}
+// Same words as the mac (Diagnostics.secretWords).
+var secretKeyWords = []string{"key", "token", "secret", "password", "auth"}
+
+// privateConfigKeys may hold words or text the user wrote (the initial
+// prompt, commands, dictionary paths). Only their length is shown, like the
+// mac (Diagnostics.privateKeys).
+var privateConfigKeys = map[string]bool{
+	"prompt": true, "contextprompt": true, "improvecommand": true, "improvetokencommand": true,
+	"llmprompt": true, "glossarypath": true, "orgglossary": true,
+}
+
+// IsPrivateConfigKey reports whether only the length of a config value may be shown.
+func IsPrivateConfigKey(k string) bool { return privateConfigKeys[strings.ToLower(k)] }
+
+// privateValue is what diagnostics show instead of a private value.
+func privateValue(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		b, _ := json.Marshal(v)
+		s = string(b)
+	}
+	return fmt.Sprintf("（%d 文字・伏せた）", utf8.RuneCountInString(s))
+}
 
 // notSecretKeys contain "key" but are settings, not secrets.
 var notSecretKeys = map[string]bool{"hotkey": true, "menumaskkey": true}
@@ -107,7 +130,8 @@ func IsSecretKey(k string) bool {
 	return false
 }
 
-// RedactValue replaces the values of secret keys (at any depth) with "***".
+// RedactValue replaces the values of secret keys (at any depth) with "***"
+// and those of private keys with their length.
 func RedactValue(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -115,6 +139,8 @@ func RedactValue(v any) any {
 		for k, x := range t {
 			if IsSecretKey(k) {
 				out[k] = "***"
+			} else if IsPrivateConfigKey(k) {
+				out[k] = privateValue(x)
 			} else {
 				out[k] = RedactValue(x)
 			}

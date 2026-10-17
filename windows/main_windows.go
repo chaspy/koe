@@ -65,7 +65,9 @@ type App struct {
 	audioCtx   atomic.Int64  // core.AudioCtx in use; the menu "速さ優先" switches auto / 0
 	gpuOff     atomic.Bool   // config gpu "off"; the menu "GPU を使う" switches it
 	keepDays   atomic.Int64  // historyKeepDays in use; the menu "履歴を残す期間" switches it
-	gpuOK      atomic.Bool   // the GPU server has transcribed once (no more first-request fallback)
+	lastUsed   atomic.Int64  // unix nano of the last press / paste (the update prompt waits until Koe is settled)
+	upPrompt   updatePromptState
+	gpuOK      atomic.Bool // the GPU server has transcribed once (no more first-request fallback)
 	keys       chan keyEvent
 	updating   atomic.Bool
 	tail       sync.WaitGroup
@@ -121,6 +123,14 @@ func main() {
 		}
 	}()
 	systray.Run(a.onReady, a.onExit)
+}
+
+// messageBoxResult shows a message box and returns the button pressed (IDYES = 6, IDNO = 7, ...).
+func messageBoxResult(title, text string, flags uint32) int32 {
+	t, _ := windows.UTF16PtrFromString(text)
+	c, _ := windows.UTF16PtrFromString(title)
+	r, _ := windows.MessageBox(0, t, c, flags)
+	return r
 }
 
 func messageBox(title, text string, flags uint32) {
@@ -779,6 +789,7 @@ func (a *App) begin(ev keyEvent) {
 		a.log.Printf("foreground_exe_failed %v", err)
 	}
 	u := &utterance{pressedAt: ev.at, app: core.ExeName(exe), record: map[string]any{}}
+	a.lastUsed.Store(time.Now().UnixNano())
 	t0 := time.Now()
 	if err := a.rec.Start(); err != nil {
 		a.log.Printf("record_start_failed err=%v", err)
@@ -856,6 +867,7 @@ func (a *App) worker() {
 }
 
 func (a *App) process(u *utterance) {
+	defer a.lastUsed.Store(time.Now().UnixNano())
 	rec := u.record
 	t0 := time.Now()
 	captured := u.pcm

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -142,6 +143,7 @@ func (a *App) checkUpdate(reason string) (*core.Release, error) {
 	a.avail = &r
 	a.mu.Unlock()
 	a.log.Printf("update_available current=%s latest=%s asset=%s", version, r.Version, r.Asset)
+	go a.prepareUpdatePrompt(r)
 	t := &a.tray
 	t.mu.Lock()
 	if t.update != nil {
@@ -293,4 +295,84 @@ func (a *App) setUpdateStatus(s string) {
 	a.updateMsg = s
 	a.mu.Unlock()
 	a.render()
+}
+
+// ---- consent-based update prompt (core.ShouldPromptUpdate) ----
+
+type updatePromptState struct {
+	mu        sync.Mutex
+	version   string // summary below is for this version
+	line      string
+	noChanges bool
+	snoozed   time.Time // "later": quiet until then (this run only)
+	loop      bool
+}
+
+// prepareUpdatePrompt fetches the release's one-line summary and starts the
+// check that asks once Koe is settled.
+func (a *App) prepareUpdatePrompt(r core.Release) {
+	defer a.recoverLog("update_prompt")
+	p := &a.upPrompt
+	p.mu.Lock()
+	known := p.version == r.Version
+	start := !p.loop
+	p.loop = true
+	p.mu.Unlock()
+	if !known {
+		line, no := "", false
+		if md, err := core.FetchChangelog(context.Background(), core.RawBase, a.cfg.UpdateRepo, r.Tag, "Koe-windows/"+version); err != nil {
+			a.log.Printf("update_summary_failed %v", err)
+		} else {
+			line, no = core.ChangelogSummary(md, r.Version, "Windows", 100)
+		}
+		p.mu.Lock()
+		p.version, p.line, p.noChanges = r.Version, line, no
+		p.mu.Unlock()
+	}
+	if start {
+		for {
+			a.maybePromptUpdate()
+			time.Sleep(15 * time.Second)
+		}
+	}
+}
+
+func (a *App) maybePromptUpdate() {
+	a.mu.Lock()
+	r := a.avail
+	a.mu.Unlock()
+	if r == nil || a.updating.Load() {
+		return
+	}
+	p := &a.upPrompt
+	p.mu.Lock()
+	if p.version != r.Version {
+		p.mu.Unlock()
+		return
+	}
+	busy := a.recording.Load() || a.processing.Load() > 0
+	var last time.Time
+	if n := a.lastUsed.Load(); n > 0 {
+		last = time.Unix(0, n)
+	}
+	now := time.Now()
+	if !core.ShouldPromptUpdate(now, r.Version, busy, last, p.snoozed, p.noChanges) {
+		p.mu.Unlock()
+		return
+	}
+	p.snoozed = now.Add(core.UpdateSnooze) // asked: quiet for 24 h of this run whatever the answer
+	line := p.line
+	p.mu.Unlock()
+	a.log.Printf("update_prompt version=%s", r.Version)
+	text := fmt.Sprintf("新しい版 v%s があります。", r.Version)
+	if line != "" {
+		text += "\n\n" + line
+	}
+	text += "\n\n今すぐ更新しますか？（Enter は「いいえ」）\n「はい」: Koe が数十秒止まって、入れ替えて起動し直します。\n「いいえ」: あとで（24 時間後か次の起動でもう一度お知らせします。トレイの「新しい版」からいつでも更新できます）"
+	if messageBoxResult("Koe", text, core.UpdatePromptBoxFlags) == core.IDYes {
+		a.log.Printf("update_prompt_answer now")
+		a.startUpdate()
+		return
+	}
+	a.log.Printf("update_prompt_answer later")
 }

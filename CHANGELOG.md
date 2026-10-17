@@ -4,6 +4,24 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 ## Unreleased
 
+## 0.6.0 — 2026-10-17
+
+### Repository
+- Docs: `docs/data-ja.md` (Japanese) lists what Koe keeps on your computer, what it sends and when, and what the diagnostics zip contains; the 「外に送りません」 line in `docs/usage-ja.md` now says that the improvement loop is the exception.
+- `koe_eval.py perf` now splits release-to-paste into stages (tail recording, prompt, transcription, the rest) by condition: Mac load in three bands, the first utterance after 10 minutes idle, audio of 30 s or more, the improve loop running, and whisper restarted. Findings for BUG-4 are in docs/notes/2026-10-16-latency-breakdown.md.
+- Fixed: `koe_eval.py misses` showed a paste success rate of about 30% because it divided by every event type in `events.jsonl` (`tracks`, `enter_scheduled`, …). It now uses the same definition as the daily report's ①入力された (pasted records ÷ pasted + failed presses), prints it per day, and counts `no_accessibility` and `target_changed` as failures (also in `daily` and `trend`).
+
+### macOS
+- When a newer version is found, Koe asks once — when it is settled (not recording or transcribing, 30 s after the last use) — 「新しい版 vX があります」 with the first line of that version's macOS changes: 「今すぐ更新」 / 「あとで」. "Later" keeps it quiet until the next launch or 24 hours. The dialog is not modal (push-to-talk keeps working), does not take the focus from the app you are typing in, and Enter / Esc never start the update: the default is 「あとで」 and 「今すぐ更新」 needs a click. Versions with no macOS changes are not asked about. Koe never updates itself without asking; the menu item 「新しい版 vX があります」 stays.
+- People directory (opt-in, `peopleSources`: `gh:owner/repo/path` or `https://`, a `<ID><TAB><name>` file fetched daily): when set, **the improvement loop sends the whole directory (every ID and name) to its LLM on every run** and asks who a misrecognized name refers to. Names enter the personal glossary only when the LLM is confident, an honorific follows (〜さん) and the conversation is about working with someone (Slack, review, PR…); the alias applies only before the honorific, and nicknames are never rewritten to real names (a surname misrecognized as other kanji, e.g. 山舌さん → 山下さん, is corrected; kana/latin-only forms and calling forms already learned for that person are not). Koe writes `~/.claude/koe-people.md` for the receiving AI to grep for unknown names (one line in `koe-voice-glossary.md` points to it). The directory is not used for the whisper prompt, and only its size appears in events and diagnostics (`peopleSources` is hidden there).
+- Names learned faster (IMP-8): when the improvement loop is confident about one misrecognized name followed by an honorific, it also adds up to 5 similar-sounding forms the LLM expects for the same person (パン粉さん → パンコさん, パンコアさん, バンコさん), and the name replaces from the first detection instead of waiting for a second one. The forms pass the same checks (not a directory ID or real name, not a known calling form, no kana/latin-only form for a real name) and apply only before the honorific, so 「パン粉を買う」 stays unchanged.
+- Network: the update check now also downloads the new version's `CHANGELOG.md` from raw.githubusercontent.com (for the one-line summary in the update prompt).
+
+### Windows
+- When a newer version is found, Koe asks once — when it is settled (not recording or transcribing, 30 s after the last use) — 「新しい版 vX があります」 with the first line of that version's Windows changes, Yes = update now / No = later. The dialog does not take the foreground, No is the default (Enter = later) and Esc does nothing, so typing elsewhere never starts the update. "Later" keeps it quiet until the next start or 24 hours. Versions with no Windows changes are not asked about. Koe never updates itself without asking; the tray item 「新しい版 vX があります」 stays.
+- Fixed: the diagnostics zip showed the initial prompt (`prompt`) you wrote in config.json. Like the mac, the settings section now shows only the length of `prompt`, `contextPrompt` and other keys that can hold your words (glossary paths, commands), and also hides keys containing `auth`.
+- Network: the update check now also downloads the new version's `CHANGELOG.md` from raw.githubusercontent.com (for the one-line summary in the update prompt).
+
 ## 0.5.0 — 2026-10-16
 
 ### macOS
