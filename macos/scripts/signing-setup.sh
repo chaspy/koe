@@ -45,9 +45,25 @@ subjectKeyIdentifier = hash
 CNF
   openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TMP/key.pem" -out "$TMP/cert.pem" -days 3650 -config "$TMP/cert.cnf" 2>/dev/null
   P12="$TMP/koe.p12"; P12PW=$(openssl rand -hex 16)
-  openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -name "$NAME" -out "$P12" -passout "pass:$P12PW"
+  # OpenSSL 3 defaults are not compatible with macOS security import.
+  # OpenSSL 1.1 and Apple's LibreSSL do not support -legacy.
+  P12_OPTIONS=(-export)
+  case "$(openssl version)" in
+    "OpenSSL 3."*) P12_OPTIONS+=(-legacy) ;;
+  esac
+  openssl pkcs12 "${P12_OPTIONS[@]}" -inkey "$TMP/key.pem" -in "$TMP/cert.pem" -name "$NAME" -out "$P12" -passout "pass:$P12PW"
 fi
-security import "$P12" -k "$KC" -P "$P12PW" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+if security import "$P12" -k "$KC" -P "$P12PW" -T /usr/bin/codesign -T /usr/bin/security >/dev/null; then
+  :
+else
+  status=$?
+  echo "error: signing identity import failed; removing incomplete signing setup" >&2
+  security delete-keychain "$KC" || echo "warning: could not remove $KC" >&2
+  security delete-generic-password -s "$SVC" -a "$USER" \
+    "$HOME/Library/Keychains/login.keychain-db" || \
+    echo "warning: could not remove signing keychain password" >&2
+  exit "$status"
+fi
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" >/dev/null
 # keep the keychain in the user's search list (codesign is also given --keychain)
 LIST=$(security list-keychains -d user | tr -d '"' | xargs)

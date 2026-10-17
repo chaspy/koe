@@ -47,6 +47,13 @@ The Windows version is documented in [windows/README-windows.md](windows/README-
 
 **Build from source**:
 
+前提ツールは Xcode Command Line Tools（`xcode-select --install`）と CMake
+（`brew install cmake`）です。署名証明書の作成には OpenSSL も必要です。
+macOS 付属のものに加え、Homebrew の OpenSSL 3（`brew install openssl@3`）も使えます。
+初回はリポジトリのルートで `bash macos/scripts/signing-setup.sh` を実行してください。
+公開版 dmg からソース版に切り替える場合の権限の再設定は
+[署名の手順](docs/notes/signing.md#公開版-dmg-の後にソース版を入れる場合)を参照してください。
+
 ```bash
 # once: a self-contained whisper-server (static, Metal embedded) to bundle
 cd ~/.local/src/whisper.cpp
