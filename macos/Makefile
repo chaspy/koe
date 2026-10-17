@@ -30,6 +30,7 @@ build:
 # 録音中・文字起こし中なら終わるまで待ってから入れ替える（使いながら入れ直しても発話を失わない）
 STATE := $(HOME)/Library/Application Support/Koe/state
 install: build
+	@bash scripts/check-install-signature.sh "$(INSTALL_DIR)/$(APP_NAME).app" "$(BUNDLE)"
 	@for i in $$(seq 1 120); do [ "$$(cat "$(STATE)" 2>/dev/null)" = "busy" ] || break; sleep 0.5; done
 	-osascript -e 'tell application id "io.github.chaspy.koe" to quit' 2>/dev/null
 	@for i in $$(seq 1 40); do pgrep -x $(APP_NAME) >/dev/null || break; sleep 0.5; done
