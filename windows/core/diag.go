@@ -96,7 +96,8 @@ var secretKeyWords = []string{"key", "token", "secret", "password", "auth"}
 // prompt, commands, dictionary paths). Only their length is shown, like the
 // mac (Diagnostics.privateKeys).
 var privateConfigKeys = map[string]bool{
-	"prompt": true, "contextprompt": true, "improvecommand": true, "improvetokencommand": true,
+	"fallbackmicname": true,
+	"prompt":          true, "contextprompt": true, "improvecommand": true, "improvetokencommand": true,
 	"llmprompt": true, "glossarypath": true, "orgglossary": true,
 }
 

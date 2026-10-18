@@ -74,5 +74,24 @@ rec.pressed = []
 for b in buttons { _ = b.performKeyEquivalent(with: key("\r", 36)) }
 check(rec.pressed == ["later"], "Return answers あとで: \(rec.pressed)")
 
+// #157: orderFrontRegardless() だけで出すと nib の素の部品（"<Do not show this message again>"、空の 3 つ目のボタン）が見えていた。
+// present() で出すと、見えるボタンは「あとで」「今すぐ更新」の 2 つだけ
+let raw = UpdatePrompt.makeAlert(version: "0.8.0", line: "Fixed something.", target: rec, now: #selector(Recorder.now), later: #selector(Recorder.later))
+let before = UpdatePrompt.visibleButtonTitles(raw)
+check(before.contains("") || before.contains { $0.hasPrefix("<") }, "before layout the nib placeholders are visible (the bug): \(before)")
+UpdatePrompt.present(raw)
+let after = UpdatePrompt.visibleButtonTitles(raw)
+check(Set(after) == ["あとで", "今すぐ更新"] && after.count == 2, "after present(): exactly あとで / 今すぐ更新: \(after)")
+check(!after.contains { $0.hasPrefix("<") }, "no raw suppression label is visible")
+check(raw.window.isVisible, "present() shows the window")
+raw.window.orderOut(nil)
+
+// アイコン: 渡したものがそのまま使われる（渡さなければ NSAlert の既定のまま）
+let icon = AppIcon.make(size: 64)
+check(icon.size == NSSize(width: 64, height: 64) && !icon.isTemplate, "AppIcon.make draws a 64 pt non-template image")
+let withIcon = UpdatePrompt.makeAlert(version: "0.8.0", line: nil, icon: icon, target: rec, now: #selector(Recorder.now), later: #selector(Recorder.later))
+check(withIcon.icon === icon, "alert uses the Koe icon")
+check(!withIcon.informativeText.isEmpty && !withIcon.informativeText.hasPrefix("\n"), "no summary line: no leading blank line")
+
 if failures > 0 { print("\(failures) failure(s)"); exit(1) }
-print("ok")
+print("update: ok")

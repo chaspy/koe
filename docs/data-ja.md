@@ -19,13 +19,15 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 | 用語パック・組織の辞書 | `~/Library/Application Support/Koe/packs/`、`org_glossary.txt`、`org_glossary.cache.txt` | 取り込んだ語の一覧 | 消さない |
 | ロック録音の文字 | `~/Documents/Koe/<日時>.txt`（書類/Koe） | ロック録音で話した内容 | 消さない（履歴を消すときも対象外） |
 | 受け取る AI 向けのメモ | `~/.claude/koe-voice-glossary.md` と `koe-voice-glossary.full.md`（場所は設定 `receiverGlossaryPath` で変えられる）。`peopleSources` を設定したときは、同じ場所に `koe-people.md`（社員全員の ID・本名と、分かった呼び方・化けた形。分からない名前に出会ったときだけ引く） | 辞書の語と、よく化ける形の一覧。話した文は入らない | 辞書が変わるたびに書き直す。`~/.claude` が無ければ書かない |
-| 改善ループの作業ファイル | `~/Library/Application Support/Koe/glossary_candidates.json`、`improve_last_response.txt`、`people_known.json` | 辞書に足す語の候補、AI の直近の返答、改善ループで分かった人の呼び方と化けた形。「使うほど賢くする」をオンにしたときだけ作られる | 消さない |
+| 改善ループの作業ファイル | `~/Library/Application Support/Koe/glossary_candidates.json`、`improve_last_response.txt`、`people_known.json` | 辞書に足す語の候補、AI の直近の返答、改善ループで分かった人の呼び方と化けた形。「使うほど賢くする（改善ループ）」をオンにしたときだけ作られる | 消さない |
 | 社員名簿（macOS のみ） | `~/Library/Application Support/Koe/people/` | `peopleSources` から取り込んだ ID と本名の一覧。設定したときだけ | 消さない（1 日 1 回取り直す） |
 | 文字起こし用のモデル | `~/Library/Application Support/Koe/models/` | whisper のモデル | 消さない |
 | whisper-server のログ | `~/Library/Caches/koe/whisper-server.log` | 起動と処理時間の記録 | whisper-server を起動するたびに作り直す |
 
 **履歴を残す期間**: メニュー →「履歴を残す期間」で、7 / 14（既定）/ 30 / 90 日 / ずっと から選べます。文字と記録は、録音の約 2 倍の期間残ります。history 全体が 1GB を超えたときは、古い日の録音から消します。消す処理は、起動したときと 1 日 1 回、裏で動きます。直近 1 日のうちに変わったファイルは消しません。
 メニュー →「録音と結果を保存（評価用）」をオフにすると、履歴は残りません（録音は文字にしたあと消します）。
+
+**予備のマイクの録音も残す（既定はオフ）**: 比べるために予備のマイクの録音も残したいときは、Koe を終了して `defaults write io.github.chaspy.koe saveAllMics -bool true` を実行し、起動し直します。履歴の保存（設定 `saveHistory`、既定はオン）がオンのときだけ残ります。
 
 **iTerm の画面を読む（macOS、既定はオフ）**: `defaults write io.github.chaspy.koe measureVisible -bool true` でオンにしたときだけ、iTerm に貼ったあと最大 10 秒、iTerm の今のセッションの画面の文字（AppleScript の contents）を読み、貼った文の末尾が出るまでの時間を測ります。読んだ画面の中身と貼った文は比べるのにだけ使い、どこにも書きません（履歴と動作の記録には `visible`・`visible_ms` などの数字と結果だけが残ります）。オンにして初めて測るときに macOS がオートメーション（Koe が iTerm を操作する）の許可を求めます。オフの間は画面を読まず、許可も聞きません。許可しなくても貼り付けはそのまま使えます（測れなかった、と記録するだけ）。止めるには `defaults write io.github.chaspy.koe measureVisible -bool false`。
 
@@ -59,11 +61,13 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 | 組織の辞書（macOS のみ） | `orgGlossary` に書いた `http(s)://` の URL | `orgGlossary` に URL を設定したときだけ。1 日 1 回 | ふつうの HTTP の要求だけ |
 | 社員名簿（macOS のみ） | `peopleSources` に書いた取り込み元（`gh:owner/repo/path` か `https://…`。用語パックと同じ取り方） | `peopleSources` を設定したときだけ。1 日 1 回 | 用語パックと同じ |
 
-`<repo>` は既定では公開版の `chaspy/koe` です（設定 `updateRepo` で変えられます）。macOS は設定 `updateCheck` を `false` にすると、更新を確認しません。Windows は `config.json` の `updateCheck` を `false` にします。
+`<repo>` は既定では公開版の `chaspy/koe` です（設定 `updateRepo` で変えられます）。更新の確認を止めるには、設定 `updateCheck` を `false` にします（macOS は defaults、Windows は `config.json`）。Windows はその状態でもメニューの「更新を確認」を押せば手で確認できます。macOS は `updateCheck` をオンに戻してから確認してください。
 
 ## 3. 自分でオンにしたときだけ外に出るもの（macOS のみ）
 
-### 「使うほど賢くする」（改善ループ）— 既定はオフ
+### 「使うほど賢くする（改善ループ）」— 既定はオフ
+
+メニューの「使うほど賢くする（改善ループ）」（設定 `improveEnabled`）を押し、送り先を確認するとオンになります。
 
 オンにすると、新しい発話が 30 件たまるごと（設定 `improveBatch`）、録音していないときに、次の内容を AI に送ります。AI はそれを読んで、誤変換された語を見つけ、伝わったかどうかを判定します。
 
@@ -77,12 +81,14 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 
 ### LLM 整形 — 既定はオフ
 
+メニューの「LLM で整形（qwen2.5:7b）」（設定 `llmEnabled`。メニューの名前は設定 `llmModel` に合わせて変わります）を押すとオンになります。
+
 設定 `llmEnabled` をオンにすると、貼る前に、文字起こしを `llmEndpoint` の OpenAI 互換の送り先に送って整えます。送るのは、文字起こしと、整形の指示と、辞書の語の一覧です。
 送り先の既定は `http://localhost:11434/v1`（自分のパソコンの中の Ollama）です。ほかの送り先を設定した場合だけ、そこに文字起こしが届きます。オンの間は、モデルを読み込んだままにしておくため、4 分ごとに短い要求（「ok」の 1 語）を送ります。
 
 ## 4. 診断情報の zip
 
-メニューの「診断情報を書き出す」（Windows はトレイ）を押すと、デスクトップに `Koe-diagnostics-<日時>.zip` ができます。**自動では送りません。** 送るかどうかは自分で決めます。
+メニューの「診断情報を書き出す（不具合を送る用）」（Windows: 「診断情報を書き出す（送る用）」）を押すと、デスクトップに `Koe-diagnostics-<日時>.zip` ができます。**自動では送りません。** 送るかどうかは自分で決めます。
 
 | | macOS | Windows |
 |---|---|---|

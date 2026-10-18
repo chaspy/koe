@@ -68,7 +68,7 @@ func mmErr(code uintptr) error {
 	return fmt.Errorf("MMRESULT %d: %s", code, windows.UTF16ToString(buf))
 }
 
-// inputDevices lists waveIn device names (for the log).
+// inputDevices lists waveIn device names; callers must not log the names.
 func inputDevices() []string {
 	n, _, _ := procWaveInGetNumDevs.Call()
 	var out []string
@@ -88,6 +88,12 @@ type Recorder struct {
 	log  func(string, ...any)
 	warm bool
 
+	lifecycle sync.Mutex // serializes operations while closeLocked releases mu
+	deviceID  uintptr
+	fallback  *micFallback
+	muted     core.MutedInput
+	usedKind  core.MicKind // alternate used by the last Stop ("" = primary microphone)
+
 	mu           sync.Mutex
 	open         bool
 	h            uintptr
@@ -105,11 +111,13 @@ type Recorder struct {
 }
 
 func NewRecorder(warm bool, log func(string, ...any)) *Recorder {
-	return &Recorder{warm: warm, log: log}
+	return &Recorder{warm: warm, log: log, deviceID: waveMapper}
 }
 
 // Warm opens the device at startup in warm mode.
 func (r *Recorder) Warm() {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	if !r.warm {
 		return
 	}
@@ -134,7 +142,7 @@ func (r *Recorder) openLocked() error {
 		AvgBytesPerSec: core.SampleRate * 2, BlockAlign: 2, BitsPerSample: 16,
 	}
 	var h uintptr
-	if rc, _, _ := procWaveInOpen.Call(uintptr(unsafe.Pointer(&h)), waveMapper, uintptr(unsafe.Pointer(&wfx)), uintptr(ev), 0, callbackEvent); rc != 0 {
+	if rc, _, _ := procWaveInOpen.Call(uintptr(unsafe.Pointer(&h)), r.deviceID, uintptr(unsafe.Pointer(&wfx)), uintptr(ev), 0, callbackEvent); rc != 0 {
 		windows.CloseHandle(ev)
 		return fmt.Errorf("waveInOpen: %w", mmErr(rc))
 	}
@@ -234,6 +242,7 @@ func (r *Recorder) append(chunk []int16) {
 		r.lastBufferAt = time.Now()
 	}
 	if r.recording {
+		r.muted.Add(chunk)
 		r.samples = append(r.samples, chunk...)
 		return
 	}
@@ -248,8 +257,13 @@ func (r *Recorder) append(chunk []int16) {
 
 // Start begins capturing. In warm mode the pre-roll is included.
 func (r *Recorder) Start() error {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.recording {
+		return nil
+	}
 	if r.open && time.Since(r.lastBufferAt) > time.Second {
 		r.log("mic_stalled last_buffer_ago_ms=%d -> reopen", time.Since(r.lastBufferAt).Milliseconds())
 		r.closeLocked()
@@ -264,16 +278,23 @@ func (r *Recorder) Start() error {
 	}
 	r.preRoll = nil
 	r.recording = true
+	r.startFallbackLocked()
 	return nil
 }
 
 // Stop keeps recording TailSeconds more, then returns the captured samples.
 func (r *Recorder) Stop() []int16 {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	// The tail is captured while holding lifecycle on purpose: a Start() from
+	// a quick re-press waits at most TailSeconds, and in warm mode that audio
+	// lands in its pre-roll, so nothing is lost.
 	time.Sleep(time.Duration(core.TailSeconds * float64(time.Second)))
+	r.finishFallback()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.recording = false
-	s := r.samples
+	s := r.fallbackSamples(r.samples)
 	r.samples = nil
 	if !r.warm {
 		r.closeLocked()
@@ -283,6 +304,9 @@ func (r *Recorder) Stop() []int16 {
 
 // Discard drops the current recording.
 func (r *Recorder) Discard() {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	r.finishFallback()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.recording = false
@@ -294,8 +318,15 @@ func (r *Recorder) Discard() {
 
 // Reopen closes and reopens the device (e.g. after digital silence).
 func (r *Recorder) Reopen(reason string) {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A previous utterance can finish processing after the next one starts.
+	// Do not interrupt that recording or its fallback worker.
+	if r.recording {
+		return
+	}
 	r.log("mic_reopen reason=%s", reason)
 	r.closeLocked()
 	if r.warm {
@@ -306,6 +337,9 @@ func (r *Recorder) Reopen(reason string) {
 }
 
 func (r *Recorder) Close() {
+	r.lifecycle.Lock()
+	defer r.lifecycle.Unlock()
+	r.finishFallback()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closeLocked()

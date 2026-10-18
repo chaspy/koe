@@ -20,25 +20,26 @@ Both are built from the same code at the same version and attached to the same G
 | Retry on hallucination, previous utterance as context, history | ✅ | ✅ |
 | In-app update | ✅ from 0.2.0 | ✅ from 0.2.0 |
 | Improvement loop (glossary grows by itself) | ✅ | not yet |
-| Lock recording, line breaks, low-level hint, fallback mic | ✅ | not yet |
-| Speech model | large-v3-turbo on the GPU (Metal) | large-v3-turbo q5_0 on the CPU |
+| Lock recording, line breaks, low-level hint | ✅ | not yet |
+| Hardware-mute fallback mic | ✅ | opt-in (`fallbackMic`) |
+| Speech model | large-v3-turbo on the GPU (Metal) | small-q5_1 by default; Vulkan GPU if faster, otherwise CPU |
 
 The Windows version is documented in [windows/README-windows.md](windows/README-windows.md).
 
 ## Koe.app (macOS menu bar, push to talk)
 
-`macos/` contains a menu bar app that works from any app, not just a terminal. Requires whisper.cpp (see [Setup whisper.cpp](#setup-whispercpp)).
+`macos/` contains a menu bar app that works from any app, not just a terminal. The dmg bundles whisper-server; building from source requires whisper.cpp (see below).
 
 - Hold **right ⌘** to record, release to transcribe. The text is pasted into the focused field and Enter is sent (toggle in the menu).
 - Pressing any other key while holding right ⌘ cancels (so ⌘ shortcuts keep working).
 - The key can be changed in the menu (押して話すキー): right ⌘ / right ⌥ / right ⌃ / fn. On US keyboards right ⌘ may clash with ⌘+Space or ⌘+Return.
 - Enter is sent only to terminals (iTerm, Terminal, Ghostty, …). In other apps the text is only pasted.
 - **Lock recording**: tap the key twice quickly to record hands-free (e.g. taking notes while talking); tap once more to stop. The text keeps line breaks, is saved to `~/Documents/Koe/<date-time>.txt`, copied to the clipboard and opened. Typing or clicking does not stop it. Lock recordings are never sent to the improvement loop.
-- **Line breaks** (menu, off by default): break lines at whisper's segment boundaries when pasting into non-terminal apps such as Google Docs.
+- **Line breaks** (`lineBreaks`, off by default): enable 「区切りごとに改行する（ターミナル以外。Docs 向け）」 in the menu to break lines at whisper's segment boundaries when pasting into non-terminal apps such as Google Docs.
 - If your voice is recorded too quietly (below about −45 dB), Koe tells you to raise the input volume.
-- The mic stays open in the background and keeps the last 0.5 s, so the first word is not cut off. Recording also continues 0.4 s after release. Turn this off from the menu if you do not want the mic indicator always on.
+- The mic stays open in the background and keeps the last 0.5 s, so the first word is not cut off. Recording also continues 0.25 s after release. `warmMic` is on by default; turn off 「マイクを常時待機（頭切れ防止）」 in the menu if you do not want the mic indicator always on.
 - Plays a short marimba tone on start and stop (toggle in the menu).
-- Muted headsets: many meeting-certified headsets and speakerphones mute in hardware when you mute in the meeting app, so the OS only receives digital silence. Choose the microphone from the menu (マイク). Pick a mic other than the one your meeting app uses and Koe never goes silent. In 自動 (default), Koe uses the system default mic, detects hardware mute (near-zero signal for 1 s) and records from another microphone while it lasts; the menu shows which one (`fallbackMicName` if set, otherwise another USB mic such as a webcam, then the built-in mic). A fallback that is also silent (e.g. a closed MacBook lid) is skipped. With the lid closed, the built-in mic is not used as the fallback at all, and the menu marks it (⚠ 蓋が閉じています). A Bluetooth mic (e.g. AirPods) is marked ⚠ 内蔵マイク推奨: Bluetooth headsets switch to call-quality audio while their mic is open, which loses words. These warnings are off by default (`defaults write io.github.chaspy.koe micNotice -bool true`). If you have only one microphone there is nothing to fall back to. If you listen to the meeting on speakers, the fallback mic may pick up other people's voices; headphones avoid that.
+- Muted headsets: many meeting-certified headsets and speakerphones mute in hardware when you mute in the meeting app, so the OS only receives digital silence. Choose the microphone from the menu (マイク). Pick a mic other than the one your meeting app uses and Koe never goes silent. In 「自動（既定のマイク…）」 (default), Koe uses the system default mic, detects hardware mute (near-zero signal for 1 s) and records from another microphone while it lasts; the menu shows which one (`fallbackMicName` if set, otherwise another USB mic such as a webcam, then the built-in mic). A fallback that is also silent (e.g. a closed MacBook lid) is skipped. With the lid closed, the built-in mic is not used as the fallback at all, and the menu marks it (⚠ 蓋が閉じています). A Bluetooth mic (e.g. AirPods) is marked ⚠ 内蔵マイク推奨: Bluetooth headsets switch to call-quality audio while their mic is open, which loses words. These warnings are off by default (`defaults write io.github.chaspy.koe micNotice -bool true`). If you have only one microphone there is nothing to fall back to. If you listen to the meeting on speakers, the fallback mic may pick up other people's voices; headphones avoid that.
 - Misses are not silent: a failure tone plays, the menu shows the reason, and every press is logged to `~/Library/Application Support/Koe/events.jsonl` (`koe_eval.py misses`).
 - Keeps `whisper-server` resident (port 18080), so the model is loaded once. Prefers `ggml-large-v3-turbo.bin` when present.
 - Needs Microphone and Accessibility permissions.
@@ -58,13 +59,15 @@ make install SIGN_IDENTITY="<your codesigning identity>"   # installs to ~/Appli
 make dist SIGN_IDENTITY="<your codesigning identity>"      # build/Koe-<version>.dmg
 ```
 
-The dmg is not notarized yet; on another Mac, right-click → Open the first time.
+`make dist` without `SIGN_IDENTITY` signs with the maintainer's Developer ID; releases are also notarized (`make notarize`, see [docs/notes/signing.md](docs/notes/signing.md) and [docs/notes/release.md](docs/notes/release.md)).
 
-Settings (`defaults write io.github.chaspy.koe <key> <value>`): `hotkeyKeyCode` (54 = right ⌘, 61 = right ⌥), `model`, `language`, `prompt`, `port`, `minHoldSeconds`, `warmMic`, `sounds`, `startSound` / `stopSound` (bundled `start`/`stop` or a macOS sound name such as `Ping`), `audioCtx` (`auto` = whisper's window sized to the utterance, the default; `0` = the whole 30 s window every time), `restoreFocus` (default `true`: if another app comes to the front while Koe is transcribing, Koe brings back the window you started talking in and pastes there, within 20 s of the press; `false` = keep the text on the clipboard instead).
+Quit and relaunch Koe after changing settings with `defaults write`; menu changes apply immediately.
+
+Settings (`defaults write io.github.chaspy.koe <key> <value>`): `hotkeyKeyCode` (54 = right ⌘, 61 = right ⌥), `model`, `language`, `prompt`, `port`, `minHoldSeconds`, `warmMic`, `sounds`, `startSound` / `stopSound` (bundled `start`/`stop` or a macOS sound name such as `Ping`), `audioCtx` (`auto`, the default, = the whole 30 s window on macOS since a shrunk window garbled 7.5–20 s utterances, see [the measurement](docs/notes/2026-10-18-audio-ctx-by-length.md); `0` = the whole window; a number = that many frames, 50 per second), `restoreFocus` (default `true`: if another app comes to the front while Koe is transcribing, Koe brings back the window you started talking in and pastes there, within 20 s of the press; `false` = keep the text on the clipboard instead).
 
 ### LLM cleanup (optional)
 
-Turn on "LLM で整形" in the menu to pass the transcript through an LLM that removes fillers, fixes obvious mistakes and adds punctuation. It talks to any OpenAI-compatible endpoint; the default is a local [Ollama](https://ollama.com):
+LLM cleanup is off by default (`llmEnabled`). Turn on 「LLM で整形（qwen2.5:7b）」 in the menu (the label shows `llmModel`) to pass the transcript through an LLM that removes fillers, fixes obvious mistakes and adds punctuation. It talks to any OpenAI-compatible endpoint; the default is a local [Ollama](https://ollama.com):
 
 ```bash
 ollama pull qwen2.5:7b
@@ -96,7 +99,7 @@ Personal glossary details: `~/Library/Application Support/Koe/glossary.txt` is s
 
 ### Improvement loop (built in)
 
-Turn on "使うほど賢くする（改善ループ）" in the menu. Every `improveBatch` (default 30) new utterances, while you are not recording, Koe sends the transcripts — plus, if you dictate into Claude Code, the message actually sent, Claude's reply and your next message from `~/.claude/projects` — to an OpenAI-compatible LLM, and gets back:
+The improvement loop is off by default (`improveEnabled`). Turn on 「使うほど賢くする（改善ループ）」 in the menu and confirm the destination. Every `improveBatch` (default 30) new utterances, while you are not recording, Koe sends the transcripts — plus, if you dictate into Claude Code, the message actually sent, Claude's reply and your next message from `~/.claude/projects` — to the configured command or OpenAI-compatible API, and gets back:
 
 - misrecognized terms and their correct spelling → added to your personal glossary (with the misrecognized forms as aliases) once seen twice, or once if you corrected it explicitly
 - per-utterance communication judgement (understood / corrected / unclear) → stored in history; the menu shows 7-day communication success
@@ -111,7 +114,9 @@ Which LLM: by default Koe runs your Claude Code headlessly (`improveProvider` = 
 
 ```json
 { "orgGlossary": "org_glossary.txt", "improveProvider": "command", "improveCommand": "claude -p --model sonnet" }
-``` `Koe --improve-now` runs it once from the command line.
+```
+
+`Koe --improve-now` runs it once from the command line.
 
 The menu also shows today's input success (presses that ended in a paste).
 
@@ -119,7 +124,7 @@ The menu also shows today's input success (presses that ended in a paste).
 
 ### History and evaluation
 
-With "録音と結果を保存（評価用）" on (default), each utterance is saved to `~/Library/Application Support/Koe/history/YYYY-MM-DD/` as `<id>.wav` + `<id>.json` (raw transcript, cleaned text, timings, models, prompts). About 32 KB per second of audio. Everything stays local.
+With "録音と結果を保存（評価用）" on (default), each utterance is saved to `~/Library/Application Support/Koe/history/YYYY-MM-DD/` as `<id>.wav` + `<id>.json` (raw transcript, cleaned text, timings, models, prompts). About 32 KB per second of audio. `saveHistory` defaults to `true`; 「履歴を残す期間」 (`historyKeepDays`, default `14`) keeps recordings for 14 days and text for 30 days, removing the oldest recordings when the history exceeds 1 GB. See [data handling](docs/data-ja.md) for retention and optional LLM data sharing.
 
 `eval/koe_eval.py` scores accuracy as CER (character error rate) against reference texts you add:
 
@@ -137,6 +142,14 @@ Results are saved under `~/Library/Application Support/Koe/evals/`.
 `koe_eval.py daily` also shows 貼る→届く: how long after ⌘V the text shows up as your message in a Claude Code session log. To also measure 貼る→画面に出る for iTerm (how long until the pasted text appears on screen), turn it on with `defaults write io.github.chaspy.koe measureVisible -bool true` (off by default). Koe then reads the iTerm screen for up to 10 s after each paste, only to compare it with the pasted text, and macOS asks once to let Koe control iTerm (Automation).
 
 If you dictate into [Claude Code](https://claude.com/claude-code), `koe_eval.py context` matches each utterance with your Claude Code session logs (`~/.claude/projects/`) and shows the message actually sent, Claude's reply and your next message. Manual edits, the way Claude interpreted it, and your corrections are strong hints for what you meant, which makes drafting references (`set-draft`) much easier.
+
+## Troubleshooting
+
+- **No permission:** on macOS, allow Koe under System Settings → Privacy & Security → Microphone and Accessibility. After a signing change, remove and re-add Koe under Accessibility ([details](docs/notes/signing.md#changing-the-certificate)). On Windows, allow microphone access for desktop apps in Settings → Privacy & security → Microphone; see the [Windows usage notes](windows/README-windows.md#使い方).
+- **Nothing is pasted:** keep the original app focused until transcription finishes. Recover the text with ⌘V / Ctrl+V or 「最近の文字起こし（クリックでコピー）」 (macOS) / 「最近の文字起こし」 (Windows). Check macOS Accessibility; Windows cannot paste into an elevated app ([macOS help](docs/usage-ja.md#うまくいかないとき), [Windows help](windows/README-windows.md#使い方)).
+- **The first word is cut off:** enable 「マイクを常時待機（頭切れ防止）」 on macOS or set `"warmMic": true` in Windows config.json and restart. Both default to on ([recording details](#koeapp-macos-menu-bar-push-to-talk), [Windows usage](windows/README-windows.md#使い方)).
+- **It is slow:** wait for the first model download/load; on Windows, check the model and GPU choice ([speed guide](windows/README-windows.md#速さの目安), [GPU](windows/README-windows.md#gpu)). On macOS, optional [LLM cleanup](#llm-cleanup-optional) adds latency. Export diagnostics if it persists ([macOS](docs/usage-ja.md#うまくいかないとき), [Windows](windows/README-windows.md#不具合のときに送ってほしいもの)).
+- **The mic is muted:** unmute the headset in hardware and in the meeting app. On macOS, choose another mic under 「マイク」 or use automatic fallback; a second working mic is required ([mic details](#koeapp-macos-menu-bar-push-to-talk)). Windows uses the system input device ([usage](windows/README-windows.md#使い方)).
 
 ## License
 

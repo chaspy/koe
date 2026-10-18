@@ -14,7 +14,7 @@ SHERPA_NAME="sherpa-onnx-$SHERPA_TAG-win-x64-shared-MT-Release-no-tts"
 # k2-fsa/sherpa-onnx v1.13.8 release, checked 2026-10-17 against a download.
 # Set both when changing SHERPA_TAG.
 SHERPA_SHA256="${SHERPA_SHA256:-4b0a94f7b5c606b1b64a19a831c2127559e4b3d34e195465ebc7be73d9ed4783}"
-CACHE=".cache"
+CACHE="${CACHE:-.cache}"  # downloads; the release script keeps one outside the worktree
 STAGE="dist/Koe"
 ZIP="dist/Koe-windows-x64.zip"
 # same version as the mac app (CFBundleShortVersionString); used by the in-app updater

@@ -11,10 +11,11 @@ enum UpdatePrompt {
     // 確認の画面。手で打っている最中に出ても Enter / Esc で更新が走らないように:
     // 既定（Return）は「あとで」、「今すぐ更新」はキーを持たない（クリックだけ）、Esc で押されるボタンも作らない。
     // フォーカスは奪わない（呼ぶ側は activate せず orderFrontRegardless で前に出すだけ）
-    static func makeAlert(version: String, line: String?, target: AnyObject, now: Selector, later: Selector) -> NSAlert {
+    static func makeAlert(version: String, line: String?, icon: NSImage? = nil, target: AnyObject, now: Selector, later: Selector) -> NSAlert {
         let a = NSAlert()
+        if let icon { a.icon = icon }
         a.messageText = "新しい版 v\(version) があります"
-        a.informativeText = (line.map { $0 + "\n\n" } ?? "") + "今すぐ更新すると、Koe が数秒止まって起動し直します。あとでにすると、24 時間後か次の起動でもう一度お知らせします（メニューの「新しい版」からいつでも更新できます）。"
+        a.informativeText = (line.map { $0 + "\n\n" } ?? "") + "今すぐ更新すると、Koe が数秒止まって起動し直します。あとでにすると、24 時間後か次の起動でもう一度お知らせします。"
         let l = a.addButton(withTitle: "あとで")       // 最初のボタン＝既定
         l.keyEquivalent = "\r"
         l.target = target
@@ -26,6 +27,27 @@ enum UpdatePrompt {
         n.action = now
         a.window.level = .floating
         return a
+    }
+
+    // Shows the alert without a modal run loop (push-to-talk keeps working, the focus stays where it is).
+    // NSAlert only lays its window out when it is run; shown with orderFrontRegardless() alone, the window
+    // still holds the nib's placeholders — a "<Do not show this message again>" checkbox, a blank third
+    // button, the notes in one cut-off line, no icon (#157). layout() first turns it into the real alert.
+    static func present(_ a: NSAlert) {
+        a.layout()
+        a.window.center()
+        a.window.orderFrontRegardless()
+    }
+
+    // The buttons a person can see in the alert's window (title and whether it is shown)
+    static func visibleButtonTitles(_ a: NSAlert) -> [String] {
+        func walk(_ v: NSView) -> [String] {
+            var out: [String] = []
+            if let b = v as? NSButton, !b.isHidden, !b.isHiddenOrHasHiddenAncestor, b.frame.width > 0 { out.append(b.title) }
+            for s in v.subviews { out += walk(s) }
+            return out
+        }
+        return a.window.contentView.map(walk) ?? []
     }
 
     static func shouldPrompt(now: Date, available: String?, busy: Bool, lastUsed: Date?, snoozedUntil: Date?, noChanges: Bool) -> Bool {

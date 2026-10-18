@@ -48,7 +48,10 @@ type Config struct {
 	EnterDelayMs        int               `json:"enterDelayMs"`
 	MinHoldSeconds      float64           `json:"minHoldSeconds"`
 	Sounds              bool              `json:"sounds"`
+	LowLevelWarning     bool              `json:"lowLevelWarning"` // hint when the voiced part is below -45 dBFS (default off; see lowlevel.go)
 	WarmMic             bool              `json:"warmMic"`
+	FallbackMic         bool              `json:"fallbackMic"`     // opt-in: switch to another microphone when the input is hardware-muted (default off)
+	FallbackMicName     string            `json:"fallbackMicName"` // preferred alternate, case-insensitive substring of its waveIn name
 	SaveHistory         bool              `json:"saveHistory"`
 	HistoryKeepDays     int               `json:"historyKeepDays"` // recordings kept this many days, text about twice as long; 0 = keep everything
 	ContextPrompt       bool              `json:"contextPrompt"`

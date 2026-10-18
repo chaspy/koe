@@ -1,11 +1,18 @@
 APP_NAME   := Koe
 BUNDLE     := build/$(APP_NAME).app
 INSTALL_DIR ?= $(HOME)/Applications
-# 署名は固定の自己署名証明書「Koe Code Signing」で行う（scripts/sign.sh。作り方は docs/notes/signing.md）。
-# ad-hoc 署名（-）だとビルドごとに cdhash が変わり、入れ替えるたびにアクセシビリティの許可が外れる。
-# 公開用（dist）は証明書が無ければ止める（SIGN_REQUIRED=1）
+# Signing (scripts/sign.sh, docs/notes/signing.md). Development builds use the
+# self-signed "Koe Code Signing" certificate; ad-hoc signing (-) changes the
+# cdhash every build and drops the Accessibility permission on each install.
+# Release builds (dist) use the Apple Developer ID of team TEAM_ID with the
+# hardened runtime and stop if it is missing (SIGN_REQUIRED=1).
+#   make dist SIGN_IDENTITY="Koe Code Signing"   # a self-signed dmg for testing
 SIGN_IDENTITY ?= Koe Code Signing
+DIST_IDENTITY ?= Developer ID Application
+TEAM_ID ?= 9RQ8WG6688
 SIGN_REQUIRED ?= 0
+# extra flags for swift build, e.g. SWIFT_BUILD_FLAGS="-j 4"
+SWIFT_BUILD_FLAGS ?=
 # 同梱する whisper-server（静的リンク・Metal 埋め込み）。無ければ同梱せず、実行時に whisperHome のものを使う
 #   cmake -B build-static -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON && cmake --build build-static -j --target whisper-server
 WHISPER_SERVER ?= $(HOME)/.local/src/whisper.cpp/build-static/bin/whisper-server
@@ -15,7 +22,7 @@ VERSION := $(shell /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString"
 REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
 
 build:
-	swift build -c release
+	swift build -c release $(SWIFT_BUILD_FLAGS)
 	rm -rf $(BUNDLE)
 	mkdir -p $(BUNDLE)/Contents/MacOS
 	cp .build/release/$(APP_NAME) $(BUNDLE)/Contents/MacOS/$(APP_NAME)
@@ -25,7 +32,7 @@ build:
 	cp Resources/* $(BUNDLE)/Contents/Resources/
 	mkdir -p $(BUNDLE)/Contents/Resources/packs && cp ../packs/*.txt $(BUNDLE)/Contents/Resources/packs/
 	if [ -x "$(WHISPER_SERVER)" ]; then cp "$(WHISPER_SERVER)" $(BUNDLE)/Contents/MacOS/whisper-server; fi
-	SIGN_IDENTITY="$(SIGN_IDENTITY)" SIGN_REQUIRED=$(SIGN_REQUIRED) bash scripts/sign.sh $(BUNDLE)
+	SIGN_IDENTITY="$(SIGN_IDENTITY)" TEAM_ID=$(TEAM_ID) SIGN_REQUIRED=$(SIGN_REQUIRED) bash scripts/sign.sh $(BUNDLE)
 
 # 録音中・文字起こし中なら終わるまで待ってから入れ替える（使いながら入れ直しても発話を失わない）
 STATE := $(HOME)/Library/Application Support/Koe/state
@@ -41,6 +48,7 @@ install: build
 
 # 配布用 dmg（whisper-server 同梱。モデルは初回起動時にダウンロード）
 dist: SIGN_REQUIRED = 1
+dist: SIGN_IDENTITY = $(DIST_IDENTITY)
 dist: build
 	test -f $(BUNDLE)/Contents/MacOS/whisper-server || (echo "whisper-server が同梱されていません（WHISPER_SERVER を確認）" && exit 1)
 	rm -rf build/dmg && mkdir -p build/dmg
@@ -49,12 +57,16 @@ dist: build
 	hdiutil create -volname "Koe $(VERSION)" -srcfolder build/dmg -ov -format UDZO build/Koe-$(VERSION).dmg
 	@echo "→ build/Koe-$(VERSION).dmg"
 
+# Developer ID dmg, notarized and stapled (notarytool profile NOTARY_PROFILE, default koe)
+notarize: dist
+	TEAM_ID=$(TEAM_ID) SIGN_IDENTITY="$(DIST_IDENTITY)" bash scripts/notarize.sh build/Koe-$(VERSION).dmg
+
 # 文字列処理の単体テスト（XCTest は Command Line Tools に無いので swiftc で直接ビルドする）
 test:
 	mkdir -p build
 	swiftc -O -o build/text-test Sources/Koe/Repeats.swift Tests/text/main.swift
 	./build/text-test
-	swiftc -O -o build/update-test Sources/Koe/UpdatePrompt.swift Tests/update/main.swift
+	swiftc -O -o build/update-test Sources/Koe/UpdatePrompt.swift Sources/Koe/AppIcon.swift Tests/update/main.swift
 	./build/update-test
 	swiftc -O -o build/paste-test Sources/Koe/PasteTarget.swift Tests/paste/main.swift
 	./build/paste-test
@@ -74,8 +86,13 @@ test:
 	./build/glossary-test
 	swiftc -O -o build/micnotice-test Sources/Koe/MicNotice.swift Tests/micnotice/main.swift
 	./build/micnotice-test
+	clang -fobjc-arc -ISources/KoeObjC/include -c Sources/KoeObjC/KoeObjC.m -o build/KoeObjC.o
+	swiftc -O -I Sources/KoeObjC/include -o build/mictap-test Sources/Koe/MicTap.swift Tests/mictap/main.swift build/KoeObjC.o
+	./build/mictap-test
+	swiftc -O -o build/vad-test Sources/Koe/VAD.swift Tests/vad/main.swift
+	./build/vad-test
 
 clean:
 	rm -rf .build build
 
-.PHONY: build install dist clean test
+.PHONY: build install dist notarize clean test

@@ -40,6 +40,7 @@ type utterance struct {
 	hwnd       windows.HWND // foreground window at press time (brought back if another app is in front at paste time)
 	held       time.Duration
 	pcm        []int16
+	micKind    core.MicKind // alternate microphone used after a hardware-mute fallback ("" = none)
 	record     map[string]any
 }
 
@@ -68,6 +69,7 @@ type App struct {
 	gpuOff     atomic.Bool   // config gpu "off"; the menu "GPU を使う" switches it
 	keepDays   atomic.Int64  // historyKeepDays in use; the menu "履歴を残す期間" switches it
 	lastUsed   atomic.Int64  // unix nano of the last press / paste (the update prompt waits until Koe is settled)
+	lowLevelAt time.Time     // when the low-level hint was last shown (lowlevel_windows.go)
 	upPrompt   updatePromptState
 	gpuOK      atomic.Bool // the GPU server has transcribed once (no more first-request fallback)
 	keys       chan keyEvent
@@ -192,7 +194,7 @@ func (a *App) startup() {
 		si.CPU, runtime.NumCPU(), si.RAMTotalMB, si.RAMFreeMB, cfg.ThreadsFor(runtime.NumCPU()), cfg.Threads)
 	a.log.Printf("config engine=%s hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s gpu=%s gpuAudioCtx=%s gpu_adapters=%q",
 		cfg.Engine, cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx, cfg.GPU, cfg.GPUAudioCtx, a.gpuNames)
-	a.log.Printf("input_devices %q", inputDevices())
+	a.log.Printf("input_devices count=%d", len(inputDevices()))
 
 	if _, err := os.Stat(a.glossaryPath()); os.IsNotExist(err) {
 		_ = os.WriteFile(a.glossaryPath(), []byte("# Koe 個人の辞書\r\n# 1 行 1 語。タブの後に、実際に起きた誤変換の形を ／ 区切りで書く（例: プルリク<TAB>プロリク／プロリック）\r\n"), 0o644)
@@ -206,6 +208,9 @@ func (a *App) startup() {
 	vk := a.hotkeyVK.Load()
 	a.hold = core.HoldTracker{HotkeyVK: vk, MinHold: time.Duration(cfg.MinHoldSeconds * float64(time.Second)), Toggle: a.toggle.Load()}
 	a.rec = NewRecorder(cfg.WarmMic, a.log.Printf)
+	if cfg.FallbackMic {
+		a.rec.fallback = &micFallback{preferred: cfg.FallbackMicName}
+	}
 	a.rec.Warm()
 
 	keys := make(chan keyEvent, 256)
@@ -919,6 +924,7 @@ func (a *App) end(at time.Time, held time.Duration) {
 	go func() {
 		defer a.recoverLog("stop")
 		u.pcm = a.rec.Stop()
+		u.micKind = a.rec.FallbackKind()
 		a.recording.Store(false)
 		a.tail.Done()
 		u.record["stop_ms"] = time.Since(u.releasedAt).Milliseconds()
@@ -955,6 +961,9 @@ func (a *App) process(u *utterance) {
 	rec["audio_seconds"] = core.Round2(seconds)
 	rec["voiced_seconds"] = core.Round2(voiced)
 	rec["peak"] = peak
+	if u.micKind != "" {
+		rec["mic_fallback"] = string(u.micKind) // device kind only, never a name
+	}
 	rec["packs"] = a.cfg.EnabledPacks
 	a.log.Printf("record_stop audio=%.2fs voiced=%.2fs peak=%d hold=%.2fs", seconds, voiced, peak, u.held.Seconds())
 
@@ -971,6 +980,12 @@ func (a *App) process(u *utterance) {
 		a.fail("マイクから音が来ていません。マイクがミュートか、Windows の設定（プライバシー → マイク → デスクトップ アプリにマイクへのアクセスを許可）がオフではありませんか？")
 		a.rec.Reopen("digital_silence")
 		return
+	}
+	if len(trimmed) > 0 {
+		// level of the voiced part (same key as the mac's history); the hint is opt-in
+		levelDB, tooQuiet := core.RecordingLevel(trimmed)
+		rec["level_db"] = core.Round2(levelDB)
+		a.warnLowLevel(levelDB, tooQuiet)
 	}
 	if len(trimmed) == 0 {
 		rec["outcome"] = "no_voice"

@@ -1,0 +1,4 @@
+module KoeObjC {
+    header "KoeObjC.h"
+    export *
+}

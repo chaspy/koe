@@ -5,6 +5,8 @@ let package = Package(
     name: "Koe",
     platforms: [.macOS(.v14)],
     targets: [
-        .executableTarget(name: "Koe", path: "Sources/Koe")
+        // Objective-C shim: catches NSException so AVFAudio errors do not abort the app (see MicTap.swift)
+        .target(name: "KoeObjC", path: "Sources/KoeObjC"),
+        .executableTarget(name: "Koe", dependencies: ["KoeObjC"], path: "Sources/Koe"),
     ]
 )

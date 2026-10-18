@@ -41,7 +41,7 @@ enum Settings {
         return downloadedModel
     }
     static var language: String { defaults.string(forKey: "language") ?? "ja" }
-    // whisper の窓の大きさ: "auto"（既定。話した長さに合わせて縮める）/ 0（毎回 30 秒ぶん全体）/ フレーム数（AudioWindow.swift）
+    // whisper の窓の大きさ: "auto"（既定。Mac では毎回 30 秒ぶん全体。#165）/ 0（毎回 30 秒ぶん全体）/ フレーム数（AudioWindow.swift）
     static var audioCtx: Int { AudioWindow.setting(defaults.object(forKey: "audioCtx")) }
     static var port: Int {
         let p = defaults.integer(forKey: "port")
@@ -290,7 +290,8 @@ final class WhisperServer {
             "--port", String(Settings.port),
             "-t", "4",
             "--prompt", Settings.prompt,
-        ]
+        ] + VAD.serverArguments()
+        VAD.serverHasModel = p.arguments!.contains("-vm")
         let log = Self.logURL
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log)
@@ -346,6 +347,7 @@ final class WhisperServer {
         field("temperature", "0.0")
         if let audioCtx { field("audio_ctx", String(audioCtx)) }
         if let temperatureInc { field("temperature_inc", temperatureInc) }
+        for (name, value) in VAD.requestFields() { field(name, value) }
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
         guard let audio = try? Data(contentsOf: wav) else {
             return done(.failure(NSError(domain: "Koe", code: 5,
@@ -362,7 +364,9 @@ final class WhisperServer {
         req.httpBody = body
         URLSession.shared.dataTask(with: req) { data, _, error in
             if let error { return done(.failure(error)) }
-            let raw = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            // 崩れた出力は多バイト文字の途中で切れることがある。空にせず U+FFFD に置き換えて、
+            // 呼び出し側で「崩れた」と分かるようにする（AudioWindow.looksGarbled）
+            let raw = String(decoding: data ?? Data(), as: UTF8.self)
             let text = raw
                 .split(whereSeparator: \.isNewline)
                 .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -959,22 +963,34 @@ final class MicSource: MicInput {
         self.outFormat = outFormat
     }
 
+    // Why the last start() returned false (#156: logged with the failed press instead of aborting)
+    private(set) var lastFailure: MicTap.Failure?
+
     func start() -> Bool {
+        lastFailure = nil
         let input = engine.inputNode
         if var id = deviceID, let unit = input.audioUnit {
             AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                                  &id, UInt32(MemoryLayout<AudioDeviceID>.size))
         }
+        // 入力デバイスが抜けた直後などは 0 ch / 0 Hz が返る。そのまま tap を入れると AVFAudio が例外を投げて落ちる
         let inFormat = input.outputFormat(forBus: 0)
-        guard inFormat.sampleRate > 0, let conv = AVAudioConverter(from: inFormat, to: outFormat) else { return false }
+        guard MicTap.isUsable(inFormat), let conv = AVAudioConverter(from: inFormat, to: outFormat) else {
+            lastFailure = .formatInvalid
+            return false
+        }
         converter = conv
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buf, _ in self?.consume(buf) }
+        if let f = MicTap.install(on: input, bufferSize: 1024, format: inFormat, block: { [weak self] buf, _ in self?.consume(buf) }) {
+            lastFailure = f
+            return false
+        }
         do {
             engine.prepare()
             try engine.start()
         } catch {
             input.removeTap(onBus: 0)
+            lastFailure = .engineStart
             return false
         }
         configObserver = NotificationCenter.default.addObserver(
@@ -1083,6 +1099,13 @@ final class Recorder {
 
     private var isRecording: Bool { lock.lock(); defer { lock.unlock() }; return recording }
 
+    // Why the primary mic could not be opened on the last start() (device kind is logged with it)
+    private(set) var lastStartFailure: MicTap.Failure?
+    var primaryTransport: UInt32? {
+        let id = primaryDeviceID ?? AudioDevices.defaultInput()
+        return AudioDevices.inputs().first { $0.id == id }?.transport
+    }
+
     private func open(_ deviceID: AudioDeviceID?, name: String, isPrimary: Bool) -> Track? {
         let src: MicInput = deviceID.map { CaptureMic(deviceID: $0, name: name) } ?? MicSource(deviceID: nil, name: name, outFormat: outFormat)
         let track = Track(src)
@@ -1096,7 +1119,9 @@ final class Recorder {
             let defaultChanged = isPrimary && Settings.micName == nil && AudioDevices.defaultInput() != self.primaryDeviceID
             if !src.isRunning || defaultChanged { self.scheduleRestart(reason: "config_change") }
         }
-        return src.start() ? track : nil
+        if src.start() { return track }
+        if isPrimary { lastStartFailure = (src as? MicSource)?.lastFailure }
+        return nil
     }
 
     private func startEngine() -> Bool {
@@ -1106,6 +1131,7 @@ final class Recorder {
         let id = fixed?.id ?? AudioDevices.defaultInput()
         let name = fixed?.name ?? AudioDevices.inputs().first { $0.id == id }?.name ?? "default"
         primaryDeviceID = id
+        lastStartFailure = nil
         // 既定のマイクはデバイスを指定せずに開く（指定すると構成変更の通知が出て張り直しが連鎖する）
         guard let primary = open(fixed?.id, name: name, isPrimary: true) else { return false }
         var list = [primary]
@@ -2511,6 +2537,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var cleaning = 0 { didSet { render() } }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.applicationIconImage = AppIcon.image  // no .icns in the bundle; alerts would show the generic icon
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         handleSigterm()
         buildMenu()
@@ -2594,11 +2621,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startServer() {
-        server.start { result in
-            DispatchQueue.main.async {
-                switch result {
-                case .success: self.serverReady = true
-                case .failure(let e): self.showError(e.localizedDescription, sticky: true)
+        // VAD（任意、VAD.swift）のモデルが無ければ先に取る。失敗しても VAD なしで whisper は起こす
+        VAD.prepare { prepared in
+            if case .failure(let e) = prepared { DispatchQueue.main.async { self.showError(e.localizedDescription) } }
+            self.server.start { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success: self.serverReady = true
+                    case .failure(let e): self.showError(e.localizedDescription, sticky: true)
+                    }
                 }
             }
         }
@@ -2777,8 +2808,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 押したときのウィンドウは、録音を始めた後に裏で取る（貼る瞬間に前面が変わっていたら戻す）
             if let f = front { FocusRestore.capture(pid: f.processIdentifier, bundleID: f.bundleIdentifier ?? "") { u.focus = $0 } }
         } else {
-            Events.log("start_failed")
-            fail("録音を開始できませんでした（マイクの許可を確認してください）")
+            // 理由とデバイスの種類（transport）だけを記録する。デバイス名は書かない
+            var extra: [String: Any] = [:]
+            if let f = recorder.lastStartFailure { extra["reason"] = f.rawValue }
+            if let t = recorder.primaryTransport { extra["transport"] = t }
+            Events.log("start_failed", extra)
+            fail(MicTap.message(recorder.lastStartFailure))
         }
     }
 
@@ -2973,21 +3008,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // loopRetry: 繰り返しのやり直し（30 秒の枠全体・温度のフォールバックあり）
-    private func transcribe(_ u: Utterance, prompt: String, retried: Bool = false, loopRetry: Bool = false) {
+    // fullWindow: 縮めた窓で崩れた出力が出たあとのやり直し（30 秒の枠全体。#165）
+    private func transcribe(_ u: Utterance, prompt: String, retried: Bool = false, loopRetry: Bool = false, fullWindow: Bool = false) {
         guard let cap = u.capture else { return }
         let started = Date()
         u.record["whisper_model"] = (Settings.model as NSString).lastPathComponent
         u.record["whisper_prompt"] = prompt
         // 窓は送る音声（無音を削った後）の長さに合わせる。繰り返しのやり直しは 30 秒の枠全体
-        let actx = loopRetry ? 0 : AudioWindow.ctx(setting: Settings.audioCtx, seconds: cap.voicedSeconds > 0 ? cap.voicedSeconds : cap.seconds)
-        u.record[loopRetry ? "whisper_audio_ctx_retry" : "whisper_audio_ctx"] = actx
+        let actx = loopRetry || fullWindow ? 0 : AudioWindow.ctx(setting: Settings.audioCtx, seconds: cap.voicedSeconds > 0 ? cap.voicedSeconds : cap.seconds)
+        u.record[loopRetry || fullWindow ? "whisper_audio_ctx_retry" : "whisper_audio_ctx"] = actx
         server.transcribe(wav: cap.url, prompt: prompt, keepLines: u.locked || Settings.keepLines, seconds: cap.seconds,
                           audioCtx: actx, temperatureInc: loopRetry ? "0.2" : nil) { result in
             DispatchQueue.main.async {
                 u.record["transcribe_ms"] = Int(Date().timeIntervalSince(started) * 1000) + (u.record["transcribe_ms"] as? Int ?? 0)
                 switch result {
                 case .success(let text):
-                    let raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    var raw = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // 縮めた窓で崩れた（日本語にない文字・読めないバイト）。30 秒の枠全体で 1 回だけやり直す
+                    if actx != 0, let reason = AudioWindow.garbledReason(raw) {
+                        Events.log("garbled_retry", ["reason": reason, "audio_ctx": actx, "chars": raw.count])
+                        u.record["retried_full_window"] = reason
+                        self.transcribe(u, prompt: prompt, retried: retried, fullWindow: true)
+                        return
+                    }
+                    raw = AudioWindow.dropInvalid(raw)
                     let (t, applied) = Glossary.autocorrectWithLog(raw)
                     u.record["raw"] = t
                     u.record["packs"] = Settings.enabledPacks
@@ -2996,7 +3040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         // 声は入っているのに決まり文句が出た＝プロンプトに引っ張られた幻聴。プロンプトなしでやり直す
                         if !retried && cap.voicedSeconds >= 1.0 {
                             u.record["retried_without_prompt"] = true
-                            self.transcribe(u, prompt: "", retried: true)
+                            self.transcribe(u, prompt: "", retried: true, fullWindow: fullWindow)
                             return
                         }
                         self.transcribing -= 1
@@ -3060,7 +3104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                 if case .success = result {
                                     self.serverReady = true
                                     self.render()
-                                    self.transcribe(u, prompt: prompt, retried: true)
+                                    self.transcribe(u, prompt: prompt, retried: true, fullWindow: fullWindow)
                                 } else {
                                     self.transcribing -= 1
                                     u.record["error"] = e.localizedDescription
@@ -3759,11 +3803,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateSnoozedUntil = Date().addingTimeInterval(UpdatePrompt.snooze)
         Events.log("update_prompt", ["version": r.version])
         // モーダルにしない（開いている間も右⌘で話せるように）。フォーカスも奪わない（打っている文字や Enter を吸わない）
-        let a = UpdatePrompt.makeAlert(version: r.version, line: sum.line, target: self,
+        let a = UpdatePrompt.makeAlert(version: r.version, line: sum.line, icon: AppIcon.image, target: self,
                                        now: #selector(updatePromptNow), later: #selector(updatePromptLater))
-        a.window.center()
         updateAlert = a
-        a.window.orderFrontRegardless()
+        UpdatePrompt.present(a)
     }
 
     @objc private func updatePromptNow() {

@@ -1,0 +1,3 @@
+# Allowed false positives of scripts/release/scrub.sh (generic patterns only;
+# denylist hits cannot be allowed). One "path:hash" per line, as printed by
+# the scrub for the hit, followed by "# why it is fine".
