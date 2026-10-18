@@ -113,6 +113,9 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `packSources` | `[]` | 共有の用語パックの取り込み元。例 `["gh:owner/repo/path/pack.txt"]`（1 日 1 回、`gh` CLI で取得） |
 | `autoEnter` | `true` | ターミナルで貼り付け後に Enter を送るか |
 | `enterApps` | ターミナル各種 | Enter を送るアプリの exe 名 |
+| `terminalPasteKeys` | `false` | （試験中）`true` にすると、ターミナルごとに合った貼り付けキーを使う: Windows Terminal・WezTerm・Alacritty・Hyper・Tabby は Ctrl+Shift+V、mintty（Git Bash）は Shift+Insert、それ以外は Ctrl+V。WezTerm・Alacritty で貼っても何も入らないときに |
+| `pasteKeys` | `{}` | アプリごとの貼り付けキー（`terminalPasteKeys` より優先、オフでも効く）。例 `{"myterm.exe": "ctrl+shift+v"}`。`"ctrl+v"` / `"ctrl+shift+v"` / `"shift+insert"` から選ぶ |
+| `restoreFocus` | `true` | 文字起こしの間に別のアプリが前に出たとき、話し始めたウィンドウを前に戻してから貼る（押してから 20 秒以内）。戻せなかったときと `false` のときは、貼らずにクリップボードに残す |
 | `sounds` | `true` | 効果音 |
 | `warmMic` | `true` | マイクを開いたままにする |
 | `saveHistory` | `true` | 録音と文字起こしを履歴（`%LOCALAPPDATA%\Koe\history`）に保存する |

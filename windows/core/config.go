@@ -33,26 +33,29 @@ type Config struct {
 	Threads   int    `json:"threads"` // 0 = auto (logical CPUs, up to 16)
 	// TemperatureFallback lets whisper re-decode a hard segment at higher
 	// temperatures (whisper.cpp's default). Off: one greedy pass, much faster on CPU.
-	TemperatureFallback bool     `json:"temperatureFallback"`
-	AudioCtx            AudioCtx `json:"audioCtx"`    // encoder window: "auto" (sized to the utterance) | 0 (whole 30 s) | frames
-	GPU                 string   `json:"gpu"`         // "auto" (Vulkan build when a GPU works, else CPU) | "off"
-	GPUAudioCtx         AudioCtx `json:"gpuAudioCtx"` // encoder window on a GPU; default 0 (whole: fast enough there, most accurate)
-	Prompt              string   `json:"prompt"`
-	EnabledPacks        []string `json:"enabledPacks"`
-	PackSources         []string `json:"packSources"`
-	AutoEnter           bool     `json:"autoEnter"`
-	EnterApps           []string `json:"enterApps"`
-	EnterDelayMs        int      `json:"enterDelayMs"`
-	MinHoldSeconds      float64  `json:"minHoldSeconds"`
-	Sounds              bool     `json:"sounds"`
-	WarmMic             bool     `json:"warmMic"`
-	SaveHistory         bool     `json:"saveHistory"`
-	HistoryKeepDays     int      `json:"historyKeepDays"` // recordings kept this many days, text about twice as long; 0 = keep everything
-	ContextPrompt       bool     `json:"contextPrompt"`
-	RestoreClipboard    bool     `json:"restoreClipboard"`
-	MenuMaskKey         bool     `json:"menuMaskKey"` // send a dummy key while Alt is held so Alt alone does not open the app menu
-	UpdateCheck         bool     `json:"updateCheck"` // check GitHub Releases for a newer version at start and daily
-	UpdateRepo          string   `json:"updateRepo"`  // "owner/repo" whose releases are checked
+	TemperatureFallback bool              `json:"temperatureFallback"`
+	AudioCtx            AudioCtx          `json:"audioCtx"`    // encoder window: "auto" (sized to the utterance) | 0 (whole 30 s) | frames
+	GPU                 string            `json:"gpu"`         // "auto" (Vulkan build when a GPU works, else CPU) | "off"
+	GPUAudioCtx         AudioCtx          `json:"gpuAudioCtx"` // encoder window on a GPU; default 0 (whole: fast enough there, most accurate)
+	Prompt              string            `json:"prompt"`
+	EnabledPacks        []string          `json:"enabledPacks"`
+	PackSources         []string          `json:"packSources"`
+	AutoEnter           bool              `json:"autoEnter"`
+	EnterApps           []string          `json:"enterApps"`
+	PasteKeys           map[string]string `json:"pasteKeys"`         // exe name -> "ctrl+v" | "ctrl+shift+v" | "shift+insert"; always applied
+	RestoreFocus        bool              `json:"restoreFocus"`      // another app came to the front while transcribing: bring back the window of the press and paste there (default on)
+	TerminalPasteKeys   bool              `json:"terminalPasteKeys"` // use DefaultPasteKeys for terminals (default off; otherwise Ctrl+V)
+	EnterDelayMs        int               `json:"enterDelayMs"`
+	MinHoldSeconds      float64           `json:"minHoldSeconds"`
+	Sounds              bool              `json:"sounds"`
+	WarmMic             bool              `json:"warmMic"`
+	SaveHistory         bool              `json:"saveHistory"`
+	HistoryKeepDays     int               `json:"historyKeepDays"` // recordings kept this many days, text about twice as long; 0 = keep everything
+	ContextPrompt       bool              `json:"contextPrompt"`
+	RestoreClipboard    bool              `json:"restoreClipboard"`
+	MenuMaskKey         bool              `json:"menuMaskKey"` // send a dummy key while Alt is held so Alt alone does not open the app menu
+	UpdateCheck         bool              `json:"updateCheck"` // check GitHub Releases for a newer version at start and daily
+	UpdateRepo          string            `json:"updateRepo"`  // "owner/repo" whose releases are checked
 }
 
 // DefaultConfig mirrors the mac defaults.
@@ -69,6 +72,7 @@ func DefaultConfig() Config {
 		PackSources:     []string{},
 		AutoEnter:       true,
 		EnterApps:       append([]string{}, DefaultEnterApps...),
+		RestoreFocus:    true,
 		EnterDelayMs:    350,
 		MinHoldSeconds:  0.3,
 		Sounds:          true,

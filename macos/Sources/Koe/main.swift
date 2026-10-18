@@ -67,9 +67,15 @@ enum Settings {
             "net.kovidgoyal.kitty", "org.alacritty", "io.alacritty", "com.github.wez.wezterm",
         ]
     }
-    static var shouldEnter: Bool {
-        guard autoEnter, let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
+    static var shouldEnter: Bool { shouldEnter(bundle: NSWorkspace.shared.frontmostApplication?.bundleIdentifier) }
+    static func shouldEnter(bundle: String?) -> Bool {
+        guard autoEnter, let id = bundle else { return false }
         return enterApps.contains(id)
+    }
+    // 文字起こしの間に別のアプリが前に出たら、押したときのアプリ・ウィンドウに戻してから貼る（BUG-FOCUS、既定オン）
+    static var restoreFocus: Bool {
+        get { defaults.object(forKey: "restoreFocus") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "restoreFocus") }
     }
     // 押し方: hold＝押している間だけ録音（既定） / toggle＝短く押すと開始、もう一度短く押すと終了して貼る
     static var toggleMode: Bool {
@@ -85,6 +91,8 @@ enum Settings {
         guard lineBreaks, let id = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else { return false }
         return !enterApps.contains(id)
     }
+    // マイクの注意（Bluetooth・蓋を閉じた内蔵マイク、MicNotice.swift）。新しい機能なので既定オフ
+    static var micNotice: Bool { defaults.object(forKey: "micNotice") as? Bool ?? false }
     // これより短い押下は誤操作とみなして捨てる
     static var minHoldSeconds: Double {
         let v = defaults.double(forKey: "minHoldSeconds")
@@ -476,7 +484,7 @@ enum Glossary {
 
     static func ambiguous(_ aliases: [String]) -> [String] { aliases.filter { $0.hasPrefix("~") }.map { String($0.dropFirst()) } }
 
-    private static var orgCacheURL: URL {
+    static var orgCacheURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Koe/org_glossary.cache.txt")
     }
@@ -505,7 +513,7 @@ enum Glossary {
     private static var usageAt = Date.distantPast
     private static var usageRefreshing = false
     private static let usageLock = NSLock()
-    private static func usageCounts(_ entries: [Entry]) -> [String: Int] {
+    static func usageCounts(_ entries: [Entry]) -> [String: Int] {
         usageLock.lock(); let cached = usage, stale = Date().timeIntervalSince(usageAt) >= 600; usageLock.unlock()
         if stale { refreshUsage(entries) }
         return cached
@@ -748,8 +756,10 @@ enum AudioDevices {
 
     // ミュート時の代わりのマイク。設定 fallbackMicName が優先。なければ USB マイク > 内蔵マイク
     // dead は開いても無音だったマイク（蓋を閉じた MacBook の内蔵マイク等）
-    static func fallback(excluding primary: AudioDeviceID?, dead: Set<AudioDeviceID> = []) -> Device? {
-        let candidates = inputs().filter {
+    static func fallback(excluding primary: AudioDeviceID?, dead: Set<AudioDeviceID>? = nil) -> Device? {
+        let all = inputs()
+        let dead = dead ?? (Settings.micNotice ? MicNotice.dead(all.map { ($0.id, $0.transport) }, lidClosed: MicNotice.lidClosed()) : [])
+        let candidates = all.filter {
             $0.id != primary && !dead.contains($0.id)
                 && $0.transport != kAudioDeviceTransportTypeVirtual && $0.transport != kAudioDeviceTransportTypeAggregate
         }
@@ -1050,6 +1060,15 @@ final class Recorder {
 
     var fallbackName: String? {
         AudioDevices.fallback(excluding: primaryDeviceID ?? AudioDevices.defaultInput())?.name
+    }
+
+    // 主のマイク（選んだマイク、自動なら既定のマイク）の注意。録音していないときも今の設定で見る
+    var notice: MicNotice.Kind? {
+        guard Settings.micNotice else { return nil }
+        let want = Settings.micName.flatMap { n in AudioDevices.selectable().first { $0.name == n } }
+        let id = want?.id ?? AudioDevices.defaultInput()
+        guard let d = want ?? AudioDevices.inputs().first(where: { $0.id == id }) else { return nil }
+        return MicNotice.kind(transport: d.transport, lidClosed: MicNotice.lidClosed())
     }
 
     func reopen() {
@@ -2006,7 +2025,8 @@ enum Typist {
 
     // ⌘V を送った時刻を返す（paste_at。画面に出た・Claude Code に届いたまでの時間の起点）
     @discardableResult
-    static func pasteAndMaybeEnter(_ text: String, enter: Bool) -> Date {
+    // targetPID: 貼る先のアプリ（前に戻した直後は frontmostApplication がまだ古いことがあるので、分かっていれば渡す）
+    static func pasteAndMaybeEnter(_ text: String, enter: Bool, targetPID: pid_t? = nil) -> Date {
         let pb = NSPasteboard.general
         let previous = pb.string(forType: .string)
         pb.clearContents()
@@ -2017,7 +2037,7 @@ enum Typist {
         if enter {
             // 貼り付け直後の Enter は TUI 側で貼り付けの一部として扱われることがあるので少し待つ。
             // Mac が重いと貼り付けの取り込みが遅れ、0.25 秒では Enter が貼り付けに吸われる（負荷 20 で実際に起きた）ので、負荷に応じて待ちを延ばす
-            let app = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            let app = targetPID ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
             let delay = enterDelay(chars: text.count)
             Events.log("enter_scheduled", ["delay_ms": Int(delay * 1000)])
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -2216,7 +2236,7 @@ enum Events {
                   Calendar.current.isDateInToday(t) else { continue }
             if o == "pasted" { ok += 1 }
             else if o == "not_visible" { ok -= 1; ng += 1 }  // 貼ったが 10 秒たっても画面に出なかった（iTerm）
-            else if ["no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press", "no_accessibility", "target_changed"].contains(o) { ng += 1 }
+            else if ["no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press", "no_accessibility", "no_microphone", "target_changed"].contains(o) { ng += 1 }
             else if o == "cancelled", d["reason"] as? String != "mouse", (d["hold_seconds"] as? Double ?? 0) >= 1.0 { ng += 1 }
         }
         return (ok, ok + ng)
@@ -2433,6 +2453,8 @@ final class Utterance {
     var toggled = false
     // 履歴に保存したときの id（貼ったあとに分かった値を後から書き足す）
     var historyID: String?
+    // 押した瞬間の前面のアプリ・ウィンドウ（貼る瞬間に前面が変わっていたら戻す）
+    var focus: FocusRestore.Snapshot?
     init(app: String) { record = ["app": app] }
 }
 
@@ -2476,6 +2498,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recent: [(time: Date, text: String)] = []
     private var recentByApp: [String: (time: Date, text: String)] = [:]
     private let improver = Improver()
+    private let permissionGuide = PermissionGuide()
+    private var permissionItem: NSMenuItem!
     private var improveItem: NSMenuItem!
     private var improveNowItem: NSMenuItem!
     private var warmUpTimer: Timer?
@@ -2492,6 +2516,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         render()
         Glossary.refreshUsage()
+        LearnedNotice.shared.start(statusItem: statusItem, busy: { [weak self] in
+            guard let self else { return false }
+            return self.current != nil || self.transcribing > 0 || self.cleaning > 0
+        }, lastUsed: { [weak self] in self?.lastUsedAt })
         watchServer()
         // 初めて起動したときは「ログイン時に起動」をオンにする（再起動のたびに手で開かなくてよいように）。
         // 一度決めた後は、メニューで本人が切り替えた状態を尊重する
@@ -2514,7 +2542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installMonitors()
         recorder.onRestart = { reason in Events.log("mic_restarted", ["reason": reason]) }
         recorder.onSourceChange = { name in
-            Events.log("mic_switched", ["device": name])
+            Events.log("mic_switched", ["device": name, "notice": self.recorder.notice?.rawValue ?? ""])
             self.render()
         }
         recorder.setWarm(Settings.warmMic)
@@ -2628,13 +2656,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Permissions
 
     private func requestPermissions() {
-        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        permissionGuide.log = { Events.log($0, $1) }
+        permissionGuide.onGranted = { p in
+            if p == .accessibility { self.installMonitors() } else { self.recorder.reopen() }
+            self.render()
+        }
+        AVCaptureDevice.requestAccess(for: .audio) { ok in
+            if !ok { DispatchQueue.main.async { self.permissionGuide.showIfNeeded(reason: "launch", only: .microphone) } }
+        }
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(opts) {
             // 許可済みに見えて外れている（署名が変わった）ときも同じ案内を 1 回出す
             Events.log("no_accessibility_at_launch")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                if !AXIsProcessTrusted() { self.showAccessibilityNotice() }
+                if !AXIsProcessTrusted() { self.showAccessibilityNotice(reason: "launch") }
             }
             // 許可されるまで待ってからキー監視を張り直す
             Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { t in
@@ -2715,7 +2750,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             fail("モデル読み込み中です。少し待ってから話してください")
             return
         }
-        let u = Utterance(app: NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
+        if PermissionGuide.enabled && PermissionCheck.micDenied {
+            Events.log("no_microphone")
+            fail("マイクの許可が必要です")
+            permissionGuide.showIfNeeded(reason: "record", only: .microphone)
+            return
+        }
+        let front = NSWorkspace.shared.frontmostApplication
+        let u = Utterance(app: front?.bundleIdentifier ?? "")
         lastUsedAt = Date()
         // 押した瞬間に whisper-server が生きているかを見る。止まっていたら、話している間に起こし直しておく
         server.isAlive { alive in
@@ -2732,6 +2774,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 開始音はマイクに入り込むので小さめに鳴らす
             play(Settings.startSound, volume: 0.35)
             current = u
+            // 押したときのウィンドウは、録音を始めた後に裏で取る（貼る瞬間に前面が変わっていたら戻す）
+            if let f = front { FocusRestore.capture(pid: f.processIdentifier, bundleID: f.bundleIdentifier ?? "") { u.focus = $0 } }
         } else {
             Events.log("start_failed")
             fail("録音を開始できませんでした（マイクの許可を確認してください）")
@@ -2813,7 +2857,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             // 部屋の雑音でも peak は数十〜数百ある。ほぼ 0 はミュートか入力停止
             if cap.seconds >= 0.5 && cap.peak <= 2 {
                 self.transcribing -= 1
-                self.drop(u, outcome: "mic_silent", message: "マイクから音が来ていません。マイクがミュートになっていませんか？")
+                self.drop(u, outcome: "mic_silent", message: MicNotice.silentMessage(self.recorder.notice) ?? "マイクから音が来ていません。マイクがミュートになっていませんか？")
             } else if cap.voicedSeconds == 0 {
                 self.transcribing -= 1
                 // 1 秒未満で声もない押下は誤操作のことが多いので音は鳴らさない
@@ -2848,42 +2892,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Events.log("no_accessibility", ["chars": text.count])
         fail("アクセシビリティの許可が外れています。文はクリップボードにあります（⌘V で貼れます）")
         finish(u, pasted: nil)
-        showAccessibilityNotice()
+        showAccessibilityNotice(reason: "paste_blocked")
         return true
     }
 
-    // 起動中に 1 回だけ、直し方を出す
-    private var accessibilityNoticeShown = false
-    private func showAccessibilityNotice() {
-        guard !accessibilityNoticeShown else { return }
-        accessibilityNoticeShown = true
-        Events.log("accessibility_notice")
-        let a = NSAlert()
-        a.messageText = "アクセシビリティの許可が外れています"
-        a.informativeText = "このままでは貼り付けられません。システム設定で Koe を一度消して追加し直してください（プライバシーとセキュリティ > アクセシビリティ で Koe を選んで「−」、もう一度「+」で Koe を追加）。話した文はクリップボードに残してあるので ⌘V で貼れます。"
-        a.addButton(withTitle: "システム設定を開く")
-        a.addButton(withTitle: "閉じる")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertFirstButtonReturn,
-           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
-            NSWorkspace.shared.open(url)
-        }
+    // 直し方をシステム設定の横に浮かべる（PermissionGuide。フォーカスは奪わない）
+    private func showAccessibilityNotice(reason: String) {
+        permissionGuide.showIfNeeded(reason: reason, only: .accessibility)
     }
+
+    @objc private func openPermissionGuide() { permissionGuide.showIfNeeded(reason: "menu", manual: true) }
 
     // 貼る瞬間の前面のアプリを記録し（paste_app）、録音を始めたときのアプリ（app）と違えば貼らない。
     // 文字起こしを待つ間に別のアプリへ移ると、話した文が思わぬところに入る（入った先も分からない）ため。
     // 文はクリップボードと「最近の文字起こし」に残し、outcome=target_changed で記録して知らせる
+    // ただし押してから 20 秒以内なら、押したときのアプリ・ウィンドウを前に戻して貼る（restored_focus）。戻せなかったときだけ target_changed
     private func blockedTargetChanged(_ u: Utterance, _ text: String) -> Bool {
         let now = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
         u.record["paste_app"] = now
         let start = u.record["app"] as? String ?? ""
-        guard PasteTarget.changed(start: start, now: now) else { return false }
+        let decision = PasteTarget.decide(start: start, now: now, sincePress: Date().timeIntervalSince(u.pressedAt), restoreEnabled: Settings.restoreFocus)
+        if decision == .paste { return false }
+        if decision == .restore, let snap = u.focus {
+            switch FocusRestore.restore(snap) {
+            case .restored(let ms):
+                u.record["paste_app"] = start
+                u.record["restored_focus"] = true
+                u.record["restore_ms"] = ms
+                u.record["restored_from"] = now
+                Events.log("focus_restored", ["app": start, "from_app": now, "restore_ms": ms])
+                return false
+            case .failed(let reason):
+                u.record["restore_failed"] = reason
+            }
+        } else if decision == .restore {
+            u.record["restore_failed"] = "no_snapshot"  // 押したときのウィンドウをまだ取り終えていない
+        }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(text, forType: .string)
         u.record["outcome"] = "target_changed"
         u.record["kept_on_clipboard"] = true
-        Events.log("target_changed", ["app": start, "paste_app": now, "chars": text.count])
+        Events.log("target_changed", ["app": start, "paste_app": now, "chars": text.count, "restore_failed": u.record["restore_failed"] ?? (decision == .restore ? "no_snapshot" : "off_or_late")])
         recent.append((Date(), text))
         if recent.count > 10 { recent.removeFirst(recent.count - 10) }
         fail("貼り先が変わったので貼りませんでした（⌘V で貼れます）")
@@ -3054,6 +3104,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // 離してから貼り付けまで（録り足し・文字起こし・整形を含む）
     private var recentLatency: [Int] = []
+    // 前に戻してから貼ったときの記録（数字と種類だけ）
+    private func restoreFields(_ u: Utterance) -> [String: Any] {
+        guard u.record["restored_focus"] != nil else { return [:] }
+        return ["restored_focus": true, "restore_ms": u.record["restore_ms"] ?? 0]
+    }
+    private func restoredPID(_ u: Utterance) -> pid_t? { u.record["restored_focus"] != nil ? u.focus?.pid : nil }
+
     private func markPasted(_ u: Utterance) {
         guard let r = u.releasedAt else { return }
         let ms = Int(Date().timeIntervalSince(r) * 1000)
@@ -3068,10 +3125,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if blockedWithoutAccessibility(u, raw) { return }
             if blockedTargetChanged(u, raw) { return }
             markPasted(u)
-            let at = Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter)
+            let at = Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter(bundle: u.record["paste_app"] as? String), targetPID: restoredPID(u))
             u.record["paste_at"] = Typist.utcMillis(at)
             watchVisible(u, raw, at)
-            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""])
+            Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""].merging(restoreFields(u)) { a, _ in a })
             finish(u, pasted: raw)
             return
         }
@@ -3097,10 +3154,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self.blockedWithoutAccessibility(u, text) { return }
                 if self.blockedTargetChanged(u, text) { return }
                 self.markPasted(u)
-                let at = Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter)
+                let at = Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter(bundle: u.record["paste_app"] as? String), targetPID: self.restoredPID(u))
                 u.record["paste_at"] = Typist.utcMillis(at)
                 self.watchVisible(u, text, at)
-                Events.log("pasted", ["llm": true, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""])
+                Events.log("pasted", ["llm": true, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""].merging(self.restoreFields(u)) { a, _ in a })
                 self.finish(u, pasted: text)
             }
         }
@@ -3178,6 +3235,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         metricsLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
         metricsLine.isEnabled = false
         menu.addItem(metricsLine)
+        permissionItem = NSMenuItem(title: "許可の案内を開く…", action: #selector(openPermissionGuide), keyEquivalent: "")
+        permissionItem.target = self
+        menu.addItem(permissionItem)
         menu.addItem(.separator())
 
         // ロック録音はキーの 2 回押しでも始められるが、気づきにくいのでメニューからも始め・止められるようにする
@@ -3224,6 +3284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         packMenu.delegate = self
         packItem.submenu = packMenu
         menu.addItem(packItem)
+        menu.addItem(GlossaryWindow.menuItem())
 
         // 押して話すキー。US 配列では右⌘が ⌘+Space（入力切替）や ⌘+Return と競合するので選べるようにする
         let keyItem = NSMenuItem(title: "押して話すキー", action: nil, keyEquivalent: "")
@@ -3358,6 +3419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if menu === statusItem.menu {
             // メニューを開いたときも、前に確かめてから 1 分以上たっていれば新しい版を確かめる（起動時と 1 日 1 回だけだと当日中に気づけない）
             if Date().timeIntervalSince(lastUpdateCheck) > 60 { checkUpdate() }
+            GlossaryWindow.updateMenuItem(in: menu)
             // 計測はメニューを開いたときだけ数える（履歴を読むので重い）
             let p1 = Events.pasteSuccessToday(), p2 = History.communication()
             func pct(_ a: Int, _ b: Int) -> String { b == 0 ? "-" : String(format: "%.0f%%", Double(a) / Double(b) * 100) }
@@ -3413,9 +3475,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         auto.target = self
         auto.state = Settings.micName == nil ? .on : .off
         menu.addItem(auto)
+        if let hint = MicNotice.menuHint(recorder.notice) { menu.addItem(withTitle: hint, action: nil, keyEquivalent: "").isEnabled = false }
         menu.addItem(.separator())
+        let lid = Settings.micNotice && MicNotice.lidClosed()
         for d in AudioDevices.selectable() {
-            let item = NSMenuItem(title: d.name, action: #selector(selectMic(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: d.name + (Settings.micNotice ? MicNotice.itemSuffix(transport: d.transport, lidClosed: lid) : ""), action: #selector(selectMic(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = d.name
             item.state = Settings.micName == d.name ? .on : .off
@@ -3609,9 +3673,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             line = "他のアプリがキー入力を保護中のため、右⌘を検知できません（パスワード欄・iTerm の Secure Keyboard Entry など）"
         }
         if !AXIsProcessTrusted() {
-            line = "アクセシビリティの許可が必要です（システム設定 > プライバシーとセキュリティ）"
+            line = PermissionGuide.enabled ? "アクセシビリティの許可が必要です（下の「許可の案内を開く」）" : "アクセシビリティの許可が必要です（システム設定 > プライバシーとセキュリティ）"
+            tint = .systemYellow
+        } else if PermissionGuide.enabled && PermissionCheck.micDenied {
+            line = "マイクの許可が必要です（下の「許可の案内を開く」）"
             tint = .systemYellow
         }
+        permissionItem?.isHidden = !PermissionGuide.enabled || PermissionCheck.missingNow().isEmpty
         button.image = symbol.isEmpty ? image : NSImage(systemSymbolName: symbol, accessibilityDescription: "Koe")
         button.image?.accessibilityDescription = "Koe"
         button.contentTintColor = tint
@@ -3625,7 +3693,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         writeState(isBusy ? "busy" : "idle")
         if terminating && !isBusy { terminating = false; NSApp.reply(toApplicationShouldTerminate: true) }
         statusLine?.title = line
-        missLine?.title = "マイク: \(recorder.activeName)\(recorder.primaryMuted ? " ※いまミュート中" : "")"
+        missLine?.title = "マイク: \(recorder.activeName)\(recorder.primaryMuted ? " ※いまミュート中" : "")\(MicNotice.lineSuffix(recorder.notice))"
 
         enterItem?.state = Settings.autoEnter ? .on : .off
         if current?.locked == true {

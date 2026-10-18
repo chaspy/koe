@@ -36,7 +36,8 @@ type pastedText struct {
 type utterance struct {
 	pressedAt  time.Time
 	releasedAt time.Time
-	app        string // exe name of the foreground app at press time
+	app        string       // exe name of the foreground app at press time
+	hwnd       windows.HWND // foreground window at press time (brought back if another app is in front at paste time)
 	held       time.Duration
 	pcm        []int16
 	record     map[string]any
@@ -862,7 +863,7 @@ func (a *App) begin(ev keyEvent) {
 	if err != nil {
 		a.log.Printf("foreground_exe_failed %v", err)
 	}
-	u := &utterance{pressedAt: ev.at, app: core.ExeName(exe), record: map[string]any{}}
+	u := &utterance{pressedAt: ev.at, app: core.ExeName(exe), hwnd: windows.GetForegroundWindow(), record: map[string]any{}}
 	a.lastUsed.Store(time.Now().UnixNano())
 	t0 := time.Now()
 	if err := a.rec.Start(); err != nil {
@@ -1150,7 +1151,22 @@ func (a *App) paste(u *utterance, text string) error {
 	}
 	name := core.ExeName(exe)
 	u.record["paste_app"] = name
-	if core.TargetChanged(u.app, name) {
+	decision := core.FocusDecision(u.app, name, time.Since(u.pressedAt), a.cfg.RestoreFocus)
+	if decision == core.FocusRestore {
+		// another app came to the front while transcribing: bring back the window of the press
+		if ms, reason := restoreForeground(u.hwnd, u.app); reason == "" {
+			a.log.Printf("focus_restored app=%s from_app=%s restore_ms=%d", u.app, name, ms)
+			u.record["restored_focus"], u.record["restore_ms"], u.record["restored_from"] = true, ms, name
+			exe = windowExe(u.hwnd)
+			name = core.ExeName(exe)
+			u.record["paste_app"] = name
+			decision = core.FocusPaste
+		} else {
+			a.log.Printf("focus_restore_failed app=%s from_app=%s reason=%s ms=%d", u.app, name, reason, ms)
+			u.record["restore_failed"] = reason
+		}
+	}
+	if decision != core.FocusPaste {
 		a.log.Printf("paste_target_changed start_app=%s paste_app=%s chars=%d -> clipboard only", u.app, name, len([]rune(text)))
 		if err := setClipboardText(text); err != nil {
 			return err
@@ -1173,12 +1189,14 @@ func (a *App) paste(u *utterance, text string) error {
 		return err
 	}
 	time.Sleep(30 * time.Millisecond)
-	if err := sendCtrlV(); err != nil {
+	pasteKey := core.PasteKeyFor(exe, a.cfg.PasteKeys, a.cfg.TerminalPasteKeys)
+	if err := sendPaste(pasteKey); err != nil {
 		return err
 	}
 	ms := time.Since(u.releasedAt).Milliseconds()
 	u.record["release_to_paste_ms"] = ms
-	a.log.Printf("paste app=%s start_app=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, u.app, len([]rune(text)), time.Since(t0).Milliseconds(), ms)
+	u.record["paste_key"] = pasteKey
+	a.log.Printf("paste app=%s start_app=%s key=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, u.app, pasteKey, len([]rune(text)), time.Since(t0).Milliseconds(), ms)
 
 	entered := false
 	if a.cfg.AutoEnter && core.IsTerminal(exe, a.cfg.EnterApps) {

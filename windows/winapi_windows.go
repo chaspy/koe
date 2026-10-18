@@ -64,10 +64,13 @@ const (
 	vkRControl = 0xA3
 	vkRMenu    = 0xA5
 	vkV        = 0x56
+	vkShift    = 0x10
+	vkInsert   = 0x2D
 	vkMaskKey  = 0xE8 // unassigned; used like AutoHotkey's menu mask key
 
-	inputKeyboard  = 1
-	keyeventfKeyUp = 0x0002
+	inputKeyboard        = 1
+	keyeventfKeyUp       = 0x0002
+	keyeventfExtendedKey = 0x0001
 
 	cfUnicodeText = 13
 	gmemMoveable  = 0x0002

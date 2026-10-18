@@ -2,6 +2,18 @@
 
 Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each release's notes on GitHub are taken from its section here.
 
+## 0.8.0 — 2026-10-17
+
+### macOS
+- Fixed: when another app (a browser, System Settings…) came to the front while Koe was transcribing, Koe did not paste and only left the text on the clipboard. Koe now brings back the app and window you started talking in and pastes there — the focus stays there, and Enter follows the usual terminal rule. Only if that window is gone, will not come back, or the press was more than 20 s ago does Koe keep the text on the clipboard as before. `defaults write io.github.chaspy.koe restoreFocus -bool false` turns it off.
+- Opt-in (`defaults write io.github.chaspy.koe permissionGuide -bool true`, off by default): when the Accessibility or Microphone permission is missing — on first launch, or when an update dropped it — a small guide now floats next to System Settings (without taking the focus) with the steps, a Koe icon you can drag into the list, and buttons to open the right page, check again and restart Koe; it closes by itself once the switch is on. The menu shows 「許可の案内を開く…」 while a permission is missing. When off, Koe keeps the 0.5.0 notice.
+- New menu item 辞書を見る… (off by default; turn on with `defaults write io.github.chaspy.koe glossaryView -bool true`) lists your own dictionary, the organisation dictionary and term packs, marks which of your words Koe learned by itself, shows when the organisation dictionary was last fetched, and says how many words don't fit in the transcription hint. Once a week, after you finish talking, a small note under the menu bar says how many words Koe learned (no notification permission needed; it disappears after 8 seconds).
+- Microphone warnings: when the mic in use is Bluetooth (e.g. AirPods), the menu shows ⚠ 内蔵マイク推奨 (Bluetooth mics switch to low call-quality audio and lose words). With the MacBook lid closed, the built-in mic is no longer used as the fallback mic, the mic menu marks it, and a recording that comes back silent from it says the lid is the reason. Off by default: `defaults write io.github.chaspy.koe micNotice -bool true`.
+
+### Windows
+- Fixed: when another app came to the front while Koe was transcribing, Koe did not paste and only left the text on the clipboard. Koe now brings back the window you started talking in and pastes there (the focus stays there; Enter follows the usual terminal rule). Only if that window is gone, will not come back, or the press was more than 20 s ago does Koe keep the text on the clipboard as before. `"restoreFocus": false` in config.json turns it off.
+- Opt-in `terminalPasteKeys` (config.json, off by default): pastes with each terminal's own paste key — Ctrl+Shift+V in Windows Terminal, WezTerm, Alacritty, Hyper and Tabby, Shift+Insert in mintty (Git Bash), Ctrl+V elsewhere — so pasting into WezTerm and Alacritty no longer types nothing. `pasteKeys` sets the key for any app, also with it off.
+
 ## 0.7.0 — 2026-10-17
 
 ### Repository

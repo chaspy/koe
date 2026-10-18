@@ -384,7 +384,7 @@ def _is_terminal_paste(r):
 # ① 入力された の失敗として数える events.jsonl の outcome（daily / misses / trend で共通）。
 # tracks・mic_restarted・enter_scheduled などは押下の結果ではない記録なので数えない
 PRESS_FAILS = ("no_voice", "mic_silent", "hallucination", "error", "not_ready", "start_failed", "missed_press",
-               "no_accessibility", "target_changed", "paste_failed")
+               "no_accessibility", "no_microphone", "target_changed", "paste_failed")
 
 
 def _is_press_fail(e):

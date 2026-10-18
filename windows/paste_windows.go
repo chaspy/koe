@@ -9,6 +9,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/chaspy/koe/windows/core"
 	"golang.org/x/sys/windows"
 )
 
@@ -43,7 +44,17 @@ func sendInputs(in []keyboardInput) error {
 	return nil
 }
 
-func sendCtrlV() error {
+// sendPaste sends the paste key (core.PasteCtrlV / PasteCtrlShiftV / PasteShiftInsert).
+func sendPaste(k string) error {
+	switch k {
+	case core.PasteCtrlShiftV:
+		return sendInputs([]keyboardInput{key(vkControl, false), key(vkShift, false), key(vkV, false), key(vkV, true), key(vkShift, true), key(vkControl, true)})
+	case core.PasteShiftInsert:
+		ins, insUp := key(vkInsert, false), key(vkInsert, true)
+		ins.Flags |= keyeventfExtendedKey // the Insert key, not numpad 0
+		insUp.Flags |= keyeventfExtendedKey
+		return sendInputs([]keyboardInput{key(vkShift, false), ins, insUp, key(vkShift, true)})
+	}
 	return sendInputs([]keyboardInput{key(vkControl, false), key(vkV, false), key(vkV, true), key(vkControl, true)})
 }
 

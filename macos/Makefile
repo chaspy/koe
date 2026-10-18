@@ -68,6 +68,12 @@ test:
 	./build/window-test
 	swiftc -O -o build/visible-test Sources/Koe/PasteVisible.swift Tests/visible/main.swift
 	./build/visible-test
+	swiftc -O -o build/permission-test Sources/Koe/PermissionGuide.swift Tests/permission/main.swift
+	./build/permission-test
+	swiftc -O -o build/glossary-test Sources/Koe/GlossaryCatalog.swift Tests/glossary/main.swift
+	./build/glossary-test
+	swiftc -O -o build/micnotice-test Sources/Koe/MicNotice.swift Tests/micnotice/main.swift
+	./build/micnotice-test
 
 clean:
 	rm -rf .build build
