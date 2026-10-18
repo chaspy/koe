@@ -2,6 +2,11 @@
 
 Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each release's notes on GitHub are taken from its section here.
 
+## Unreleased
+
+### Repository
+- Align README and usage/data guides with current setting defaults and menu labels, document opt-in steps, repair setup/document links, and add a short Troubleshooting guide.
+
 ## 0.7.0 — 2026-10-17
 
 ### Repository

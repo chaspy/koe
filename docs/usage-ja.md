@@ -1,8 +1,10 @@
 # Koe の使い方
 
 Koe は、キーを押して話すと文字にして貼り付ける、Mac のメニューバーアプリです。
-音声も文字も自分の Mac の中で処理し、既定では外に送りません（「使うほど賢くする」をオンにしたときを除く）。メニューバーの吹き出しのアイコンが Koe です。
+音声も文字も自分の Mac の中で処理し、既定では外に送りません。メニューバーの吹き出しのアイコンが Koe です。
 何を手元に残し、何がいつ外に出るかは [Koe が扱うデータ](data-ja.md) にまとめています。
+
+Optional LLM cleanup and the improvement loop can send text to the configured service; see [data handling](data-ja.md).
 
 ## 基本: 押している間だけ話す
 
@@ -28,19 +30,22 @@ Koe は、キーを押して話すと文字にして貼り付ける、Mac のメ
 |---|---|
 | 押して話すキー | 右⌘ / 右⌥ / 右⌃ / fn。US 配列で ⌘+Space などと重なるときに変える |
 | 押し方 | 「押している間だけ録音」（既定）か「押すたびに開始・終了（トグル）」。トグルでは、短く押すと録音が始まり、もう一度押すと終わって貼り付けます |
-| 区切りごとに改行する | Google Docs などに長く話すとき用。ターミナル以外で、区切りごとに改行します |
+| 区切りごとに改行する（ターミナル以外。Docs 向け） | `lineBreaks`: off by default. Click to enable line breaks in non-terminal apps. |
 | 用語パック | よく使う語を正しい表記で聞き取らせる辞書。開発用（developer）は最初から入っています |
-| マイク | 使うマイクと、会議アプリでミュートしたときの予備のマイク |
-| 使うほど賢くする | 誤変換を自分の辞書に足していく（自分の Claude Code を使います） |
-| 最近の文字起こし | 貼り付けに失敗したときに、ここから取り出せます |
+| マイク | Select a fixed input or automatic mode; set the preferred backup with `fallbackMicName` (see below). |
+| 使うほど賢くする（改善ループ） | `improveEnabled`: off by default. Click and confirm the destination to enable glossary learning; the default command is `claude -p --model sonnet`. |
+| 最近の文字起こし（クリックでコピー） | 貼り付けに失敗したときに、ここから取り出せます |
 | 履歴を残す期間 | 録音と文字起こしの履歴（`~/Library/Application Support/Koe/history`）は、既定で録音 14 日・文字 30 日残して消します（全体が 1GB を超えたら古い録音から）。7 / 14 / 30 / 90 日 / ずっと から選べます。ロック録音の `書類/Koe` は消しません |
 
 ## うまくいかないとき
 
+- **Permissions / no paste:** allow Microphone and Accessibility in System Settings → Privacy & Security. If Accessibility stopped working after an update, remove and re-add Koe ([why](notes/signing.md#changing-the-certificate)). Keep the original app focused; if the target changes, Koe leaves the text on the clipboard instead. Use ⌘V or 「最近の文字起こし（クリックでコピー）」 to recover it.
+- **The first word is cut off:** turn on 「マイクを常時待機（頭切れ防止）」 (`warmMic`, default `true`), which keeps 0.5 s before the key press. Recording continues for 0.25 s after release.
+- **Muted mic:** 「マイク」 selects a fixed input or 「自動（既定のマイク…）」. Automatic mode uses another working mic during hardware mute (`fallbackMic`, default `true`). To prefer a backup, quit Koe, run `defaults write io.github.chaspy.koe fallbackMicName -string "Your backup mic name"`, and relaunch. A fixed mic does not use automatic fallback.
+
 - **声が途切れる・聞き取られない**: マイクを口元に近づけるか、システム設定 → サウンド → 入力 で入力音量を上げる（声が小さいと Koe が知らせます）
-- **会議中に声を拾わない**: 会議アプリでマイクをミュートすると、Koe もそのマイクから音を取れません。メニューの「マイク」で予備のマイクを選んでおく
-- **貼られなかった**: メニューの「最近の文字起こし」から取り出せます
-- **遅い・動かない・おかしい**: メニューの **「診断情報を書き出す」** を押すと、デスクトップに zip ができます。それを作者に送ってください。版・機種・設定（秘密の値は伏せる）・動作の記録と速さが入ります。文字起こしの本文・録音・辞書の中身は入りません
+- **貼られなかった**: メニューの「最近の文字起こし（クリックでコピー）」から取り出せます
+- **遅い・動かない・おかしい**: メニューの **「診断情報を書き出す（不具合を送る用）」** を押すと、デスクトップに zip ができます。それを作者に送ってください。版・機種・設定（秘密の値は伏せる）・動作の記録と速さが入ります。文字起こしの本文・録音・辞書の中身は入りません
 
 ## 更新
 

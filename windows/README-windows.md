@@ -5,7 +5,7 @@
 
 ## インストール
 
-1. `Koe-windows-x64.zip` を好きな場所（例: `ドキュメント\Koe`）に展開します。
+1. `Koe-<version>-windows-x64.zip` を好きな場所（例: `ドキュメント\Koe`）に展開します。
 2. 展開したフォルダの `Koe.exe` をダブルクリックします。
    - 署名していないため「Windows によって PC が保護されました」と出ます。**「詳細情報」→「実行」** を押してください。
 3. 初回は音声認識モデル（small-q5_1、約 190MB）をダウンロードします。1〜2 分かかります。
@@ -69,7 +69,7 @@ https://aka.ms/vs/17/release/vc_redist.x64.exe
 
 ## 速さの目安
 
-GitHub Actions の Windows（AMD EPYC 7763・2 コア・GPU なし）で測った結果です（詳しくは `bench/results.md`。音声は合成音声）。
+GitHub Actions の Windows（AMD EPYC 7763・2 コア・GPU なし）で測った結果です（詳しくは [bench/results.md](bench/results.md)。音声は合成音声）。
 
 - **small-q5_1 ＋ 速さ優先（既定）が、速さと精度のバランスがいちばん良い**結果でした。
 - 速さ優先の枠の最小は 15 秒ぶん（768）です。以前の最小（約 7.7 秒ぶん）は合成音声では問題がなかったものの、本物の声では 1〜6 秒の短い発話で別の文になることが多く、引き上げました。15 秒ぶんにすると、どの長さでも 30 秒ぶん全体と同じくらいの精度で、時間は全体の約半分（2 コアで 1 回 7〜8 秒。全体だと 16〜22 秒）でした。
@@ -104,7 +104,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `pressMode` | `"hold"` | 押し方。`"hold"`（押している間だけ録音）か `"toggle"`（押すたびに開始・終了） |
 | `engine` | `"whisper"` | 文字起こしのエンジン（試験中）。`"whisper"`（今までどおり）か `"parakeet"`（Parakeet-ja。下の「文字起こしエンジン（試験中）」） |
 | `model` | `"ggml-small-q5_1.bin"` | モデルのファイル名（`%LOCALAPPDATA%\Koe\models` 内）か絶対パス。`"small-q5_1"` のような短い名前も可 |
-| `threads` | `0` | 文字起こしに使うスレッド数。`0` は自動（論理プロセッサ数、最大 16） |
+| `threads` | `0` | Transcription threads. `0`: whisper uses logical processors (up to 16); Parakeet uses half (up to 4). |
 | `audioCtx` | `"auto"` | 文字起こしの枠の大きさ。`"auto"` は話した長さに合わせる（最小 15 秒ぶん＝768、それより長い発話は長さに合わせて広げる。30 秒以上は全体）、`0` は毎回 30 秒ぶん全体（遅いが元の精度）、数値は固定（1 秒 = 50、最大 1500）。メニューの「速さ優先」で `"auto"` / `0` を切り替えられます。large-v3 系のモデルでは常に `0` |
 | `gpu` | `"auto"` | GPU を使うか。`"auto"` は使える GPU があり、CPU より速いときだけ GPU（上の「GPU」）、`"off"` は常に CPU |
 | `gpuAudioCtx` | `0` | GPU で動いているときの枠の大きさ（`audioCtx` と同じ書き方）。既定は 30 秒ぶん全体 |
@@ -135,12 +135,12 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 
 - 個人の辞書: `%APPDATA%\Koe\glossary.txt`（1 行 1 語。タブの後に誤変換された形を `／` 区切り）
 - 自作の用語パック: `%APPDATA%\Koe\packs\*.txt`（`enabledPacks` に名前を入れると有効）
-- 書き方は同梱の `CONTRIBUTING.md` を見てください。
+- 書き方は [CONTRIBUTING.md](../CONTRIBUTING.md) を見てください。
 - `%USERPROFILE%\.claude` があれば、Claude Code 向けの誤変換メモ（`koe-voice-glossary.md`）をそこに書き出します。
 
 ## 不具合のときに送ってほしいもの
 
-**遅い・動かないときは、メニューの「診断情報を書き出す」でできた zip を送ってください。** デスクトップに `Koe-diagnostics-<日時>.zip` ができます。中身は次のとおりで、録音した音声と文字起こしの中身は入りません（設定のうち key / token / secret / password を含む項目の値は `***` に置き換えます）。
+**遅い・動かないときは、メニューの「診断情報を書き出す（送る用）」でできた zip を送ってください。** デスクトップに `Koe-diagnostics-<日時>.zip` ができます。中身は次のとおりで、録音した音声と文字起こしの中身は入りません（設定のうち key / token / secret / password を含む項目の値は `***` に置き換えます）。
 
 - `diagnostics.txt` … Koe と Windows のバージョン、CPU 名、論理プロセッサ数、メモリ、モデル、スレッド数、押し方、録音キー、用語パック、その他の設定
 - `koe.log` の最後の 2000 行、`whisper-server.log` の最後の 500 行、`whisper-server-vulkan.log`（GPU 用を起動したことがあれば）、`update.log`（あれば）
