@@ -316,9 +316,13 @@ func (r *Recorder) Discard() {
 func (r *Recorder) Reopen(reason string) {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
-	r.finishFallback()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// A previous utterance can finish processing after the next one starts.
+	// Do not interrupt that recording or its fallback worker.
+	if r.recording {
+		return
+	}
 	r.log("mic_reopen reason=%s", reason)
 	r.closeLocked()
 	if r.warm {
