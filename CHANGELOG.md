@@ -2,6 +2,11 @@
 
 Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each release's notes on GitHub are taken from its section here.
 
+## Unreleased
+
+### Repository
+- Add an opt-in public JSUT v1.1 benchmark for 200 fixed clips: corpus CER, median/p95 inference latency and repetition counts for macOS turbo with/without packs and the Windows small CPU profile. Downloads stay in an external cache; only aggregate metrics are reported.
+
 ## 0.7.0 — 2026-10-17
 
 ### Repository
