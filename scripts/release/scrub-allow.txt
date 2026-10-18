@@ -1,3 +1,4 @@
 # Allowed false positives of scripts/release/scrub.sh (generic patterns only;
 # denylist hits cannot be allowed). One "path:hash" per line, as printed by
 # the scrub for the hit, followed by "# why it is fine".
+macos/Tests/syncedterms/main.swift:8dbb92d7b15f0d38  # test fixture path with the placeholder user "x" (#178), not a real home directory

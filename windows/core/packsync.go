@@ -17,10 +17,29 @@ func ParseGhSource(src string) (GhSource, bool) {
 		return GhSource{}, false
 	}
 	parts := strings.SplitN(strings.TrimPrefix(src, "gh:"), "/", 3)
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+	if len(parts) != 3 || !safeSegment(parts[0], 39) || !safeSegment(parts[1], 100) || len(parts[2]) > 512 {
 		return GhSource{}, false
 	}
+	for _, seg := range strings.Split(parts[2], "/") {
+		if !safeSegment(seg, 255) {
+			return GhSource{}, false
+		}
+	}
 	return GhSource{parts[0], parts[1], parts[2]}, true
+}
+
+// safeSegment: 1..max characters from [A-Za-z0-9._-], and not "." or "..".
+func safeSegment(s string, max int) bool {
+	if s == "" || len(s) > max || s == "." || s == ".." {
+		return false
+	}
+	for _, c := range s {
+		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // GhArgs are the gh CLI arguments that fetch the raw file.

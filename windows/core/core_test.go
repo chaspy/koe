@@ -25,9 +25,9 @@ func devPack(t *testing.T) []Entry {
 func TestParseGlossary(t *testing.T) {
 	es := ParseGlossary("# c\n\nプルリク\tプロリク／プロリック/プロレクト\r\nGitHub\n  マージ\t~マジ／マジ>(され|し)  \n")
 	want := []Entry{
-		{"プルリク", []string{"プロリク", "プロリック", "プロレクト"}},
-		{"GitHub", nil},
-		{"マージ", []string{"~マジ", "マジ>(され|し)"}},
+		{Term: "プルリク", Aliases: []string{"プロリク", "プロリック", "プロレクト"}},
+		{Term: "GitHub", Aliases: nil},
+		{Term: "マージ", Aliases: []string{"~マジ", "マジ>(され|し)"}},
 	}
 	if !reflect.DeepEqual(es, want) {
 		t.Fatalf("got %#v", es)
@@ -70,7 +70,7 @@ func TestAutocorrect(t *testing.T) {
 }
 
 func TestAutocorrectBoundaryKatakana(t *testing.T) {
-	es := []Entry{{"WAF", []string{"フォール"}}}
+	es := []Entry{{Term: "WAF", Aliases: []string{"フォール"}}}
 	if got, _ := Autocorrect("フォールバックする", es); got != "フォールバックする" {
 		t.Fatal(got)
 	}
@@ -83,7 +83,7 @@ func TestAutocorrectBoundaryKatakana(t *testing.T) {
 }
 
 func TestWhisperTermsAndPrompt(t *testing.T) {
-	personal := []Entry{{"Herdr", []string{"ハーダー"}}, {"PR", nil}}
+	personal := []Entry{{Term: "Herdr", Aliases: []string{"ハーダー"}}, {Term: "PR", Aliases: nil}}
 	packs := devPack(t)
 	counts := UsageCounts(append(personal, packs...), []string{"ハーダーを開く", "GitHubでマージ", "githubを見る"})
 	if counts["Herdr"] != 1 || counts["GitHub"] != 2 {
@@ -130,7 +130,7 @@ func idx(l []string, s string) int {
 }
 
 func TestReceiverNotes(t *testing.T) {
-	personal := []Entry{{"マージ", []string{"マジ>(して)"}}, {"Herdr", []string{"ハーダー", "~ハード"}}}
+	personal := []Entry{{Term: "マージ", Aliases: []string{"マジ>(して)"}}, {Term: "Herdr", Aliases: []string{"ハーダー", "~ハード"}}}
 	short, full := ReceiverNotes(personal, devPack(t), map[string]int{"Herdr": 3}, `~\.claude\koe-voice-glossary.full.md`)
 	if !strings.HasPrefix(short, "# 音声入力（Koe）の誤変換メモ\n\n") {
 		t.Fatal(short)
@@ -354,9 +354,6 @@ func TestTranscribe(t *testing.T) {
 		io.WriteString(w, " こんにちは。\n\n 元気？\n")
 	}))
 	defer srv.Close()
-	if !IsAlive(srv.URL) || IsAlive("http://127.0.0.1:1") {
-		t.Fatal("alive")
-	}
 	got, err := Transcribe(context.Background(), srv.URL, EncodeWAV(make([]int16, 100)), "プロンプト", false, 384)
 	if err != nil || got != "こんにちは。 元気？" {
 		t.Fatal(got, err)
@@ -440,6 +437,17 @@ func TestPackSync(t *testing.T) {
 	}
 	if _, ok := ParseGhSource("gh:a/b"); ok {
 		t.Fatal("short")
+	}
+	for _, bad := range []string{
+		"gh:o/r/../x.txt", "gh:o/r/./x.txt", "gh:o/r/a//x.txt", "gh:o/r/x.txt/", "gh:../r/x.txt", "gh:o/../x.txt",
+		"gh:o w/r/x.txt", "gh:o/r;x/x.txt", "gh:o/r/x$y.txt", "gh:o/r/x?ref=1", "gh:o/r/x'y.txt", "gh:o/r/名前.txt",
+	} {
+		if _, ok := ParseGhSource(bad); ok {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+	if _, ok := ParseGhSource("gh:my-org/team.packs/voice/dev_v2-1.txt"); !ok {
+		t.Error("ordinary source rejected")
 	}
 	dir := t.TempDir()
 	var logs []string

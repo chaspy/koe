@@ -1,3 +1,4 @@
+// test-sources: MicTap.swift ../KoeObjC/KoeObjC.m
 // make test: Sources/Koe/MicTap.swift の単体テスト（XCTest なしで動く）
 // #156: installTap(onBus:) が 0 ch / 0 Hz の形式で NSException を投げて Koe ごと落ちていた
 import AVFoundation

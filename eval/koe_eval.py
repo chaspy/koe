@@ -35,6 +35,7 @@ import difflib
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -47,7 +48,6 @@ HISTORY = Path(os.environ.get("KOE_HISTORY", Path.home() / "Library/Application 
 EVALS = HISTORY.parent / "evals"
 WHISPER_HOME = Path(os.environ.get("WHISPER_CPP_HOME", Path.home() / ".local/src/whisper.cpp"))
 DEFAULT_MODEL = WHISPER_HOME / "models/ggml-large-v3-turbo.bin"
-EVAL_PORT = int(os.environ.get("KOE_EVAL_PORT", "18090"))  # 並行して回すときはずらす
 CLAUDE_PROJECTS = Path(os.environ.get("CLAUDE_PROJECTS", Path.home() / ".claude/projects"))
 DEFAULT_LLM_PROMPT = Path(__file__).resolve().parent.parent / "macos/Resources/cleanup_prompt.txt"
 
@@ -114,28 +114,66 @@ def summarize(rows, keys):
 
 # ---------- whisper / llm ----------
 
+# The whisper-server this process started (set by start_server, checked by transcribe).
+_server_proc = None
+_server_url = None
+
+
+def free_port():
+    """A loopback port that is free right now, chosen fresh for every server start."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_ready(proc, url, attempts=240, interval=0.5, opener=urllib.request.urlopen):
+    """Wait until our own child answers /health with 200. Fails as soon as the child exits."""
+    for _ in range(attempts):
+        if proc.poll() is not None:
+            raise RuntimeError("whisper-server exited during startup")
+        try:
+            with opener(url + "/health", timeout=1) as resp:
+                if resp.status == 200:
+                    return
+        except OSError:
+            pass
+        time.sleep(interval)
+    raise TimeoutError("whisper-server startup timed out")
+
+
 def start_server(model, prompt):
+    global _server_proc, _server_url
     exe = WHISPER_HOME / "build/bin/whisper-server"
+    port = free_port()
     args = [str(exe), "-m", str(model), "-l", "ja", "--host", "127.0.0.1",
-            "--port", str(EVAL_PORT), "-t", "4"]
+            "--port", str(port), "-t", "4"]
     if prompt:
         args += ["--prompt", prompt]
     # 例: KOE_EVAL_SERVER_ARGS="-bs 5" でビームサーチを試す
     args += os.environ.get("KOE_EVAL_SERVER_ARGS", "").split()
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(240):
-        try:
-            urllib.request.urlopen(f"http://127.0.0.1:{EVAL_PORT}/", timeout=1)
-            return proc
-        except Exception:
-            if proc.poll() is not None:
-                sys.exit("whisper-server exited during startup")
-            time.sleep(0.5)
-    proc.kill()
-    sys.exit("whisper-server startup timed out")
+    url = f"http://127.0.0.1:{port}"
+    try:
+        wait_ready(proc, url)
+    except (RuntimeError, TimeoutError) as e:
+        proc.kill()
+        proc.wait()
+        sys.exit(str(e))
+    _server_proc, _server_url = proc, url
+    return proc
+
+
+def server_url():
+    """URL of the server start_server launched; fails if it is not running any more."""
+    if _server_proc is None or _server_url is None:
+        raise RuntimeError("whisper-server was not started by start_server")
+    if _server_proc.poll() is not None:
+        raise RuntimeError("whisper-server is no longer running")
+    return _server_url
 
 
 def transcribe(wav, prompt=None):
+    url = server_url()
     boundary = uuid.uuid4().hex
     parts = []
     fields = [("response_format", "text"), ("temperature", "0.0")]
@@ -146,7 +184,7 @@ def transcribe(wav, prompt=None):
     parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
                  f"Content-Type: audio/wav\r\n\r\n".encode() + wav.read_bytes() + b"\r\n")
     parts.append(f"--{boundary}--\r\n".encode())
-    req = urllib.request.Request(f"http://127.0.0.1:{EVAL_PORT}/inference", data=b"".join(parts),
+    req = urllib.request.Request(f"{url}/inference", data=b"".join(parts),
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     text = urllib.request.urlopen(req, timeout=300).read().decode()
     return " ".join(line.strip() for line in text.splitlines() if line.strip())

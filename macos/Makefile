@@ -61,36 +61,13 @@ dist: build
 notarize: dist
 	TEAM_ID=$(TEAM_ID) SIGN_IDENTITY="$(DIST_IDENTITY)" bash scripts/notarize.sh build/Koe-$(VERSION).dmg
 
-# 文字列処理の単体テスト（XCTest は Command Line Tools に無いので swiftc で直接ビルドする）
+# Unit tests: every Tests/<name>/main.swift, built with swiftc (no XCTest in the
+# Command Line Tools). The sources a test needs are on its
+# "// test-sources: A.swift B.swift" line, so adding a test needs no Makefile change.
+# One test: make test T=people
+T ?=
 test:
-	mkdir -p build
-	swiftc -O -o build/text-test Sources/Koe/Repeats.swift Tests/text/main.swift
-	./build/text-test
-	swiftc -O -o build/update-test Sources/Koe/UpdatePrompt.swift Sources/Koe/AppIcon.swift Tests/update/main.swift
-	./build/update-test
-	swiftc -O -o build/paste-test Sources/Koe/PasteTarget.swift Tests/paste/main.swift
-	./build/paste-test
-	swiftc -O -o build/history-test Sources/Koe/Retention.swift Tests/history/main.swift
-	./build/history-test
-	swiftc -O -o build/people-test Sources/Koe/People.swift Sources/Koe/AliasReplace.swift Tests/people/main.swift
-	./build/people-test
-	swiftc -O -o build/redaction-test Sources/Koe/Redaction.swift Tests/redaction/main.swift
-	./build/redaction-test
-	swiftc -O -o build/window-test Sources/Koe/AudioWindow.swift Tests/window/main.swift
-	./build/window-test
-	swiftc -O -o build/visible-test Sources/Koe/PasteVisible.swift Tests/visible/main.swift
-	./build/visible-test
-	swiftc -O -o build/permission-test Sources/Koe/PermissionGuide.swift Tests/permission/main.swift
-	./build/permission-test
-	swiftc -O -o build/glossary-test Sources/Koe/GlossaryCatalog.swift Tests/glossary/main.swift
-	./build/glossary-test
-	swiftc -O -o build/micnotice-test Sources/Koe/MicNotice.swift Tests/micnotice/main.swift
-	./build/micnotice-test
-	clang -fobjc-arc -ISources/KoeObjC/include -c Sources/KoeObjC/KoeObjC.m -o build/KoeObjC.o
-	swiftc -O -I Sources/KoeObjC/include -o build/mictap-test Sources/Koe/MicTap.swift Tests/mictap/main.swift build/KoeObjC.o
-	./build/mictap-test
-	swiftc -O -o build/vad-test Sources/Koe/VAD.swift Tests/vad/main.swift
-	./build/vad-test
+	bash scripts/test.sh $(T)
 
 clean:
 	rm -rf .build build

@@ -39,6 +39,7 @@ type Pass struct {
 	Raw      string   // the recognizer's text (trimmed)
 	Text     string   // after Autocorrect
 	Applied  []string // corrections
+	Synced   bool     // a term from a synced pack was put in
 	Err      error
 }
 
@@ -64,6 +65,7 @@ type UtteranceResult struct {
 	RetriedForStock       bool   // a stock phrase such as (音楽) was inside the text
 	StockBeforeRetry      string // the text that had it
 	StockRemoved          string // the retry's text before the stock phrase was removed
+	SyncedReplaced        bool   // the text has a term from a synced pack (no automatic Enter)
 	Err                   error
 }
 
@@ -94,7 +96,8 @@ func TranscribeUtterance(ctx context.Context, r UtteranceRequest) UtteranceResul
 		res.TotalMS += p.MS
 		if err == nil {
 			p.Raw = strings.TrimSpace(raw)
-			p.Text, p.Applied = Autocorrect(p.Raw, r.Entries)
+			p.Text, p.Applied, p.Synced = AutocorrectSynced(p.Raw, r.Entries)
+			res.SyncedReplaced = p.Synced // the last pass is the one whose text is used
 		}
 		res.Passes = append(res.Passes, p)
 		if r.OnPass != nil {

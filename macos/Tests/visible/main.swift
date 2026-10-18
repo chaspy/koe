@@ -1,3 +1,4 @@
+// test-sources: PasteVisible.swift
 // make test: Sources/Koe/PasteVisible.swift の単体テスト（貼った文の末尾が画面に出たか）
 import Foundation
 

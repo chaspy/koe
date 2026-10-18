@@ -1,3 +1,4 @@
+// test-sources: PermissionGuide.swift
 // make test: Sources/Koe/PermissionGuide.swift の単体テスト（許可の判定・文言・置き場所）
 import AppKit
 import AVFoundation

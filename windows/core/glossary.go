@@ -23,6 +23,7 @@ import (
 type Entry struct {
 	Term    string
 	Aliases []string
+	Synced  bool // from a pack synced from packSources (synced.go)
 }
 
 // ParseGlossary parses "term<TAB>alias／alias" lines. '#' lines are comments.
@@ -89,62 +90,88 @@ type correction struct {
 	head   string // the form to find
 	follow *regexp.Regexp
 	right  string
+	synced bool
 }
 
 // Autocorrect replaces sure misrecognitions of personal + pack entries.
 // It returns the corrected text and the applied replacements ("wrong→right").
 func Autocorrect(text string, entries []Entry) (string, []string) {
-	var pairs []correction
-	for _, e := range entries {
-		for _, a := range Sure(e.Aliases) {
-			if runeLen(a) < 2 || a == e.Term {
-				continue
-			}
-			parts := strings.SplitN(a, ">", 2)
-			c := correction{wrong: a, head: parts[0], right: e.Term}
-			if len(parts) > 1 {
-				re, err := regexp.Compile("^(?:" + parts[1] + ")")
-				if err != nil {
-					continue
-				}
-				c.follow = re
-			}
-			if c.head == "" {
-				continue
-			}
-			pairs = append(pairs, c)
-		}
-	}
-	// longer forms first (stable, like the mac sort on count)
-	sort.SliceStable(pairs, func(i, j int) bool { return runeLen(pairs[i].wrong) > runeLen(pairs[j].wrong) })
+	t, applied, _ := AutocorrectSynced(text, entries)
+	return t, applied
+}
 
+// AutocorrectSynced is Autocorrect that also says whether a term from a synced
+// pack was put in. Synced terms that fail UsableSyncedTerm are not used.
+func AutocorrectSynced(text string, entries []Entry) (string, []string, bool) {
 	var applied []string
+	synced := false
 	t := text
-	for _, p := range pairs {
+	for _, p := range corrections(entries) {
 		if !strings.Contains(t, p.head) {
 			continue
 		}
-		var b strings.Builder
-		n := 0
-		i := 0
-		for i < len(t) {
-			if strings.HasPrefix(t[i:], p.head) && boundaryOK(t, i, i+len(p.head)) &&
-				(p.follow == nil || p.follow.MatchString(t[i+len(p.head):])) {
-				b.WriteString(p.right)
-				i += len(p.head)
-				n++
-				continue
-			}
-			_, size := utf8.DecodeRuneInString(t[i:])
-			b.WriteString(t[i : i+size])
-			i += size
-		}
-		if n > 0 {
+		if out, n := p.replaceAll(t); n > 0 {
 			applied = append(applied, p.head+"→"+p.right)
-			t = b.String()
+			synced = synced || p.synced
+			t = out
 		}
 	}
-	return t, applied
+	return t, applied, synced
+}
+
+// corrections lists the sure aliases of the entries, longer forms first
+// (stable, like the mac sort on count).
+func corrections(entries []Entry) []correction {
+	var pairs []correction
+	for _, e := range entries {
+		if e.Synced && !UsableSyncedTerm(e.Term) {
+			continue
+		}
+		for _, a := range Sure(e.Aliases) {
+			if c, ok := newCorrection(a, e); ok {
+				pairs = append(pairs, c)
+			}
+		}
+	}
+	sort.SliceStable(pairs, func(i, j int) bool { return runeLen(pairs[i].wrong) > runeLen(pairs[j].wrong) })
+	return pairs
+}
+
+func newCorrection(alias string, e Entry) (correction, bool) {
+	if runeLen(alias) < 2 || alias == e.Term {
+		return correction{}, false
+	}
+	parts := strings.SplitN(alias, ">", 2)
+	c := correction{wrong: alias, head: parts[0], right: e.Term, synced: e.Synced}
+	if len(parts) > 1 {
+		re, err := regexp.Compile("^(?:" + parts[1] + ")")
+		if err != nil {
+			return correction{}, false
+		}
+		c.follow = re
+	}
+	return c, c.head != ""
+}
+
+// replaceAll replaces every occurrence of head at word boundaries (and before
+// follow, if set) and returns the text and the count.
+func (p correction) replaceAll(t string) (string, int) {
+	var b strings.Builder
+	n := 0
+	i := 0
+	for i < len(t) {
+		if strings.HasPrefix(t[i:], p.head) && boundaryOK(t, i, i+len(p.head)) &&
+			(p.follow == nil || p.follow.MatchString(t[i+len(p.head):])) {
+			b.WriteString(p.right)
+			i += len(p.head)
+			n++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(t[i:])
+		b.WriteString(t[i : i+size])
+		i += size
+	}
+	return b.String(), n
 }
 
 func boundaryOK(t string, start, end int) bool {
@@ -360,9 +387,10 @@ func contains(list []string, s string) bool {
 
 // Pack is a term pack file (packs/<id>.txt).
 type Pack struct {
-	ID    string
-	Title string
-	Path  string
+	ID     string
+	Title  string
+	Path   string
+	Synced bool // the local copy of a packSources entry (MarkSyncedPacks)
 }
 
 // ListPacks lists *.txt packs in dirs; earlier dirs win on duplicate ids.
@@ -402,7 +430,10 @@ func LoadPackEntries(packs []Pack, enabled []string) []Entry {
 		if err != nil {
 			continue
 		}
-		out = append(out, ParseGlossary(string(b))...)
+		for _, e := range ParseGlossary(string(b)) {
+			e.Synced = p.Synced
+			out = append(out, e)
+		}
 	}
 	return out
 }

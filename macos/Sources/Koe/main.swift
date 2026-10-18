@@ -43,10 +43,6 @@ enum Settings {
     static var language: String { defaults.string(forKey: "language") ?? "ja" }
     // whisper の窓の大きさ: "auto"（既定。Mac では毎回 30 秒ぶん全体。#165）/ 0（毎回 30 秒ぶん全体）/ フレーム数（AudioWindow.swift）
     static var audioCtx: Int { AudioWindow.setting(defaults.object(forKey: "audioCtx")) }
-    static var port: Int {
-        let p = defaults.integer(forKey: "port")
-        return p > 0 ? p : 18080
-    }
     // 句読点と疑問符を付けさせるための初期プロンプト
     static var prompt: String {
         defaults.string(forKey: "prompt") ?? "これで合ってる？はい、承知しました。それって本当？では、次の作業に進みましょう。"
@@ -254,21 +250,20 @@ let hallucinations = [
 
 final class WhisperServer {
     private var process: Process?
-    var baseURL: URL { URL(string: "http://127.0.0.1:\(Settings.port)")! }
+    // Chosen for each launch (OwnServer.swift); Koe never uses a server it did not start
+    private var port = 0
+    var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
 
     func start(onReady: @escaping (Result<Void, Error>) -> Void) {
-        isAlive { alive in
-            if alive { return onReady(.success(())) }
-            // 起動中（読み込み待ち）なら、もう 1 本は起動せずに待つ
-            if self.process?.isRunning == true {
-                return self.waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
-            }
-            do {
-                try self.launch()
-                self.waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
-            } catch {
-                onReady(.failure(error))
-            }
+        // 起動済み・起動中（読み込み待ち）なら、もう 1 本は起動せずに待つ
+        if process?.isRunning == true {
+            return waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
+        }
+        do {
+            try launch()
+            waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
+        } catch {
+            onReady(.failure(error))
         }
     }
 
@@ -281,13 +276,18 @@ final class WhisperServer {
             throw NSError(domain: "Koe", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "モデルが見つかりません: \(Settings.model)"])
         }
+        guard let port = OwnServer.freeLoopbackPort() else {
+            throw NSError(domain: "Koe", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "whisper-server に使うポートを確保できませんでした"])
+        }
+        self.port = port
         let p = Process()
         p.executableURL = URL(fileURLWithPath: Settings.serverBinary)
         p.arguments = [
             "-m", Settings.model,
             "-l", Settings.language,
             "--host", "127.0.0.1",
-            "--port", String(Settings.port),
+            "--port", String(port),
             "-t", "4",
             "--prompt", Settings.prompt,
         ] + VAD.serverArguments()
@@ -308,11 +308,19 @@ final class WhisperServer {
         return dir.appendingPathComponent("whisper-server.log")
     }
 
+    // Our own child is running and holds the port (no network call)
+    private var ownsPort: Bool {
+        guard let p = process, p.isRunning else { return false }
+        return OwnServer.holds(OwnServer.listeners(pid: p.processIdentifier), port: port)
+    }
+
     func isAlive(_ done: @escaping (Bool) -> Void) {
-        var req = URLRequest(url: baseURL)
+        guard ownsPort else { return done(false) }
+        var req = URLRequest(url: baseURL.appendingPathComponent("health"))
         req.timeoutInterval = 1
         URLSession.shared.dataTask(with: req) { _, resp, _ in
-            done((resp as? HTTPURLResponse) != nil)
+            let status = (resp as? HTTPURLResponse)?.statusCode
+            done(OwnServer.isUp(running: self.process?.isRunning == true, holdsPort: self.ownsPort, healthStatus: status))
         }.resume()
     }
 
@@ -356,6 +364,8 @@ final class WhisperServer {
         body.append(audio)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
 
+        // Same error as a stopped server, so the caller restarts it and retries once
+        guard ownsPort else { return done(.failure(URLError(.cannotConnectToHost))) }
         var req = URLRequest(url: baseURL.appendingPathComponent("inference"))
         req.httpMethod = "POST"
         // 長い録音（ロック録音）は文字起こしに時間がかかる
@@ -372,7 +382,7 @@ final class WhisperServer {
                 .map { $0.trimmingCharacters(in: .whitespaces) }
                 .filter { !$0.isEmpty }
                 .joined(separator: keepLines ? "\n" : " ")
-            done(.success(text))
+            done(.success(TranscriptText.removingControls(text)))
         }.resume()
     }
 
@@ -432,9 +442,14 @@ enum Glossary {
         }
         return out
     }
-    static var packs: [Entry] {
+    static var packs: [Entry] { enabledPackFiles.flatMap(\.entries) }
+    // Enabled packs, and whether each is the local copy of a packSources entry (SyncedTerms.swift)
+    static var enabledPackFiles: [(entries: [Entry], synced: Bool)] {
         let on = Set(Settings.enabledPacks)
-        return availablePacks.filter { on.contains($0.id) }.flatMap { parse(read($0.url.path)) }
+        let userDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe/packs")
+        return availablePacks.filter { on.contains($0.id) }.map {
+            (parse(read($0.url.path)), SyncedTerms.isSynced(packURL: $0.url, userPacksDir: userDir, sources: Settings.packSources))
+        }
     }
     static func sure(_ aliases: [String]) -> [String] { aliases.filter { !$0.hasPrefix("~") } }
 
@@ -449,7 +464,10 @@ enum Glossary {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         DispatchQueue.global(qos: .utility).async {
             for src in sources {
-                let name = (src as NSString).lastPathComponent
+                guard let name = PackSource.cacheName(src) else {
+                    Events.log("pack_sync_failed", ["source": src, "reason": "unsupported"])
+                    continue
+                }
                 let dest = dir.appendingPathComponent(name)
                 if !force, let m = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.modificationDate] as? Date,
                    Date().timeIntervalSince(m) < 86400 { continue }
@@ -467,13 +485,13 @@ enum Glossary {
     }
 
     // 取り込み元（gh:owner/repo/path は gh CLI で、https はそのまま）から中身を取る。失敗は nil
+    // Sources outside the allowlist (PackSource.swift) are ignored
     static func fetch(_ src: String) -> Data? {
         if src.hasPrefix("gh:") {
-            let parts = src.dropFirst(3).split(separator: "/", maxSplits: 2).map(String.init)
-            guard parts.count == 3 else { return nil }
+            guard let g = PackSource.gitHub(src), let gh = PackSource.resolveGh() else { return nil }
             let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            p.arguments = ["-lc", "gh api repos/\(parts[0])/\(parts[1])/contents/\(parts[2]) -H 'Accept: application/vnd.github.raw'"]
+            p.executableURL = URL(fileURLWithPath: gh)
+            p.arguments = PackSource.ghArguments(g)
             let out = Pipe()
             p.standardOutput = out
             p.standardError = Pipe()
@@ -482,7 +500,7 @@ enum Glossary {
             p.waitUntilExit()
             return p.terminationStatus == 0 ? data : nil
         }
-        guard let url = URL(string: src) else { return nil }
+        guard let url = PackSource.web(src) else { return nil }
         return try? Data(contentsOf: url)
     }
 
@@ -568,18 +586,27 @@ enum Glossary {
     static func autocorrect(_ text: String) -> String { autocorrectWithLog(text).text }
 
     // 置き換えた内容も返す（効き目の計測用。履歴に autocorrected として残す）
-    static func autocorrectWithLog(_ text: String) -> (text: String, applied: [String]) {
+    // synced: a term from a synced pack was put in (no automatic Enter then)
+    static func autocorrectWithLog(_ text: String) -> (text: String, applied: [String], synced: Bool) {
         var applied: [String] = []
+        var synced = false
         // 「マジ>(され|し|する)」のように > の後に続く語の条件を書いた別名は、その語が続くときだけ置き換える（AliasReplace）
-        let pairs = (personal + packs).flatMap { e in sure(e.aliases).filter { $0.count >= 2 && $0 != e.term }.map { ($0, e.term) } }
-            .sorted { $0.0.count > $1.0.count }
+        // Synced packs only insert terms that pass SyncedTerms.usable
+        let pairs = ([(entries: personal, synced: false)] + enabledPackFiles).flatMap { file in
+            file.entries.filter { !file.synced || SyncedTerms.usable($0.term) }.flatMap { e in
+                sure(e.aliases).filter { $0.count >= 2 && $0 != e.term }.map { (wrong: $0, right: e.term, synced: file.synced) }
+            }
+        }.sorted { $0.wrong.count > $1.wrong.count }
         var t = text
-        for (wrong, right) in pairs {
+        for (wrong, right, fromSynced) in pairs {
             let r = AliasReplace.apply(t, wrong: wrong, right: right)
-            if r.hit { applied.append("\(wrong.split(separator: ">").first ?? "")→\(right)") }
+            if r.hit {
+                applied.append("\(wrong.split(separator: ">").first ?? "")→\(right)")
+                synced = synced || fromSynced
+            }
             t = r.text
         }
-        return (t, applied)
+        return (t, applied, synced)
     }
 
     // 受け取る側の AI（Claude Code 等）に渡す「誤変換されやすい語」の一覧。
@@ -675,8 +702,8 @@ enum PeopleStore {
     static var all: [People.Person] {
         guard !Settings.peopleSources.isEmpty else { return [] }
         var seen = Set<String>()
-        return Settings.peopleSources.flatMap { src in
-            People.parse((try? String(contentsOf: cacheDir.appendingPathComponent((src as NSString).lastPathComponent), encoding: .utf8)) ?? "")
+        return Settings.peopleSources.compactMap(PackSource.cacheName).flatMap { name in
+            People.parse((try? String(contentsOf: cacheDir.appendingPathComponent(name), encoding: .utf8)) ?? "")
         }.filter { seen.insert($0.id.lowercased()).inserted }
     }
 
@@ -687,7 +714,11 @@ enum PeopleStore {
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         DispatchQueue.global(qos: .utility).async {
             for src in sources {
-                let dest = cacheDir.appendingPathComponent((src as NSString).lastPathComponent)
+                guard let name = PackSource.cacheName(src) else {
+                    Events.log("people_sync_failed")
+                    continue
+                }
+                let dest = cacheDir.appendingPathComponent(name)
                 if !force, let m = (try? FileManager.default.attributesOfItem(atPath: dest.path))?[.modificationDate] as? Date,
                    Date().timeIntervalSince(m) < 86400 { continue }
                 if let d = Glossary.fetch(src), let text = String(data: d, encoding: .utf8), !text.hasPrefix("{"), !People.parse(text).isEmpty {
@@ -1042,6 +1073,7 @@ final class Recorder {
         var samples: [Int16] = []
         var preRoll: [Int16] = []
         var lastPeakAt = Date.distantPast
+        var level: Float = 0   // 直近の塊の RMS（録音中の表示用）
         init(_ s: MicInput) { source = s }
     }
 
@@ -1072,6 +1104,17 @@ final class Recorder {
         lock.lock(); defer { lock.unlock() }
         guard let p = tracks.first else { return false }
         return Date().timeIntervalSince(p.lastPeakAt) > 1.0
+    }
+
+    // 録音中の声の大きさ（RMS。ミュート中は代わりのマイクで録るので、大きい方）
+    var level: Float {
+        lock.lock(); defer { lock.unlock() }
+        return recording ? tracks.map(\.level).max() ?? 0 : 0
+    }
+    // 録音していなくても（マイクを開いていれば）今の声の大きさ。初回の案内のマイクテスト用
+    var inputLevel: Float {
+        lock.lock(); defer { lock.unlock() }
+        return tracks.map(\.level).max() ?? 0
     }
 
     var fallbackName: String? {
@@ -1175,6 +1218,7 @@ final class Recorder {
         defer { lock.unlock() }
         if track === tracks.first { lastBufferAt = Date() }
         if peak > mutedPeak { track.lastPeakAt = Date() }
+        track.level = AudioLevel.rms(chunk)
         if recording {
             track.samples.append(contentsOf: chunk)
         } else {
@@ -1627,7 +1671,25 @@ final class Improver {
         return f
     }()
 
-    private func run(_ items: [(URL, [String: Any])], judgeOnly: Bool = false) throws -> String {
+    // 送る内容（system と user の文）と、結果を語に結びつけるための発話ごとの文字起こし・前後
+    struct Payload {
+        let system: String, user: String
+        let people: [People.Person]
+        let transcripts: [Int: String], contexts: [Int: String]
+    }
+
+    // 次に送る発話（runIfNeeded と同じ選び方。送らずに中身を見せるときにも使う）
+    func nextBatch() -> [(URL, [String: Any])] { Array(unscanned().suffix(60)) }
+
+    // 送らずに、次に送る内容をそのまま組み立てる（「送る内容を見る」）。送る発話が無ければ nil
+    func preview() -> (count: Int, text: String)? {
+        let items = nextBatch()
+        guard !items.isEmpty else { return nil }
+        let p = payload(items)
+        return (items.count, p.system + "\n\n---\n\n" + p.user)
+    }
+
+    private func payload(_ items: [(URL, [String: Any])]) -> Payload {
         let times = items.compactMap { ($0.1["id"] as? String).flatMap { Improver.idFormat.date(from: $0) } }
         let humans = SessionLog.load(since: (times.min() ?? Date()).addingTimeInterval(-3600))
         var lines: [String] = []
@@ -1663,6 +1725,12 @@ final class Improver {
         var user = "既に辞書にある語: \(known)\n\n"
         if !people.isEmpty { user += "社員名簿（ID<TAB>本名、\(people.count) 人）:\n\(People.promptBlock(people))\n\n" }
         user += lines.joined(separator: "\n\n")
+        return Payload(system: system, user: user, people: people, transcripts: transcripts, contexts: contexts)
+    }
+
+    private func run(_ items: [(URL, [String: Any])], judgeOnly: Bool = false) throws -> String {
+        let p = payload(items)
+        let system = p.system, user = p.user, people = p.people, transcripts = p.transcripts, contexts = p.contexts
         func ask() throws -> [String: Any] {
             let content = Settings.improveProvider == "api"
                 ? try LLM.chat(endpoint: Settings.improveEndpoint, model: Settings.improveModel, auth: Settings.improveAuth(),
@@ -1999,6 +2067,7 @@ enum ConfigImport {
         if let cmd = cfg["improveCommand"] as? String, !cmd.isEmpty {
             info += "\n\n⚠️ 改善ループのコマンドは、この Mac 上でそのまま実行されます:\n\(cmd)"
         }
+        info += PackSource.importNotice(packs: cfg["packSources"] as? [String] ?? [], people: cfg["peopleSources"] as? [String] ?? [])
         if cfg["improveEnabled"] as? Bool == true {
             info += "\n\n⚠️ 改善ループが有効になり、発話の文字起こしとセッション記録の該当部分が送られます。"
         }
@@ -2447,17 +2516,24 @@ enum Updater {
             let ok = run(["ditto", mount.appendingPathComponent("Koe.app").path, staged.path]) == 0
             _ = run(["hdiutil", "detach", "-quiet", mount.path])
             guard ok else { return DispatchQueue.main.async { failed("新しい版を取り出せませんでした") } }
+            // Replace the app only with a bundle signed by Koe's Developer ID (UpdateVerify.swift)
+            if let bad = UpdateVerify.check(appAt: staged) {
+                try? FileManager.default.removeItem(at: work)
+                Events.log("update_verify_failed", ["to": r.version, "reason": bad.reason, "status": Int(bad.status)])
+                return DispatchQueue.main.async { failed("新しい版の署名を確かめられなかったので、入れ替えませんでした（\(bad.message)）") }
+            }
             let target = Bundle.main.bundleURL.path
             let pid = ProcessInfo.processInfo.processIdentifier
+            // Values are passed as arguments ($1 pid, $2 target, $3 staged app, $4 work dir), not put into the script
             let script = """
-            while kill -0 \(pid) 2>/dev/null; do sleep 0.3; done
-            rm -rf "\(target)" && ditto "\(staged.path)" "\(target)" && xattr -dr com.apple.quarantine "\(target)" 2>/dev/null
-            open "\(target)"
-            rm -rf "\(work.path)"
+            while kill -0 "$1" 2>/dev/null; do sleep 0.3; done
+            rm -rf "$2" && ditto "$3" "$2"
+            open "$2"
+            rm -rf "$4"
             """
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/bin/sh")
-            p.arguments = ["-c", script]
+            p.arguments = ["-c", script, "sh", String(pid), target, staged.path, work.path]
             do { try p.run() } catch { return DispatchQueue.main.async { failed("入れ替えを始められませんでした") } }
             Events.log("update_installing", ["from": current, "to": r.version])
             DispatchQueue.main.async { NSApp.terminate(nil) }
@@ -2486,7 +2562,7 @@ final class Utterance {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let server = WhisperServer()
-    private let recorder = Recorder()
+    let recorder = Recorder()
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
     private var missLine: NSMenuItem!
@@ -2524,10 +2600,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recent: [(time: Date, text: String)] = []
     private var recentByApp: [String: (time: Date, text: String)] = [:]
     private let improver = Improver()
-    private let permissionGuide = PermissionGuide()
+    let permissionGuide = PermissionGuide()
+    let onboarding = OnboardingWindow()
+    // 初めての起動で、初回の案内を出すか（案内が許可を順に聞くので、起動時にまとめて聞かない）。案内がオフなら前のまま
+    private let firstRun = !Settings.defaults.bool(forKey: "welcomeShown") && OnboardingFlow.enabled
     private var permissionItem: NSMenuItem!
+    private let hud = RecordingHUD()
+    private var indicatorMenu: NSMenu!
     private var improveItem: NSMenuItem!
     private var improveNowItem: NSMenuItem!
+    private var improvePreviewItem: NSMenuItem!
+    private var improveNeverItem: NSMenuItem!
     private var warmUpTimer: Timer?
 
     private var serverReady = false { didSet { render() } }
@@ -2544,6 +2627,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
         Glossary.refreshUsage()
         LearnedNotice.shared.start(statusItem: statusItem, busy: { [weak self] in
+            guard let self else { return false }
+            return self.current != nil || self.transcribing > 0 || self.cleaning > 0
+        }, lastUsed: { [weak self] in self?.lastUsedAt })
+        // 改善ループの一度きりの提案（#168）。オンにするのは押したときだけ
+        ImproveSuggestPanel.shared.onEnable = { [weak self] in self?.enableImprove(via: "suggestion") }
+        ImproveSuggestPanel.shared.onPreview = { [weak self] in self?.showImprovePreview(via: "suggestion") }
+        ImproveSuggestPanel.shared.start(statusItem: statusItem, busy: { [weak self] in
             guard let self else { return false }
             return self.current != nil || self.transcribing > 0 || self.cleaning > 0
         }, lastUsed: { [weak self] in self?.lastUsedAt })
@@ -2573,6 +2663,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.render()
         }
         recorder.setWarm(Settings.warmMic)
+        setUpOnboarding()
+        hud.level = { [recorder] in recorder.level }
         recent = History.recentPasted(10)
         updateLLMWarmUp()
         watchSecureInput()
@@ -2692,15 +2784,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if p == .accessibility { self.installMonitors() } else { self.recorder.reopen() }
             self.render()
         }
-        AVCaptureDevice.requestAccess(for: .audio) { ok in
-            if !ok { DispatchQueue.main.async { self.permissionGuide.showIfNeeded(reason: "launch", only: .microphone) } }
+        if !firstRun {
+            AVCaptureDevice.requestAccess(for: .audio) { ok in
+                if !ok { DispatchQueue.main.async { self.permissionGuide.showIfNeeded(reason: "launch", only: .microphone) } }
+            }
         }
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: !firstRun] as CFDictionary
         if !AXIsProcessTrustedWithOptions(opts) {
             // 許可済みに見えて外れている（署名が変わった）ときも同じ案内を 1 回出す
             Events.log("no_accessibility_at_launch")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                if !AXIsProcessTrusted() { self.showAccessibilityNotice(reason: "launch") }
+                if !AXIsProcessTrusted() && !self.firstRun { self.showAccessibilityNotice(reason: "launch") }
             }
             // 許可されるまで待ってからキー監視を張り直す
             Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { t in
@@ -2729,6 +2823,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func handle(_ e: NSEvent) {
+        if onboardingIntercepts(e) { return }
         let key = Settings.hotkeyKeyCode
         switch e.type {
         case .keyDown:
@@ -2979,6 +3074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 取りこぼしは黙って捨てない。音とメニューで知らせる
     private func fail(_ message: String) {
         play(Settings.failSound)
+        hud.flashFailure(message)
         showError(message)
     }
 
@@ -3032,7 +3128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         return
                     }
                     raw = AudioWindow.dropInvalid(raw)
-                    let (t, applied) = Glossary.autocorrectWithLog(raw)
+                    let (t, applied) = self.autocorrect(u, raw)
                     u.record["raw"] = t
                     u.record["packs"] = Settings.enabledPacks
                     if t != raw { u.record["raw_before_autocorrect"] = raw; u.record["autocorrected"] = applied }
@@ -3163,13 +3259,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if recentLatency.count > 20 { recentLatency.removeFirst() }
     }
 
+    // Autocorrect, noting on the utterance when a synced pack's term was put in (SyncedTerms.swift)
+    private func autocorrect(_ u: Utterance, _ raw: String) -> (String, [String]) {
+        let r = Glossary.autocorrectWithLog(raw)
+        if r.synced { u.record["synced_pack_replaced"] = true }
+        return (r.text, r.applied)
+    }
+
+    // No automatic Enter after a replacement from a synced pack (SyncedTerms.swift)
+    private func enterAfterPaste(_ u: Utterance) -> Bool {
+        guard Settings.shouldEnter(bundle: u.record["paste_app"] as? String) else { return false }
+        guard u.record["synced_pack_replaced"] as? Bool != true else {
+            Events.log("enter_skipped", ["reason": "synced_pack"])
+            return false
+        }
+        return true
+    }
+
     private func deliver(_ u: Utterance, _ raw: String) {
         u.record["llm_enabled"] = Settings.llmEnabled
         guard Settings.llmEnabled else {
             if blockedWithoutAccessibility(u, raw) { return }
             if blockedTargetChanged(u, raw) { return }
             markPasted(u)
-            let at = Typist.pasteAndMaybeEnter(raw, enter: Settings.shouldEnter(bundle: u.record["paste_app"] as? String), targetPID: restoredPID(u))
+            let at = Typist.pasteAndMaybeEnter(raw, enter: enterAfterPaste(u), targetPID: restoredPID(u))
             u.record["paste_at"] = Typist.utcMillis(at)
             watchVisible(u, raw, at)
             Events.log("pasted", ["retried": u.record["retried_without_prompt"] != nil, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""].merging(restoreFields(u)) { a, _ in a })
@@ -3198,7 +3311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if self.blockedWithoutAccessibility(u, text) { return }
                 if self.blockedTargetChanged(u, text) { return }
                 self.markPasted(u)
-                let at = Typist.pasteAndMaybeEnter(text, enter: Settings.shouldEnter(bundle: u.record["paste_app"] as? String), targetPID: self.restoredPID(u))
+                let at = Typist.pasteAndMaybeEnter(text, enter: self.enterAfterPaste(u), targetPID: self.restoredPID(u))
                 u.record["paste_at"] = Typist.utcMillis(at)
                 self.watchVisible(u, text, at)
                 Events.log("pasted", ["llm": true, "app": u.record["app"] ?? "", "paste_app": u.record["paste_app"] ?? "", "paste_at": u.record["paste_at"] ?? ""].merging(self.restoreFields(u)) { a, _ in a })
@@ -3237,8 +3350,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func finish(_ u: Utterance, pasted: String?) {
         lastUsedAt = Date()
+        onboarding.notePaste(pasted: pasted != nil, pasteApp: u.record["paste_app"] as? String)
         if let text = pasted {
             Glossary.refreshUsage(ifOlderThan: 300)
+            ImproveSuggestPanel.notePasted()
             recentByApp[u.record["app"] as? String ?? ""] = (Date(), text)
             recent.append((Date(), text))
             if recent.count > 10 { recent.removeFirst(recent.count - 10) }
@@ -3306,9 +3421,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         llmItem.target = self
         menu.addItem(llmItem)
 
-        improveItem = NSMenuItem(title: "使うほど賢くする（改善ループ）", action: #selector(toggleImprove), keyEquivalent: "")
+        improveItem = NSMenuItem(title: ImproveSuggest.menuOn, action: #selector(toggleImprove), keyEquivalent: "")
         improveItem.target = self
         menu.addItem(improveItem)
+        improvePreviewItem = NSMenuItem(title: "改善ループで送る内容を見る…", action: #selector(previewImprove), keyEquivalent: "")
+        improvePreviewItem.target = self
+        menu.addItem(improvePreviewItem)
+        improveNeverItem = NSMenuItem(title: "改善ループの提案を出さない", action: #selector(toggleImproveNever), keyEquivalent: "")
+        improveNeverItem.target = self
+        menu.addItem(improveNeverItem)
         improveNowItem = NSMenuItem(title: "今すぐ改善する", action: #selector(improveNow), keyEquivalent: "")
         improveNowItem.target = self
         menu.addItem(improveNowItem)
@@ -3352,6 +3473,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         modeItem.submenu = pressModeMenu
         menu.addItem(modeItem)
+
+        let indicatorItem = NSMenuItem(title: "録音中の表示", action: nil, keyEquivalent: "")
+        indicatorMenu = NSMenu()
+        for s in IndicatorStyle.allCases {
+            let it = NSMenuItem(title: s.label, action: #selector(chooseIndicator(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = "style:" + s.rawValue
+            indicatorMenu.addItem(it)
+        }
+        indicatorMenu.addItem(.separator())
+        for p in IndicatorPosition.allCases {
+            let it = NSMenuItem(title: p.label, action: #selector(chooseIndicator(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = "position:" + p.rawValue
+            indicatorMenu.addItem(it)
+        }
+        indicatorItem.submenu = indicatorMenu
+        menu.addItem(indicatorItem)
 
         let micItem = NSMenuItem(title: "マイク", action: nil, keyEquivalent: "")
         micMenu = NSMenu()
@@ -3398,6 +3537,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let help = NSMenuItem(title: "使い方", action: #selector(openHelp), keyEquivalent: "")
         help.target = self
         menu.addItem(help)
+        let guide = NSMenuItem(title: "はじめての案内を開く…", action: #selector(openOnboarding), keyEquivalent: "")
+        guide.target = self
+        guide.isHidden = !OnboardingFlow.enabled
+        menu.addItem(guide)
         let diag = NSMenuItem(title: "診断情報を書き出す（不具合を送る用）", action: #selector(exportDiagnostics), keyEquivalent: "")
         diag.target = self
         menu.addItem(diag)
@@ -3538,23 +3681,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func toggleImprove() {
-        if !Settings.improveEnabled {
-            if Settings.improveProvider == "api" && Settings.improveEndpoint.isEmpty {
-                showError("改善ループの送り先（improveEndpoint）が設定されていません")
-                return
-            }
-            let a = NSAlert()
-            a.messageText = "改善ループをオンにしますか？"
-            let people = PeopleStore.all.count
-            a.informativeText = "発話の文字起こしと、Claude Code のセッション記録の該当部分（送った文・返答・次の発話）を、次の送り先に送って辞書を育てます。"
-                + (people > 0 ? "社員名簿（peopleSources、\(people) 人の ID と本名）も毎回送ります。" : "")
-                + "\n\n送り先: \(Settings.improveTarget)"
-            a.addButton(withTitle: "オンにする")
-            a.addButton(withTitle: "やめる")
-            NSApp.activate(ignoringOtherApps: true)
-            guard a.runModal() == .alertFirstButtonReturn else { return }
+        if Settings.improveEnabled {
+            Settings.improveEnabled = false
+            Events.log("improve_disabled", ["via": "menu"])
+            render()
+        } else {
+            enableImprove(via: "menu")
         }
-        Settings.improveEnabled.toggle()
+    }
+
+    // 改善ループをオンにする。どこから押しても、送るものと送り先を見せて本人に決めてもらう（黙ってオンにしない）。
+    // via: menu / suggestion / onboarding（記録は種類だけ）
+    func enableImprove(via: String) {
+        guard !Settings.improveEnabled else { return }
+        if Settings.improveProvider == "api" && Settings.improveEndpoint.isEmpty {
+            showError("改善ループの送り先（improveEndpoint）が設定されていません")
+            return
+        }
+        let a = NSAlert()
+        a.messageText = "改善ループをオンにしますか？"
+        let people = PeopleStore.all.count
+        a.informativeText = "発話の文字起こしと、Claude Code のセッション記録の該当部分（送った文・返答・次の発話）を、次の送り先に送って辞書を育てます。音声は送りません。"
+            + (people > 0 ? "社員名簿（peopleSources、\(people) 人の ID と本名）も毎回送ります。" : "")
+            + "\n\n送り先: \(Settings.improveTarget)"
+        a.addButton(withTitle: "オンにする")
+        a.addButton(withTitle: "やめる")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else {
+            Events.log("improve_declined", ["via": via, "reason": "confirm"])
+            return
+        }
+        Settings.improveEnabled = true
+        Events.log("improve_enabled_via", ["via": via])
+        render()
+    }
+
+    // 次に送る内容を、送らずに組み立てて見せる（履歴とセッション記録を読むので裏で作る）
+    func showImprovePreview(via: String, onEmpty: (() -> Void)? = nil) {
+        let target = Settings.improveTarget
+        DispatchQueue.global(qos: .userInitiated).async {
+            let p = self.improver.preview()
+            DispatchQueue.main.async {
+                Events.log("improve_preview", ["via": via, "count": p?.count ?? 0])
+                guard let p else {
+                    if let onEmpty { return onEmpty() }
+                    self.showError("まだ送る発話がありません（履歴の保存がオンなら、話した分が溜まります）")
+                    return
+                }
+                ImprovePreviewWindow.shared.show(count: p.count, text: p.text, target: target,
+                                                 onEnable: Settings.improveEnabled ? nil : { [weak self] in self?.enableImprove(via: via) })
+            }
+        }
+    }
+
+    @objc private func previewImprove() { showImprovePreview(via: "menu") }
+
+    @objc private func toggleImproveNever() {
+        var st = ImproveSuggest.load(Settings.defaults)
+        st.neverAgain.toggle()
+        ImproveSuggest.save(st, Settings.defaults)
+        if st.neverAgain { Events.log("improve_declined", ["via": "menu", "reason": "never"]) }
         render()
     }
 
@@ -3637,6 +3823,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    @objc private func chooseIndicator(_ sender: NSMenuItem) {
+        guard let v = sender.representedObject as? String else { return }
+        if let s = IndicatorStyle(rawValue: String(v.dropFirst("style:".count))), v.hasPrefix("style:") {
+            IndicatorStyle.current = s
+        } else if let p = IndicatorPosition(rawValue: String(v.dropFirst("position:".count))), v.hasPrefix("position:") {
+            IndicatorPosition.set(p)
+        }
+        let style = IndicatorStyle.current
+        Events.log("indicator_changed", ["style": style.rawValue, "position": IndicatorPosition.current(for: style).rawValue])
+        render()
+    }
+
     @objc private func choosePressMode(_ sender: NSMenuItem) {
         Settings.toggleMode = sender.tag == 1
         Events.log("press_mode", ["mode": Settings.toggleMode ? "toggle" : "hold"])
@@ -3664,10 +3862,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // 初めて起動したときに、使い方を 3 行で見せる
+    // 初めて起動したときに、初回の案内（許可 → マイク → キー → 貼ってみる）を開く
     private func showWelcomeIfFirstLaunch() {
         guard !Settings.defaults.bool(forKey: "welcomeShown") else { return }
         Settings.defaults.set(true, forKey: "welcomeShown")
+        if OnboardingFlow.enabled { onboarding.show(reason: "first_launch"); return }
         let a = NSAlert()
         a.messageText = "Koe へようこそ"
         a.informativeText = """
@@ -3686,7 +3885,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(WhisperServer.logURL)
     }
 
-    private func render() {
+    func render() {
         guard let button = statusItem?.button else { return }
         var symbol = ""
         var image: NSImage = KoeIcon.outline
@@ -3734,6 +3933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             button.title = ""
         }
+        renderGuides()
         writeState(isBusy ? "busy" : "idle")
         if terminating && !isBusy { terminating = false; NSApp.reply(toApplicationShouldTerminate: true) }
         statusLine?.title = line
@@ -3755,11 +3955,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for mi in keepItems { mi.state = mi.tag == Settings.historyKeepDays ? .on : .off }
         clipboardItem?.state = Settings.restoreClipboard ? .on : .off
         improveItem?.state = Settings.improveEnabled ? .on : .off
+        improveItem?.title = Settings.improveEnabled ? ImproveSuggest.menuOn : ImproveSuggest.menuOff
+        // 提案を出さない: ループがオフで、まだ決めていない間だけ出す
+        let suggest = ImproveSuggest.load(Settings.defaults)
+        improveNeverItem?.isHidden = Settings.improveEnabled || !ImproveSuggest.undecided(Settings.defaults)
+        improveNeverItem?.state = suggest.neverAgain ? .on : .off
         improveNowItem?.isEnabled = Settings.improveEnabled && !improver.running
         improveNowItem?.title = improver.running ? "改善中…" : "今すぐ改善する" + (improver.lastRun.map { "（前回: \($0.prefix(40))）" } ?? "")
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         for it in hotkeyMenu?.items ?? [] { it.state = it.tag == Int(Settings.hotkeyKeyCode) ? .on : .off }
         for it in pressModeMenu?.items ?? [] { it.state = (it.tag == 1) == Settings.toggleMode ? .on : .off }
+        renderIndicatorMenu()
+    }
+
+    // 初回の案内（モデルの取得の進み具合）と、録音中の表示を今の状態に合わせる
+    private func renderGuides() {
+        onboarding.update(modelProgress: downloadProgress, ready: serverReady)
+        hud.update(HUDState.from(recordingSince: current?.pressedAt, locked: current?.locked == true,
+                                 app: HUDState.appName(bundleID: current?.record["app"] as? String), busy: transcribing + cleaning))
+    }
+
+    // メニュー「録音中の表示」の見た目と場所のチェック
+    private func renderIndicatorMenu() {
+        let style = IndicatorStyle.current
+        for it in indicatorMenu?.items ?? [] {
+            let v = it.representedObject as? String
+            it.state = v == "style:" + style.rawValue || v == "position:" + IndicatorPosition.current(for: style).rawValue ? .on : .off
+        }
     }
 
     private var lastUpdateCheck = Date.distantPast

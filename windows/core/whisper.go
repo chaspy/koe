@@ -142,15 +142,17 @@ func AutoAudioCtxMin(seconds float64, min int) int {
 // BaseURL of the local whisper-server.
 func BaseURL(port int) string { return fmt.Sprintf("http://127.0.0.1:%d", port) }
 
-// IsAlive: any HTTP response from the server counts as alive.
-func IsAlive(baseURL string) bool {
+// IsHealthy: GET /health answers 200 once whisper-server has loaded its model
+// (503 while loading). It says nothing about which process answered; Koe
+// also checks that the listener is the server it started (CheckServer).
+func IsHealthy(baseURL string) bool {
 	cl := http.Client{Timeout: time.Second}
-	resp, err := cl.Get(baseURL + "/")
+	resp, err := cl.Get(baseURL + "/health")
 	if err != nil {
 		return false
 	}
 	_ = resp.Body.Close()
-	return true
+	return resp.StatusCode == http.StatusOK
 }
 
 // BuildInferenceBody builds the multipart body of POST /inference

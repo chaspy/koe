@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import re
+import socket
 import sys
 import tempfile
 import unittest
@@ -236,6 +237,84 @@ class DeliveredTest(unittest.TestCase):
         self.assertIn("どのセッションにも発話が無い（送っていない・Claude Code 以外のペインに貼った） 1", daily)
         for text in texts:
             self.assertNotIn(text, daily)
+
+
+class _Proc:
+    """Stand-in for subprocess.Popen: poll() returns None while running, an exit code after."""
+
+    def __init__(self, exits_after=None):
+        self.polls = 0
+        self.exits_after = exits_after
+
+    def poll(self):
+        self.polls += 1
+        if self.exits_after is not None and self.polls > self.exits_after:
+            return 1
+        return None
+
+
+class _Resp:
+    def __init__(self, status):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class OwnServerTest(unittest.TestCase):
+    """The eval scripts use only the whisper-server they started, on a port chosen per run."""
+
+    def tearDown(self):
+        koe_eval._server_proc = None
+        koe_eval._server_url = None
+
+    def test_free_port_is_bindable(self):
+        port = koe_eval.free_port()
+        self.assertGreater(port, 0)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", port))
+
+    def test_ready_only_on_health_ok(self):
+        seen = []
+
+        def opener(url, timeout):
+            seen.append(url)
+            if len(seen) < 3:
+                return _Resp(503)
+            return _Resp(200)
+
+        koe_eval.wait_ready(_Proc(), "http://127.0.0.1:1", attempts=5, interval=0, opener=opener)
+        self.assertEqual(seen, ["http://127.0.0.1:1/health"] * 3)
+
+    def test_child_checked_before_every_probe(self):
+        calls = []
+
+        def opener(url, timeout):
+            calls.append(url)
+            return _Resp(200)
+
+        with self.assertRaises(RuntimeError):
+            koe_eval.wait_ready(_Proc(exits_after=0), "http://127.0.0.1:1", attempts=5, interval=0, opener=opener)
+        self.assertEqual(calls, [])  # an answer on the port is not enough once our child has exited
+
+    def test_times_out_without_health(self):
+        def opener(url, timeout):
+            raise OSError("refused")
+
+        with self.assertRaises(TimeoutError):
+            koe_eval.wait_ready(_Proc(), "http://127.0.0.1:1", attempts=3, interval=0, opener=opener)
+
+    def test_transcribe_requires_running_child(self):
+        with self.assertRaises(RuntimeError):
+            koe_eval.server_url()
+        koe_eval._server_proc, koe_eval._server_url = _Proc(), "http://127.0.0.1:1"
+        self.assertEqual(koe_eval.server_url(), "http://127.0.0.1:1")
+        koe_eval._server_proc = _Proc(exits_after=0)
+        with self.assertRaises(RuntimeError):
+            koe_eval.transcribe(Path("unused.wav"))
 
 
 if __name__ == "__main__":

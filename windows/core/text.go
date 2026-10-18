@@ -1,6 +1,9 @@
 package core
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+)
 
 // Hallucinations: phrases whisper often produces from silence / noise.
 var Hallucinations = map[string]bool{
@@ -228,13 +231,30 @@ func collapseSentences(text string) string {
 }
 
 // CleanServerText joins the non-empty trimmed lines of whisper-server's text
-// response with a space (mac behavior).
+// response with a space (mac behavior). Control characters are removed.
 func CleanServerText(raw string) string {
 	var parts []string
 	for _, l := range splitLines(raw) {
-		if l = strings.TrimSpace(l); l != "" {
+		if l = strings.TrimSpace(StripControl(l)); l != "" {
 			parts = append(parts, l)
 		}
 	}
 	return strings.Join(parts, " ")
+}
+
+// StripControl removes control characters from text before it is pasted:
+// a tab becomes a space, line breaks (\n, \r) are kept as they are, and every
+// other control character (C0, DEL, C1) is dropped.
+func StripControl(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r':
+			return r
+		case r == '\t':
+			return ' '
+		case unicode.IsControl(r):
+			return -1
+		}
+		return r
+	}, s)
 }

@@ -15,7 +15,8 @@ out="$HOME/Library/Application Support/Koe/evals/pack-change-$(date +%Y%m%d-%H%M
 mkdir -p "$out"
 git show "$base:packs/developer.txt" > "$out/developer.before.txt"
 cp packs/developer.txt "$out/developer.after.txt"
-export KOE_EVAL_PORT="${KOE_EVAL_PORT:-18503}" KOE_EVAL_SERVER_ARGS="${KOE_EVAL_SERVER_ARGS:--t 2}"
+# Each run picks a free port for its own whisper-server, so parallel runs need no setting.
+export KOE_EVAL_SERVER_ARGS="${KOE_EVAL_SERVER_ARGS:--t 2}"
 echo "$(date '+%F %T') before ($base)" | tee "$out/log.txt"
 nice -n 19 python3 eval/koe_bench.py compare-terms --developer "$out/developer.before.txt" \
     --extra-terms "$out/developer.after.txt" --forms "$out/before.json" --sleep 1 > "$out/before.txt"

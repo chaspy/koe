@@ -386,7 +386,9 @@ final class PermissionGuide: NSObject, NSWindowDelegate {
     static func relaunch() {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do sleep 0.3; done; open \"\(Bundle.main.bundlePath)\""]
+        // The pid and the bundle path are passed as arguments, not put into the script
+        p.arguments = ["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.3; done; open \"$2\"", "sh",
+                       String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
         try? p.run()
         NSApp.terminate(nil)
     }

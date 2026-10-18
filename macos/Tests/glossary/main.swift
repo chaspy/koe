@@ -1,3 +1,4 @@
+// test-sources: GlossaryCatalog.swift
 // make test: Sources/Koe/GlossaryCatalog.swift の単体テスト（辞書の画面と「覚えた語」のお知らせの判定）
 import Foundation
 

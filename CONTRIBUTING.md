@@ -56,3 +56,40 @@ One version number for macOS and Windows; both are built from the same commit an
 
 If a release changes only one platform, its notes say "macOS: no changes" or "Windows: no changes".
 
+
+## Changelog (`changelog.d/`)
+
+**Do not edit `CHANGELOG.md` in a pull request; add `changelog.d/<PR>.md` instead.** One file per PR, so parallel PRs never conflict:
+
+```
+changelog.d/<PR number or short name>.md     e.g. changelog.d/131-retranscribe.md
+```
+
+```markdown
+### macOS
+- What changes for the user, in one item.
+
+### Windows
+- ...
+```
+
+Use only the sections that apply: `### Repository`, `### macOS`, `### Windows`. Check the file with `python3 scripts/changelog.py check`.
+
+A release folds the files into a version section of `CHANGELOG.md` and deletes them:
+
+```bash
+python3 scripts/changelog.py preview          # what the release would add
+python3 scripts/changelog.py release 0.8.0    # done by scripts/release/release.sh in the release commit
+```
+
+The apps read the first item under `### macOS` / `### Windows` of the released version for the update prompt. Fragments are folded in PR-number order (then other names), so before a release, read the "update prompt shows" lines that `preview` prints; to put an item first, rename its fragment to start with `0-` (e.g. `changelog.d/0-signing.md`) in a small PR. An app with no fragments gets `- No changes.`, and that app does not ask to update.
+
+## Tests (macOS)
+
+`make -C macos test` builds and runs every `macos/Tests/<name>/main.swift` (no XCTest; each test is compiled with `swiftc`). To add a test, create `macos/Tests/<name>/main.swift` whose first line lists the files from `macos/Sources/Koe` it needs — no Makefile change:
+
+```swift
+// test-sources: People.swift AliasReplace.swift
+```
+
+Objective-C files are listed relative to `Sources/Koe` too (`// test-sources: MicTap.swift ../KoeObjC/KoeObjC.m`); they are compiled with clang and their `include` directory is passed to swiftc. Run one test with `make -C macos test T=people`.

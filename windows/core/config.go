@@ -29,7 +29,7 @@ type Config struct {
 	Model     string `json:"model"`     // file name in the models dir, or an absolute path
 	ModelURL  string `json:"modelURL"`  // empty = ModelBaseURL + Model
 	Language  string `json:"language"`
-	Port      int    `json:"port"`
+	Port      int    `json:"port"`    // not used by the app: whisper-server gets a free port at each start
 	Threads   int    `json:"threads"` // 0 = auto (logical CPUs, up to 16)
 	// TemperatureFallback lets whisper re-decode a hard segment at higher
 	// temperatures (whisper.cpp's default). Off: one greedy pass, much faster on CPU.

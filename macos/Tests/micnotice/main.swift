@@ -1,3 +1,4 @@
+// test-sources: MicNotice.swift
 // make test: Sources/Koe/MicNotice.swift の単体テスト（XCTest なしで動く）
 import CoreAudio
 import Foundation

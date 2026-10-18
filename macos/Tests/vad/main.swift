@@ -1,3 +1,4 @@
+// test-sources: VAD.swift
 // make test: Sources/Koe/VAD.swift の単体テスト（XCTest なしで動く）
 import Foundation
 

@@ -7,6 +7,14 @@ cd "$(dirname "$0")"
 
 WHISPER_TAG="${WHISPER_TAG:-v1.9.2}"
 WHISPER_ASSET="whisper-bin-x64.zip"
+# sha256 of $WHISPER_ASSET: the "digest" GitHub shows for the asset in the
+# ggml-org/whisper.cpp v1.9.2 release, checked 2026-10-18 against a download.
+# Set both when changing WHISPER_TAG.
+WHISPER_SHA256="${WHISPER_SHA256:-49dcc16de826f20bd53d44f947a1ae49dfa81f86cad67a64d80820cb192d674a}"
+# sha256 of whisper-server-vulkan.exe from the whisper-vulkan workflow (run
+# 38825703725, 2026-10-15). After running the workflow again, check the new
+# artifact and set this to its hash.
+VULKAN_SHA256="${VULKAN_SHA256:-dce8936bc017c5ecb91902f200a1dbbb99069f11731b93f8d9c157b7c167075f}"
 # sherpa-onnx for engine "parakeet" (core.SherpaVersion; core.sherpaRecognizerConfig matches its c-api.h)
 SHERPA_TAG="${SHERPA_TAG:-v1.13.8}"
 SHERPA_NAME="sherpa-onnx-$SHERPA_TAG-win-x64-shared-MT-Release-no-tts"
@@ -21,6 +29,17 @@ ZIP="dist/Koe-windows-x64.zip"
 VERSION="${VERSION:-$(awk '/<key>CFBundleShortVersionString<\/key>/{getline; gsub(/.*<string>|<\/string>.*/, ""); print; exit}' ../macos/Info.plist)}"
 [ -n "$VERSION" ] || { echo "CFBundleShortVersionString not found in ../macos/Info.plist" >&2; exit 1; }
 REV="${REV:-$(git rev-parse --short HEAD 2>/dev/null || echo unknown)}"
+
+# check_sha256 <file> <want> <what to remove on mismatch>: stops the build on a mismatch
+check_sha256() {
+  local got
+  got=$( (shasum -a 256 "$1" 2>/dev/null || sha256sum "$1") | awk '{print $1}')
+  if [ "$got" != "$2" ]; then
+    rm -rf "$3"
+    echo "sha256 mismatch for $(basename "$1"): got $got, want $2 (removed; not shipped)" >&2
+    exit 1
+  fi
+}
 
 echo "== test (pure logic) =="
 go vet ./...
@@ -46,13 +65,14 @@ if [ ! -s "$CZIP" ]; then
     || gh release download "$WHISPER_TAG" -R ggml-org/whisper.cpp -p "$WHISPER_ASSET" -O "$CZIP.tmp" --clobber
   mv "$CZIP.tmp" "$CZIP"
 fi
+# checked on every build, and unpacked again from the checked zip
+check_sha256 "$CZIP" "$WHISPER_SHA256" "$CZIP"
 WDIR="$CACHE/whisper-$WHISPER_TAG"
-if [ ! -f "$WDIR/whisper-server.exe" ]; then
-  mkdir -p "$WDIR"
-  # only the server and its DLLs (the zip also has many example tools)
-  unzip -q -o -j "$CZIP" '*/whisper-server.exe' '*.dll' -d "$WDIR"
-  [ -f "$WDIR/whisper-server.exe" ] || { echo "whisper-server.exe not in $CZIP" >&2; exit 1; }
-fi
+rm -rf "$WDIR"
+mkdir -p "$WDIR"
+# only the server and its DLLs (the zip also has many example tools)
+unzip -q -o -j "$CZIP" '*/whisper-server.exe' '*.dll' -d "$WDIR"
+[ -f "$WDIR/whisper-server.exe" ] || { echo "whisper-server.exe not in $CZIP" >&2; exit 1; }
 
 echo "== whisper.cpp $WHISPER_TAG Vulkan (GPU) =="
 # built by .github/workflows/whisper-vulkan.yml; taken from its latest
@@ -66,6 +86,7 @@ if [ ! -f "$VDIR/whisper-server-vulkan.exe" ] && [ "${SKIP_VULKAN:-}" != 1 ]; th
   fi
 fi
 if [ -f "$VDIR/whisper-server-vulkan.exe" ]; then
+  check_sha256 "$VDIR/whisper-server-vulkan.exe" "$VULKAN_SHA256" "$VDIR"
   cat "$VDIR/vulkan-build.txt" 2>/dev/null || true
 else
   echo "warning: no whisper-server-vulkan.exe (run the whisper-vulkan workflow, or SKIP_VULKAN=1); building without GPU support" >&2
@@ -78,12 +99,7 @@ SDIR="$CACHE/sherpa-$SHERPA_TAG"
 if [ ! -f "$SDIR/sherpa-onnx-c-api.dll" ]; then
   STAR="$CACHE/$SHERPA_NAME.tar.bz2"
   [ -s "$STAR" ] || { curl -fL --retry 3 -o "$STAR.tmp" "https://github.com/k2-fsa/sherpa-onnx/releases/download/$SHERPA_TAG/$SHERPA_NAME.tar.bz2" && mv "$STAR.tmp" "$STAR"; }
-  got=$( (shasum -a 256 "$STAR" 2>/dev/null || sha256sum "$STAR") | awk '{print $1}')
-  if [ "$got" != "$SHERPA_SHA256" ]; then
-    rm -f "$STAR"
-    echo "sha256 mismatch for $SHERPA_NAME.tar.bz2: got $got, want $SHERPA_SHA256 (removed; not shipped)" >&2
-    exit 1
-  fi
+  check_sha256 "$STAR" "$SHERPA_SHA256" "$STAR"
   mkdir -p "$SDIR"
   tar -xjf "$STAR" -C "$SDIR" --strip-components=2 \
     "$SHERPA_NAME/lib/sherpa-onnx-c-api.dll" "$SHERPA_NAME/lib/onnxruntime.dll" "$SHERPA_NAME/lib/onnxruntime_providers_shared.dll"

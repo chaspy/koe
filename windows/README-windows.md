@@ -110,7 +110,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `gpuAudioCtx` | `0` | GPU で動いているときの枠の大きさ（`audioCtx` と同じ書き方）。既定は 30 秒ぶん全体 |
 | `temperatureFallback` | `false` | うまく読めない区間を条件を変えて読み直すか。`true` にすると精度が少し上がることがありますが、遅くなります |
 | `enabledPacks` | `["developer"]` | 使う用語パック（`packs\*.txt` のファイル名） |
-| `packSources` | `[]` | 共有の用語パックの取り込み元。例 `["gh:owner/repo/path/pack.txt"]`（1 日 1 回、`gh` CLI で取得） |
+| `packSources` | `[]` | 共有の用語パックの取り込み元。例 `["gh:owner/repo/path/pack.txt"]`（1 日 1 回、`gh` CLI で取得）。取り込んだパックの語で置き換えたときは、自動で Enter を押さない。40 文字を超える語、制御文字・シェルの記号・3 つ以上の空白を含む語は置き換えに使わない |
 | `autoEnter` | `true` | ターミナルで貼り付け後に Enter を送るか |
 | `enterApps` | ターミナル各種 | Enter を送るアプリの exe 名 |
 | `terminalPasteKeys` | `false` | （試験中）`true` にすると、ターミナルごとに合った貼り付けキーを使う: Windows Terminal・WezTerm・Alacritty・Hyper・Tabby は Ctrl+Shift+V、mintty（Git Bash）は Shift+Insert、それ以外は Ctrl+V。WezTerm・Alacritty で貼っても何も入らないときに |

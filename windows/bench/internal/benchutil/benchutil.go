@@ -44,7 +44,7 @@ func StartServerLines(bin string, args []string, logPath string, fn func(string)
 	}
 	base := core.BaseURL(portOf(args))
 	for deadline := time.Now().Add(5 * time.Minute); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-		if core.IsAlive(base) {
+		if core.IsHealthy(base) {
 			return stop, nil
 		}
 	}

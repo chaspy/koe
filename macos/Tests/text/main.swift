@@ -1,3 +1,4 @@
+// test-sources: Repeats.swift
 // make test: Sources/Koe/Repeats.swift の単体テスト（XCTest なしで動く）
 import Foundation
 

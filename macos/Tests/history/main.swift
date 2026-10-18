@@ -1,3 +1,4 @@
+// test-sources: Retention.swift
 // make test: Sources/Koe/Retention.swift の単体テスト（XCTest なしで動く）
 import Foundation
 

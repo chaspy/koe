@@ -1,3 +1,4 @@
+// test-sources: People.swift AliasReplace.swift
 // make test: Sources/Koe/People.swift の単体テスト。改善ループの LLM の返り値を固定して、人の名前を辞書に足す／足さないを確かめる。
 // 名簿は架空の人（実在の社員の名前は使わない）
 import Foundation

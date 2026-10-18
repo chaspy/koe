@@ -1,3 +1,4 @@
+// test-sources: AudioWindow.swift
 // make test: Sources/Koe/AudioWindow.swift の単体テスト（XCTest なしで動く）
 import Foundation
 

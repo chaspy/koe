@@ -39,6 +39,7 @@ type WhisperServer struct {
 	stopping bool // Stop was called: the exit is expected
 	Threads  int
 	Model    string
+	port     int           // loopback port chosen at Start
 	Exe      string        // core.CPUServerExe (default) or core.VulkanServerExe
 	Probe    core.GPUProbe // what the server said about the GPU
 	OnGPU    bool          // the Vulkan build is running on a GPU (set by App.startServer)
@@ -60,22 +61,26 @@ func (s *WhisperServer) logName() string {
 	return "whisper-server.log"
 }
 
-// Start launches whisper-server.exe (or reuses one already listening) and
-// waits until it answers HTTP.
+// Start launches whisper-server.exe on a free loopback port chosen for this
+// launch and waits until it is ready: the child is still running, it is the
+// only process listening on its port, and GET /health answers 200. A server
+// that is already listening somewhere is never reused, and config.json
+// "port" is not used.
 func (s *WhisperServer) Start(modelPath string) error {
 	a := s.app
-	base := core.BaseURL(a.cfg.Port)
-	if core.IsAlive(base) {
-		a.log.Printf("server_reuse %s (already running)", base)
-		return nil
-	}
 	exe := filepath.Join(a.exeDir, s.exeName())
 	if _, err := os.Stat(exe); err != nil {
 		return fmt.Errorf("%s が見つかりません: %s", s.exeName(), exe)
 	}
+	port, err := core.FreeLoopbackPort()
+	if err != nil {
+		return fmt.Errorf("whisper-server のポートを用意できません: %w", err)
+	}
 	threads := a.cfg.ThreadsFor(runtime.NumCPU())
 	s.Threads, s.Model = threads, modelPath
-	args := core.ServerArgs(a.cfg, modelPath, threads)
+	cfg := a.cfg
+	cfg.Port = port
+	args := core.ServerArgs(cfg, modelPath, threads)
 	logPath := filepath.Join(a.localDir, s.logName())
 	lf, err := os.Create(logPath)
 	if err != nil {
@@ -97,10 +102,10 @@ func (s *WhisperServer) Start(modelPath string) error {
 		lf.Close()
 		return fmt.Errorf("whisper-server を起動できません: %w", err)
 	}
-	a.log.Printf("server_launched exe=%s pid=%d threads=%d model=%s args=%q log=%s", s.exeName(), cmd.Process.Pid, threads, modelPath, args[:len(args)-2], logPath)
+	a.log.Printf("server_launched exe=%s pid=%d port=%d threads=%d model=%s args=%q log=%s", s.exeName(), cmd.Process.Pid, port, threads, modelPath, args[:len(args)-2], logPath)
 	exited := make(chan struct{})
 	s.mu.Lock()
-	s.cmd, s.exited = cmd, exited
+	s.cmd, s.exited, s.port = cmd, exited, port
 	s.mu.Unlock()
 	s.assignJob(cmd.Process.Pid)
 	go func() {
@@ -120,11 +125,19 @@ func (s *WhisperServer) Start(modelPath string) error {
 		close(exited)
 	}()
 
+	base := core.BaseURL(port)
 	deadline := time.Now().Add(300 * time.Second)
 	for {
-		if core.IsAlive(base) {
-			a.log.Printf("server_ready ms=%d", time.Since(t0).Milliseconds())
-			return nil
+		switch st := s.state(); st {
+		case core.ServerOwned:
+			if core.IsHealthy(base) {
+				a.log.Printf("server_ready ms=%d port=%d", time.Since(t0).Milliseconds(), port)
+				return nil
+			}
+		case core.ServerForeign:
+			a.log.Printf("server_port_shared port=%d -> stopping", port)
+			s.Stop()
+			return fmt.Errorf("whisper-server のポート %d を別のプログラムも使っています。Koe を再起動してください", port)
 		}
 		select {
 		case <-exited:
@@ -139,9 +152,96 @@ func (s *WhisperServer) Start(modelPath string) error {
 		case <-time.After(500 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
+			s.Stop()
 			return errors.New("whisper-server の起動がタイムアウトしました")
 		}
 	}
+}
+
+// BaseURL of this server (its port is chosen at each Start).
+func (s *WhisperServer) BaseURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return core.BaseURL(s.port)
+}
+
+// Recognizer sends utterances to this server, checking before every request
+// that it is still the child Koe started and still owns its port.
+func (s *WhisperServer) Recognizer() core.Recognizer {
+	return core.CheckedWhisper{BaseURL: s.BaseURL(), Check: s.Check}
+}
+
+// Check returns an error unless the child is running and is the only process
+// listening on its port.
+func (s *WhisperServer) Check() error {
+	if st := s.state(); st != core.ServerOwned {
+		return fmt.Errorf("server state %s", st)
+	}
+	return nil
+}
+
+// state looks up who listens on the server's port (IPv4 and IPv6 tables).
+func (s *WhisperServer) state() core.ServerState {
+	s.mu.Lock()
+	cmd, exited, port := s.cmd, s.exited, s.port
+	s.mu.Unlock()
+	running := cmd != nil && cmd.Process != nil && exited != nil
+	if running {
+		select {
+		case <-exited:
+			running = false
+		default:
+		}
+	}
+	if !running {
+		return core.ServerExited
+	}
+	table, err := listenerTable()
+	if err != nil {
+		s.app.log.Printf("listener_table_failed err=%v", err)
+		return core.ServerForeign
+	}
+	return core.CheckServer(true, table, port, cmd.Process.Pid)
+}
+
+var (
+	iphlpapi                = windows.NewLazySystemDLL("iphlpapi.dll")
+	procGetExtendedTcpTable = iphlpapi.NewProc("GetExtendedTcpTable")
+)
+
+const tcpTableOwnerPIDListener = 3 // TCP_TABLE_OWNER_PID_LISTENER
+
+// listenerTable returns every listening TCP socket (IPv4 and IPv6) with the
+// id of its owning process.
+func listenerTable() ([]core.Listener, error) {
+	v4, err := ownerPIDTable(windows.AF_INET, core.TCPRowOwnerPIDSize)
+	if err != nil {
+		return nil, err
+	}
+	v6, err := ownerPIDTable(windows.AF_INET6, core.TCP6RowOwnerPIDSize)
+	if err != nil {
+		return nil, err
+	}
+	return append(v4, v6...), nil
+}
+
+func ownerPIDTable(family uint32, rowSize int) ([]core.Listener, error) {
+	size := uint32(4 + 64*rowSize)
+	for range 4 {
+		buf := make([]byte, size)
+		r, _, _ := procGetExtendedTcpTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0,
+			uintptr(family), tcpTableOwnerPIDListener, 0)
+		switch windows.Errno(r) {
+		case 0:
+			return core.ParseOwnerPIDTable(buf, rowSize)
+		case windows.ERROR_INSUFFICIENT_BUFFER:
+			size += uint32(16 * rowSize) // the table can grow between calls
+			continue
+		default:
+			return nil, fmt.Errorf("GetExtendedTcpTable: %w", windows.Errno(r))
+		}
+	}
+	return nil, errors.New("GetExtendedTcpTable: table keeps growing")
 }
 
 // assignJob puts the server in a kill-on-close job so it dies with Koe.
@@ -189,8 +289,8 @@ func (s *WhisperServer) Stop() {
 	}
 }
 
-// StopAndWait stops the server and waits (up to 10 s) until it has exited
-// and the port no longer answers, so a new server can take the port.
+// StopAndWait stops the server and waits (up to 10 s) until it has exited.
+// The next Start picks a new port, so the old one need not be free.
 func (s *WhisperServer) StopAndWait() {
 	s.Stop()
 	s.mu.Lock()
@@ -201,9 +301,5 @@ func (s *WhisperServer) StopAndWait() {
 		case <-exited:
 		case <-time.After(10 * time.Second):
 		}
-	}
-	base := core.BaseURL(s.app.cfg.Port)
-	for i := 0; i < 20 && core.IsAlive(base); i++ {
-		time.Sleep(250 * time.Millisecond)
 	}
 }

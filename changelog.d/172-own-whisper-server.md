@@ -1,0 +1,2 @@
+### Windows
+- Koe now only talks to the whisper-server it started itself. Each start picks a free loopback port (the `port` setting in config.json is no longer used), Koe never reuses a server that is already listening, and it treats the server as ready only when its own child process is running, is the only process listening on that port, and answers `/health`. The same check runs before every transcription request. Control characters are removed from the text before it is pasted (line breaks are handled as before).

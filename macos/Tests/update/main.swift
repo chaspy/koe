@@ -1,3 +1,4 @@
+// test-sources: UpdatePrompt.swift AppIcon.swift
 // make test: Sources/Koe/UpdatePrompt.swift の単体テスト
 import AppKit
 

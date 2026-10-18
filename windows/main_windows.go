@@ -558,7 +558,7 @@ func (a *App) measureAndServe(model string, size int64) {
 		a.serve(s)
 		return
 	}
-	gpuMS, gerr := core.MeasureTranscribe(context.Background(), core.BaseURL(a.cfg.Port), wav, a.cfg.Prompt, a.cfg.GPUAudioCtx.For(sec, model))
+	gpuMS, gerr := core.MeasureTranscribe(context.Background(), s.BaseURL(), wav, a.cfg.Prompt, a.cfg.GPUAudioCtx.For(sec, model))
 	s.StopAndWait()
 	cpu := &WhisperServer{app: a}
 	if err := cpu.Start(model); err != nil {
@@ -567,7 +567,7 @@ func (a *App) measureAndServe(model string, size int64) {
 		go messageBox("Koe", err.Error(), 0x10)
 		return
 	}
-	cpuMS, cerr := core.MeasureTranscribe(context.Background(), core.BaseURL(a.cfg.Port), wav, a.cfg.Prompt, a.audioCtxSetting().For(sec, model))
+	cpuMS, cerr := core.MeasureTranscribe(context.Background(), cpu.BaseURL(), wav, a.cfg.Prompt, a.audioCtxSetting().For(sec, model))
 	if gerr != nil {
 		gpuMS = 0
 	}
@@ -1061,7 +1061,7 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 		gpu := a.onGPU()
 		setting := a.cfg.AudioCtxSetting(gpu, a.audioCtxSetting())
 		req := core.UtteranceRequest{
-			BaseURL: core.BaseURL(a.cfg.Port), WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
+			WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
 			AudioCtx: setting, Fallback: a.cfg.TemperatureFallback,
 			Entries: append(append([]core.Entry{}, personal...), packs...),
 		}
@@ -1071,6 +1071,9 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 			req.Recognizer, req.SingleShot, req.Model = a.asr, true, model
 			rec["whisper_backend"] = "cpu"
 		} else {
+			if srv := a.server; srv != nil {
+				req.BaseURL, req.Recognizer = srv.BaseURL(), srv.Recognizer()
+			}
 			rec["whisper_backend"] = map[bool]string{true: "gpu", false: "cpu"}[gpu]
 			rec["whisper_audio_ctx"] = setting.For(voiced, model)
 		}
@@ -1148,6 +1151,9 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 	if res.RepetitionCollapsed != "" {
 		rec["repetition_collapsed"] = res.RepetitionCollapsed
 	}
+	if res.SyncedReplaced {
+		rec["synced_pack_replaced"] = true
+	}
 	return res.Text, true
 }
 
@@ -1156,6 +1162,7 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 var errTargetChanged = errors.New("paste target changed")
 
 func (a *App) paste(u *utterance, text string) error {
+	text = core.StripControl(text)
 	// do not send Ctrl+V while the hotkey is held for the next utterance (it would become Ctrl+Alt+V)
 	for i := 0; a.holding.Load() && i < 300; i++ {
 		time.Sleep(50 * time.Millisecond)
@@ -1214,7 +1221,9 @@ func (a *App) paste(u *utterance, text string) error {
 	a.log.Printf("paste app=%s start_app=%s key=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, u.app, pasteKey, len([]rune(text)), time.Since(t0).Milliseconds(), ms)
 
 	entered := false
-	if a.cfg.AutoEnter && core.IsTerminal(exe, a.cfg.EnterApps) {
+	if a.cfg.AutoEnter && core.IsTerminal(exe, a.cfg.EnterApps) && u.record["synced_pack_replaced"] == true {
+		a.log.Printf("enter_skipped reason=synced_pack app=%s", name)
+	} else if a.cfg.AutoEnter && core.IsTerminal(exe, a.cfg.EnterApps) {
 		time.Sleep(time.Duration(a.cfg.EnterDelayMs) * time.Millisecond)
 		now, _ := foregroundExe()
 		if core.ExeName(now) != name {
@@ -1278,7 +1287,7 @@ func (a *App) save(u *utterance, wav []byte, pasted *string) {
 // ---- glossary ----
 
 func (a *App) packs() []core.Pack {
-	return core.ListPacks(filepath.Join(a.exeDir, "packs"), a.userPacksDir())
+	return core.MarkSyncedPacks(core.ListPacks(filepath.Join(a.exeDir, "packs"), a.userPacksDir()), a.userPacksDir(), a.cfg.PackSources)
 }
 
 // computeUsage counts, for every glossary and pack term, how often it was

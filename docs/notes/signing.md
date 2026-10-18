@@ -18,6 +18,15 @@ How it is signed (`macos/scripts/sign.sh` with `SIGN_IDENTITY="Developer ID Appl
 
 Notarization (`make notarize`, or step 5 of the release script, through `macos/scripts/notarize.sh`): checks the app in the dmg, signs the dmg with the same identity, `xcrun notarytool submit --keychain-profile koe --wait`, `xcrun stapler staple`, `stapler validate` and `spctl -a -vvv -t install`. On a rejection it prints the notarytool log. `scripts/release/release.sh --no-notarize` skips this step (Developer ID signature only; the release notes say so).
 
+### In-app updates check the signature
+Before the in-app updater (macOS `Updater.install`) replaces Koe.app, it checks the downloaded bundle with `SecStaticCodeCheckValidity` (all architectures, nested code, strict) against
+
+```
+anchor apple generic and identifier "io.github.chaspy.koe" and certificate leaf[subject.OU] = "9RQ8WG6688"
+```
+
+(`macos/Sources/Koe/UpdateVerify.swift`). If the check fails, nothing is replaced and the reason is shown. The updater does not change extended attributes of the new app: a dmg Koe downloads itself carries no quarantine attribute (Koe does not opt in to file quarantine), so there is nothing to remove.
+
 ### Set up a Mac for releases (once)
 1. Install the Developer ID Application certificate with its private key in the login keychain (Xcode → Settings → Accounts → Manage Certificates, or import the `.p12`). `security find-identity -v -p codesigning` should list `Developer ID Application: … (9RQ8WG6688)`. The first `codesign` may ask to allow access to the key: choose "Always Allow".
 2. Store the notarization credentials as the keychain profile `koe` (an app-specific password of the Apple Account, or an App Store Connect API key):

@@ -1,3 +1,4 @@
+// test-sources: PasteTarget.swift
 // make test: Sources/Koe/PasteTarget.swift の単体テスト
 import Foundation
 

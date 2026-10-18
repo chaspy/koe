@@ -1,3 +1,4 @@
+// test-sources: Redaction.swift
 // make test: Sources/Koe/Redaction.swift の単体テスト（診断情報の設定欄・動作の記録で伏せるもの）
 import Foundation
 
