@@ -176,13 +176,13 @@ def audio_ctx(seconds):
 
 
 @contextmanager
-def server(executable, model, windows):
+def server(executable, model, windows, extra=()):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     url = f'http://127.0.0.1:{port}'
     args = [str(executable), '-m', str(model), '-l', 'ja', '--host', '127.0.0.1',
-            '--port', str(port), '-t', '4', '--prompt', BASE_PROMPT]
+            '--port', str(port), '-t', '4', '--prompt', BASE_PROMPT, *extra]
     if windows:
         args += ['-bs', '1', '-bo', '1', '-fa', '-ng']
     proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

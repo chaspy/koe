@@ -125,3 +125,62 @@ python3 -m unittest discover -s eval -p 'test_*.py'
 Tests use synthetic text/audio and cover fixed IDs, CER weighting, Unicode
 normalization, p95, repetition thresholds, pack behavior, audio windows, HTTP
 profiles and archive range validation.
+
+## VAD before transcription (`vad_bench.py`)
+
+```sh
+nice -n 15 python3 eval/vad_bench.py
+```
+
+Compares what reaches whisper under four gates, on the same 200 JSUT clips
+plus synthetic variants built in memory from them, with the turbo model and the
+Koe base prompt (no pack). Requires `onnxruntime` and `numpy` in addition to the
+dependencies above; it shares the cache, the lock file and the thread/priority
+limits with `public_bench.py`. `--limit N` runs the first N clips for a smoke
+test; `--seed` changes the noise generator (default 8).
+
+The command downloads the **Silero VAD** v5 ONNX model (MIT, 2.3 MB) and its
+LICENSE from [snakers4/silero-vad](https://github.com/snakers4/silero-vad) at
+commit `1e261b036686cd0017d500ee96acd1c4ba572a9d`, verifying SHA-256
+`1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3` for the
+model, into the external cache. The VAD runs on one CPU thread with Silero's
+default thresholds (speech at 0.5, off below 0.35 for 100 ms, speech shorter
+than 250 ms ignored) and is reset for every clip.
+
+| Gate | What is sent to whisper | After transcription |
+|---|---|---|
+| raw | the whole clip | nothing (pure whisper output) |
+| koe | Koe's energy trim: first/last 30 ms window with RMS above 330, padded 0.25 s before and 0.3 s after; no loud window → `no_voice`, whisper not called | Koe's checks: fixed hallucination list (retry without prompt when ≥ 1 s of audio, then drop), repetition or stock phrase (one retry with the whole window and temperature fallback, then stock phrases removed) |
+| vad | Silero speech span with the same 0.25 s / 0.3 s padding; no speech → whisper not called | same as koe |
+| vad-tight | Silero speech span padded 0.1 s / 0.1 s (word-cutoff probe) | same as koe |
+| koe+server-vad | Koe's energy trim, then whisper-server's built-in Silero pass (`vad=true`, `vad_speech_pad_ms=250`; speech segments concatenated, nothing transcribed without speech). This is the path the macOS opt-in (`VAD.swift`) uses | same as koe |
+
+For the server-side gate the command also downloads `ggml-silero-v5.1.2.bin`
+(the same weights converted for whisper.cpp, MIT, 0.9 MB) from
+[ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad), revision
+`9ffd54a1e1ee413ddf265af9913beaf518d1639b`, SHA-256
+`29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf`, and starts
+whisper-server with `-vm`. `--conditions` selects a subset of gates.
+
+| Audio | Clips | Construction |
+|---|---:|---|
+| clean | 200 | the public clips as cached |
+| padded | 200 | 1.5 s before, 2.5 s after, white noise floor at −60 dBFS (RMS ≈ 33, below Koe's threshold) over the whole clip |
+| noisy | 200 | same padding, white noise floor at −38 dBFS (RMS ≈ 412, above Koe's threshold, speech SNR ≈ 18 dB) |
+| silence | 60 | white noise only, 1–6 s, 20 clips each at −60, −45 and −38 dBFS |
+
+Columns: **CER** as above (a dropped or skipped clip counts as an empty
+hypothesis); **Median / p95** of gate time plus whisper time per clip (retries
+included, skipped clips contribute the gate time only); **Gate (ms)** median
+time of the trim/VAD step; **Sent audio** total seconds uploaded; **Skipped**
+clips never sent to whisper; **Dropped** clips rejected after transcription;
+**Pasted** clips with a non-empty result (on silence, this is the hallucination
+count that would reach the user); **Head / Tail** clips whose first / last two
+normalized characters differ from the reference (a word-cutoff indicator; the
+raw row is the floor caused by recognition errors alone). The repetition
+collapse of the app is not reproduced; outputs are only retried and stock
+phrases removed. White noise is a stand-in for room noise, not a recording of
+one. Results and the recommendation are in
+`docs/notes/2026-10-18-vad-before-transcription.md`. On 2026-10-18 (same machine
+as above, warm cache) the full command took **969 seconds (about 16 minutes)**
+for 4,200 scored requests.
