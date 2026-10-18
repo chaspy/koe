@@ -68,6 +68,8 @@ test:
 	./build/window-test
 	swiftc -O -o build/visible-test Sources/Koe/PasteVisible.swift Tests/visible/main.swift
 	./build/visible-test
+	swiftc -O -o build/vad-test Sources/Koe/VAD.swift Tests/vad/main.swift
+	./build/vad-test
 
 clean:
 	rm -rf .build build

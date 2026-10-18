@@ -282,7 +282,8 @@ final class WhisperServer {
             "--port", String(Settings.port),
             "-t", "4",
             "--prompt", Settings.prompt,
-        ]
+        ] + VAD.serverArguments()
+        VAD.serverHasModel = p.arguments!.contains("-vm")
         let log = Self.logURL
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log)
@@ -338,6 +339,7 @@ final class WhisperServer {
         field("temperature", "0.0")
         if let audioCtx { field("audio_ctx", String(audioCtx)) }
         if let temperatureInc { field("temperature_inc", temperatureInc) }
+        for (name, value) in VAD.requestFields() { field(name, value) }
         body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n".data(using: .utf8)!)
         guard let audio = try? Data(contentsOf: wav) else {
             return done(.failure(NSError(domain: "Koe", code: 5,
@@ -2566,11 +2568,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func startServer() {
-        server.start { result in
-            DispatchQueue.main.async {
-                switch result {
-                case .success: self.serverReady = true
-                case .failure(let e): self.showError(e.localizedDescription, sticky: true)
+        // VAD（任意、VAD.swift）のモデルが無ければ先に取る。失敗しても VAD なしで whisper は起こす
+        VAD.prepare { prepared in
+            if case .failure(let e) = prepared { DispatchQueue.main.async { self.showError(e.localizedDescription) } }
+            self.server.start { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success: self.serverReady = true
+                    case .failure(let e): self.showError(e.localizedDescription, sticky: true)
+                    }
                 }
             }
         }

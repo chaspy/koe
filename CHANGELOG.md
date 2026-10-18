@@ -5,7 +5,11 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 ## Unreleased
 
 ### Repository
+- `eval/vad_bench.py` compares Silero VAD (model pinned by commit and SHA-256, cached outside the repository) with Koe's energy trim before whisper on the 200 public JSUT clips plus synthetic variants (added leading/trailing silence, a −38 dBFS noise floor, 60 noise-only clips): CER, gate and transcription time, clips skipped or dropped, hallucinations that would be pasted, and first/last-character mismatches as a word-cutoff indicator. Numbers and the recommendation are in `docs/notes/2026-10-18-vad-before-transcription.md`.
 - Add an opt-in public JSUT v1.1 benchmark for 200 fixed clips: corpus CER, median/p95 inference latency and repetition counts for macOS turbo with/without packs and the Windows small CPU profile. Downloads stay in an external cache; only aggregate metrics are reported.
+
+### macOS
+- Optional, off by default: with `defaults write io.github.chaspy.koe vad -bool true`, whisper-server runs Silero VAD on each utterance before transcribing (whisper.cpp's built-in VAD, speech segments padded 250 ms) and answers nothing when it hears no speech, so noise without speech is dropped instead of becoming 「ご視聴ありがとうございました」. The model (`ggml-silero-v5.1.2.bin`, 0.9 MB, MIT) is downloaded once from a pinned Hugging Face revision into Koe's models folder and accepted only when its SHA-256 matches; the energy trim and the checks after transcription stay as they are. On the public benchmark it pasted 0 of 60 noise-only clips instead of 18, with the same CER on clean audio and no change in first-character accuracy (docs/notes/2026-10-18-vad-before-transcription.md). VAD is requested only from a server Koe itself started with the model.
 
 ## 0.7.0 — 2026-10-17
 
