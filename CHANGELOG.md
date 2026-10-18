@@ -2,6 +2,14 @@
 
 Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each release's notes on GitHub are taken from its section here.
 
+## Unreleased
+
+### macOS
+- No changes.
+
+### Windows
+- Optional low recording level hint: enable `lowLevelWarning` in config.json (off by default). Whole-recording RMS below -45 dBFS shows input-volume advice at most once every 10 minutes; only the numeric level is logged.
+
 ## 0.7.0 — 2026-10-17
 
 ### Repository

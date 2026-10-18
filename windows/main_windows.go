@@ -67,6 +67,7 @@ type App struct {
 	gpuOff     atomic.Bool   // config gpu "off"; the menu "GPU を使う" switches it
 	keepDays   atomic.Int64  // historyKeepDays in use; the menu "履歴を残す期間" switches it
 	lastUsed   atomic.Int64  // unix nano of the last press / paste (the update prompt waits until Koe is settled)
+	lowLevel   lowLevelWarningState
 	upPrompt   updatePromptState
 	gpuOK      atomic.Bool // the GPU server has transcribed once (no more first-request fallback)
 	keys       chan keyEvent
@@ -971,9 +972,13 @@ func (a *App) process(u *utterance) {
 		a.rec.Reopen("digital_silence")
 		return
 	}
+	quietWarning := a.warnLowLevel(captured)
 	if len(trimmed) == 0 {
 		rec["outcome"] = "no_voice"
 		a.save(u, wav, nil)
+		if quietWarning {
+			return
+		}
 		if u.held >= time.Second {
 			a.fail("声を検出できませんでした")
 		} else {

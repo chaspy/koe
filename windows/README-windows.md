@@ -114,6 +114,7 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `autoEnter` | `true` | ターミナルで貼り付け後に Enter を送るか |
 | `enterApps` | ターミナル各種 | Enter を送るアプリの exe 名 |
 | `sounds` | `true` | 効果音 |
+| `lowLevelWarning` | `false` | Set to `true` and restart Koe to show an input-volume hint below -45 dBFS (whole-recording RMS), at most once every 10 minutes. Muted input uses the existing warning. Only the numeric level is logged. Long silence can lower the measured level. |
 | `warmMic` | `true` | マイクを開いたままにする |
 | `saveHistory` | `true` | 録音と文字起こしを履歴（`%LOCALAPPDATA%\Koe\history`）に保存する |
 | `historyKeepDays` | `14` | 録音を残す日数（文字と記録はその約 2 倍：7→14、14→30、30→60、90→180）。`0` は消さない。メニューの「履歴を残す期間」でも変えられます |

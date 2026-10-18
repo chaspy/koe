@@ -23,6 +23,9 @@ const ModelBaseURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/
 
 // Config is %APPDATA%\Koe\config.json. Missing keys keep the defaults.
 type Config struct {
+	// LowLevelWarning enables the opt-in warning for quiet recordings.
+	LowLevelWarning bool `json:"lowLevelWarning"`
+
 	Hotkey    string `json:"hotkey"`    // "ralt" | "rctrl"
 	Engine    string `json:"engine"`    // "whisper" (default) | "parakeet" (Parakeet-ja via sherpa-onnx, CPU)
 	PressMode string `json:"pressMode"` // "hold" (record while held) | "toggle" (tap to start, tap to stop)
