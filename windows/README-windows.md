@@ -164,3 +164,28 @@ zip を作れないときは、`%LOCALAPPDATA%\Koe` フォルダ（メニュー�
 | `%LOCALAPPDATA%\Koe` | `koe.log`、`whisper-server.log`、`whisper-server-vulkan.log`、`update.log`、`backend.json`（GPU と CPU を測った結果）、`models\`、`history\` |
 
 アンインストールは、Koe を終了してから上の 3 つのフォルダを消すだけです。
+
+
+### Muted headsets (opt-in)
+
+Set `"fallbackMic": true` in `%APPDATA%\Koe\config.json` and restart Koe.
+The default is `false`. After about one second of near-zero input during a
+recording, Koe tries another microphone for that recording. Set
+`"fallbackMicName": "Camera"` to prefer a case-insensitive substring of its
+Windows waveIn name (these names can be truncated to 31 characters).
+Otherwise the order is USB, onboard audio, then other inputs. USB and onboard
+HDAUDIO are identified from the device interface; onboard analog jacks count
+as onboard audio, and unrecognized interfaces count as other inputs.
+
+Each candidate gets up to one second to produce a non-silent signal; inputs
+that cannot open or stay silent are skipped. The original microphone remains
+open and is used again for the next recording. Short recordings may finish
+before a fallback is found. Audio before an alternate starts cannot be
+recovered; an accepted alternate is kept until the recording ends. With only
+one microphone, recording continues on that microphone. A speakerphone may
+cause the alternate to pick up meeting participants; use headphones to avoid
+this. Disable `fallbackMic` and restart to restore the original behavior.
+
+The local `koe.log` event is `mic_fallback kind=usb` (or `built_in` / `other`).
+It does not contain device names or audio. `fallbackMicName` is redacted from
+diagnostics. No network calls are added.

@@ -23,6 +23,9 @@ const ModelBaseURL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/
 
 // Config is %APPDATA%\Koe\config.json. Missing keys keep the defaults.
 type Config struct {
+	FallbackMic     bool   `json:"fallbackMic"` // opt-in hardware-mute fallback
+	FallbackMicName string `json:"fallbackMicName"`
+
 	Hotkey    string `json:"hotkey"`    // "ralt" | "rctrl"
 	Engine    string `json:"engine"`    // "whisper" (default) | "parakeet" (Parakeet-ja via sherpa-onnx, CPU)
 	PressMode string `json:"pressMode"` // "hold" (record while held) | "toggle" (tap to start, tap to stop)

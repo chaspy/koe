@@ -2,6 +2,11 @@
 
 Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each release's notes on GitHub are taken from its section here.
 
+## Unreleased
+
+### Windows
+- Optional hardware-mute microphone fallback (`fallbackMic`, off by default): after one second of digital silence, try `fallbackMicName`, another USB microphone, then onboard audio, skipping silent or unavailable inputs. Fallback events contain only the device kind.
+
 ## 0.7.0 — 2026-10-17
 
 ### Repository

@@ -191,7 +191,7 @@ func (a *App) startup() {
 		si.CPU, runtime.NumCPU(), si.RAMTotalMB, si.RAMFreeMB, cfg.ThreadsFor(runtime.NumCPU()), cfg.Threads)
 	a.log.Printf("config engine=%s hotkey=%s pressMode=%s model=%s packs=%v packSources=%v autoEnter=%v enterDelayMs=%d warmMic=%v minHold=%.2f temperatureFallback=%v audioCtx=%s gpu=%s gpuAudioCtx=%s gpu_adapters=%q",
 		cfg.Engine, cfg.Hotkey, cfg.PressMode, cfg.Model, cfg.EnabledPacks, cfg.PackSources, cfg.AutoEnter, cfg.EnterDelayMs, cfg.WarmMic, cfg.MinHoldSeconds, cfg.TemperatureFallback, cfg.AudioCtx, cfg.GPU, cfg.GPUAudioCtx, a.gpuNames)
-	a.log.Printf("input_devices %q", inputDevices())
+	a.log.Printf("input_devices count=%d", len(inputDevices()))
 
 	if _, err := os.Stat(a.glossaryPath()); os.IsNotExist(err) {
 		_ = os.WriteFile(a.glossaryPath(), []byte("# Koe 個人の辞書\r\n# 1 行 1 語。タブの後に、実際に起きた誤変換の形を ／ 区切りで書く（例: プルリク<TAB>プロリク／プロリック）\r\n"), 0o644)
@@ -205,6 +205,9 @@ func (a *App) startup() {
 	vk := a.hotkeyVK.Load()
 	a.hold = core.HoldTracker{HotkeyVK: vk, MinHold: time.Duration(cfg.MinHoldSeconds * float64(time.Second)), Toggle: a.toggle.Load()}
 	a.rec = NewRecorder(cfg.WarmMic, a.log.Printf)
+	if cfg.FallbackMic {
+		a.rec.fallback = &micFallback{preferred: cfg.FallbackMicName}
+	}
 	a.rec.Warm()
 
 	keys := make(chan keyEvent, 256)

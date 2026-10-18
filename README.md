@@ -20,7 +20,8 @@ Both are built from the same code at the same version and attached to the same G
 | Retry on hallucination, previous utterance as context, history | ✅ | ✅ |
 | In-app update | ✅ from 0.2.0 | ✅ from 0.2.0 |
 | Improvement loop (glossary grows by itself) | ✅ | not yet |
-| Lock recording, line breaks, low-level hint, fallback mic | ✅ | not yet |
+| Lock recording, line breaks, low-level hint | ✅ | not yet |
+| Hardware-mute fallback mic | ✅ | opt-in (`fallbackMic`) |
 | Speech model | large-v3-turbo on the GPU (Metal) | large-v3-turbo q5_0 on the CPU |
 
 The Windows version is documented in [windows/README-windows.md](windows/README-windows.md).
