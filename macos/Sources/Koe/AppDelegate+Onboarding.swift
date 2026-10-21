@@ -49,19 +49,8 @@ extension AppDelegate {
         }
     }
 
-    // 改善ループのコマンドと同じく zsh -lc で探す（claude などは ~/.local/bin にあり、ログインシェルで PATH が通る）。
-    // 名前は引数として渡し、シェルの文字列には埋め込まない。5 秒で諦める
     static func loginShellFinds(_ program: String) -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", "command -v -- \"$1\" >/dev/null", "koe", program]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return false }
-        let deadline = Date().addingTimeInterval(5)
-        while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
-        if p.isRunning { p.terminate(); return false }
-        return p.terminationStatus == 0
+        ImproveCommand.find(program) != nil
     }
 
     @objc func openOnboarding() { onboarding.show(reason: "menu") }

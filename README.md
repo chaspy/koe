@@ -19,7 +19,7 @@ Both are built from the same code at the same version and attached to the same G
 | Term packs, personal glossary, note for the receiving AI | ✅ | ✅ |
 | Retry on hallucination, previous utterance as context, history | ✅ | ✅ |
 | In-app update | ✅ from 0.2.0 | ✅ from 0.2.0 |
-| Improvement loop (glossary grows by itself) | ✅ | not yet |
+| Improvement loop (glossary grows by itself) | ✅ | opt-in (`improveEnabled`) |
 | Lock recording, line breaks, low-level hint | ✅ | not yet |
 | Hardware-mute fallback mic | ✅ | opt-in (`fallbackMic`) |
 | Speech model | large-v3-turbo on the GPU (Metal) | small-q5_1 by default; Vulkan GPU if faster, otherwise CPU |
@@ -38,16 +38,18 @@ The Windows version is documented in [windows/README-windows.md](windows/README-
 - **Line breaks** (`lineBreaks`, off by default): enable 「区切りごとに改行する（ターミナル以外。Docs 向け）」 in the menu to break lines at whisper's segment boundaries when pasting into non-terminal apps such as Google Docs.
 - If your voice is recorded too quietly (below about −45 dB), Koe tells you to raise the input volume.
 - The mic stays open in the background and keeps the last 0.5 s, so the first word is not cut off. Recording also continues 0.25 s after release. `warmMic` is on by default; turn off 「マイクを常時待機（頭切れ防止）」 in the menu if you do not want the mic indicator always on.
-- Optional (off by default): a small indicator that shows recording (moving with your voice), transcribing, and failures. It never takes the focus or blocks clicks. Menu → 録音中の表示 picks the look (`recordingIndicator` = `off` / `pill` / `dot` / `wave`) and the place (`recordingIndicatorPosition` = `top` / `caret` / `bottom`).
+- Optional (off by default): a small indicator that shows recording (moving with your voice), transcribing, and failures. It never takes the focus or blocks clicks. Turn it on with `defaults write io.github.chaspy.koe recordingIndicator pill`; after that, menu → 録音中の表示 picks the look (`recordingIndicator` = `off` / `pill` / `dot` / `wave`) and the place (`recordingIndicatorPosition` = `top` / `caret` / `bottom`).
 - Plays a short marimba tone on start and stop (toggle in the menu).
 - Muted headsets: many meeting-certified headsets and speakerphones mute in hardware when you mute in the meeting app, so the OS only receives digital silence. Choose the microphone from the menu (マイク). Pick a mic other than the one your meeting app uses and Koe never goes silent. In 「自動（既定のマイク…）」 (default), Koe uses the system default mic, detects hardware mute (near-zero signal for 1 s) and records from another microphone while it lasts; the menu shows which one (`fallbackMicName` if set, otherwise another USB mic such as a webcam, then the built-in mic). A fallback that is also silent (e.g. a closed MacBook lid) is skipped. With the lid closed, the built-in mic is not used as the fallback at all, and the menu marks it (⚠ 蓋が閉じています). A Bluetooth mic (e.g. AirPods) is marked ⚠ 内蔵マイク推奨: Bluetooth headsets switch to call-quality audio while their mic is open, which loses words. These warnings are off by default (`defaults write io.github.chaspy.koe micNotice -bool true`). If you have only one microphone there is nothing to fall back to. If you listen to the meeting on speakers, the fallback mic may pick up other people's voices; headphones avoid that.
 - Misses are not silent: a failure tone plays, the menu shows the reason, and every press is logged to `~/Library/Application Support/Koe/events.jsonl` (`koe_eval.py misses`).
 - Keeps `whisper-server` resident (on a free loopback port chosen at each start; Koe only uses the server it started itself), so the model is loaded once. Prefers `ggml-large-v3-turbo.bin` when present.
 - Needs Microphone and Accessibility permissions.
 
-**Install from the dmg**: open `Koe-<version>.dmg`, drag Koe to Applications, launch it, and allow Microphone and Accessibility. On first launch Koe downloads the speech model (about 1.6 GB, shown in the menu). whisper-server is bundled; nothing else to install.
+**Install from the dmg**: open `Koe-<version>.dmg`, drag Koe to Applications, launch it, and allow Microphone and Accessibility. On first launch Koe downloads the speech model (about 1.6 GB, shown in the menu). whisper-server is bundled; nothing else to install. Step-by-step guide in Japanese for people who don't use the terminal: [docs/setup-ja.md](docs/setup-ja.md).
 
 **Build from source**:
+
+You need the Xcode Command Line Tools (`xcode-select --install`) and CMake (`brew install cmake`). Creating the signing certificate also needs OpenSSL: the one that comes with macOS works, and so does Homebrew's OpenSSL 3 (`brew install openssl@3`). The first time, run `bash macos/scripts/signing-setup.sh` from the repository root. If you are switching from the dmg to a build from source, see [Installing a source build after the dmg](docs/notes/signing.md#installing-a-source-build-after-the-dmg) for granting the permissions again.
 
 ```bash
 # once: a self-contained whisper-server (static, Metal embedded) to bundle
@@ -64,7 +66,9 @@ make dist SIGN_IDENTITY="<your codesigning identity>"      # build/Koe-<version>
 
 Quit and relaunch Koe after changing settings with `defaults write`; menu changes apply immediately.
 
-Settings (`defaults write io.github.chaspy.koe <key> <value>`): `hotkeyKeyCode` (54 = right ⌘, 61 = right ⌥), `model`, `language`, `prompt`, `port`, `minHoldSeconds`, `warmMic`, `sounds`, `startSound` / `stopSound` (bundled `start`/`stop` or a macOS sound name such as `Ping`), `audioCtx` (`auto`, the default, = the whole 30 s window on macOS since a shrunk window garbled 7.5–20 s utterances, see [the measurement](docs/notes/2026-10-18-audio-ctx-by-length.md); `0` = the whole window; a number = that many frames, 50 per second), `restoreFocus` (default `true`: if another app comes to the front while Koe is transcribing, Koe brings back the window you started talking in and pastes there, within 20 s of the press; `false` = keep the text on the clipboard instead).
+Settings (`defaults write io.github.chaspy.koe <key> <value>`): `hotkeyKeyCode` (54 = right ⌘, 61 = right ⌥), `model`, `language`, `prompt`, `port`, `minHoldSeconds`, `warmMic`, `sounds`, `startSound` / `stopSound` (bundled `start`/`stop` or a macOS sound name such as `Ping`), `pasteLast` (`true` = ⌃⌥V and menu → 「最後の文を貼る」 paste the last text again; `false` = off, the default; takes effect at the next launch), `duckMedia` (`true` = turn the volume down while you talk if music or a video is playing; `false` = leave it, the default), `audioCtx` (`auto`, the default, = the whole 30 s window on macOS since a shrunk window garbled 7.5–20 s utterances, see [the measurement](docs/notes/2026-10-18-audio-ctx-by-length.md); `0` = the whole window; a number = that many frames, 50 per second), `restoreFocus` (default `true`: if another app comes to the front while Koe is transcribing, Koe brings back the window you started talking in and pastes there, within 20 s of the press; `false` = keep the text on the clipboard instead), `pressMode` (`hold` = record while held, the default; `auto` = a tap under 0.3 s starts hands-free recording that pastes on the next press, a hold works as before, a quick double tap still starts a lock recording; `toggle`), `repoContext` (`true` = when talking into a terminal, add the repository and branch name to the local whisper prompt; `false` = off, the default).
+
+Previous-utterance context is off by default on macOS (`contextPrompt`). To opt in, use `defaults write io.github.chaspy.koe contextPrompt -bool true` and relaunch; explicit preferences are preserved. The 180-utterance comparison in [#203](https://github.com/chaspy/koe-dev/issues/203) found no measurable gain and more carried-over errors. Windows keeps its current default pending a separate public-data evaluation.
 
 ### LLM cleanup (optional)
 
@@ -97,6 +101,13 @@ Two more layers, same format (one term per line, optionally a tab and aliases se
 The whisper prompt only fits about 120 characters, so Koe picks the terms that appeared most in your recent utterances (counting aliases too) from both layers; the LLM cleanup gets all of them.
 
 Personal glossary details: `~/Library/Application Support/Koe/glossary.txt` is sent to whisper as part of the initial prompt on every request, and to the LLM cleanup. Put the words you say often and want spelled a certain way at the top — only about 120 characters fit in the whisper prompt. Changes apply to the next utterance without restarting.
+
+macOS alias-learning options (both off by default; relaunch after changing):
+
+- `defaults write io.github.chaspy.koe termAliasLearning -bool true`: learn the term-only prefix when the improvement response identifies a boundary, and trim trailing スキャン / ツール / サーバー / アプリ / サービス from aliases of existing multi-word terms when that suffix is not part of the term. The observed longer alias is retained; no aliases are invented or retroactively rewritten. Multi-word terms must already exist in a dictionary.
+- `defaults write io.github.chaspy.koe ordinaryWordNotes -bool true`: allow new ambiguous ordinary-word aliases as `~` notes for the receiving AI only. They never replace dictated text, even in a technical sentence. Existing notes and manual entries are preserved when off; person-name rules are unchanged. The receiving AI must load the existing voice glossary to use the notes.
+
+On macOS, automatic term learning rejects phrases, common English/Japanese vocabulary, and alias chains. Eligible terms take priority in the limited whisper prompt. Existing dictionary files are never cleaned automatically: enable the dictionary view with `defaults write io.github.chaspy.koe glossaryView -bool true`, relaunch, and open 「辞書を見る…」. The first visit with cleanup candidates shows 「見直し候補だけ（削除は手動）」; hover a term for its reason, then use 「辞書のファイルを開いて直す…」 to remove unwanted entries manually. The filter remains available on later visits. Name learning keeps its separate safeguards. The local vocabulary list is conservative and cannot recognize every proper noun; manual dictionaries remain editable.
 
 ### Improvement loop (built in)
 

@@ -30,7 +30,6 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
     private var window: NSWindow?
     private(set) var step: OnboardingStep = .permissions
-    private var flow: OnboardingFlow = .steps
     private var timer: Timer?
     private var ticks = 0
     private var restoreWarm: Bool?
@@ -79,14 +78,13 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
     func show(reason: String) {
         if isVisible { window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
-        flow = OnboardingFlow.enabled ? OnboardingFlow.current : .steps
-        log("onboarding_opened", ["reason": reason, "flow": flow.rawValue])
+        log("onboarding_opened", ["reason": reason])
         if window == nil { build() }
         practiced = false; pasted = false; micPassed = false; permissionsWereMissing = false
         withImprove = ImproveStepText.shows(undecided: improveUndecided(), enabled: improveEnabled())
         if restoreWarm == nil { restoreWarm = isWarm(); if !isWarm() { setWarm(true) } }
         // 許可が揃っていれば、許可の段は飛ばす
-        go(PermissionCheck.missingNow().isEmpty && micAuthorized ? flow.next(after: .permissions, improve: withImprove)! : .permissions)
+        go(PermissionCheck.missingNow().isEmpty && micAuthorized ? OnboardingFlow.next(after: .permissions, improve: withImprove)! : .permissions)
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -193,18 +191,17 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     }
 
     @objc private func nextStep() {
-        if let n = flow.next(after: step, improve: withImprove) { go(n) } else { finish() }
+        if let n = OnboardingFlow.next(after: step, improve: withImprove) { go(n) } else { finish() }
     }
 
     @objc private func previousStep() {
-        if let p = flow.previous(before: step, improve: withImprove) { go(p) }
+        if let p = OnboardingFlow.previous(before: step, improve: withImprove) { go(p) }
     }
 
-    // 自分で進む案だけ。少し ✓ を見せてから、まだその段にいれば次へ
+    // 少し ✓ を見せてから、まだその段にいれば次へ
     private func advanceSoon(from s: OnboardingStep, after seconds: TimeInterval) {
-        guard flow.advancesItself else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-            if self.isVisible, self.step == s, let n = self.flow.next(after: s, improve: self.withImprove) { self.go(n) }
+            if self.isVisible, self.step == s, let n = OnboardingFlow.next(after: s, improve: self.withImprove) { self.go(n) }
         }
     }
 
@@ -267,10 +264,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
             } else {
                 pillBars?.heights = HUDLayout.barHeights(.recording(since: Date(), locked: false, app: nil), level: 0, t: 0)
             }
-        case .paste:
-            meter?.level = smoothed   // 短い案だけ、貼る段にマイクの揺れを出す
-            meter?.passed = smoothed >= MicTest.threshold
-        case .improve:
+        case .paste, .improve:
             break
         }
     }
@@ -279,7 +273,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
     private func refreshSteps() {
         let s = NSMutableAttributedString()
-        for (i, st) in flow.steps(improve: withImprove).enumerated() {
+        for (i, st) in OnboardingFlow.steps(improve: withImprove).enumerated() {
             if i > 0 { s.append(NSAttributedString(string: "   ›   ", attributes: [.foregroundColor: NSColor.tertiaryLabelColor])) }
             let done = st.rawValue < step.rawValue
             let text = (done ? "✓ " : "\(i + 1). ") + st.short
@@ -291,7 +285,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     }
 
     private func refreshButtons() {
-        backButton.isHidden = flow.previous(before: step, improve: withImprove) == nil
+        backButton.isHidden = OnboardingFlow.previous(before: step, improve: withImprove) == nil
         laterButton.isHidden = step == .improve   // この段では右下の「あとで」が同じ役目
         switch step {
         case .permissions:
@@ -304,7 +298,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
             nextButton.title = practiced ? "次へ" : "飛ばす"
             nextButton.isEnabled = true
         case .paste:
-            nextButton.title = flow.next(after: .paste, improve: withImprove) == nil ? "完了" : "次へ"
+            nextButton.title = OnboardingFlow.next(after: .paste, improve: withImprove) == nil ? "完了" : "次へ"
             nextButton.isEnabled = true
         case .improve:
             nextButton.title = improveEnabled() ? "完了" : "あとで"
@@ -335,7 +329,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         // 揃ったら少し見せてから次へ進む
         if all && !wasEnabled && permissionsWereMissing {
             log("onboarding_permissions_ok", [:])
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { if self.step == .permissions, let n = self.flow.next(after: .permissions) { self.go(n) } }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { if self.step == .permissions, let n = OnboardingFlow.next(after: .permissions) { self.go(n) } }
         }
     }
 
@@ -537,19 +531,11 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         let tips = body("・長く話すときは \(keyName) を素早く 2 回押す（ロック録音。もう 1 回押すと終わります）\n・設定と困ったときは、メニューバーの吹き出しのアイコンから（この案内もそこから開き直せます）", size: 12, color: .secondaryLabelColor)
         tips.isHidden = true
         hintLabel = tips
-        var views: [NSView] = [
+        return vstack([
             title("ほかのアプリに貼ってみましょう"),
             body("① テキストエディット（Slack やメモでも大丈夫）の入力欄をクリックする\n② \(keyName) を押しながら話して、離す\n③ 話した文が、カーソルの位置に貼られます"),
-            open,
-        ]
-        // 短い案はマイクの段がないので、ここで声が入っているかを見せる
-        if !flow.steps.contains(.mic) {
-            let m = MeterView()
-            meter = m
-            let cap = body("マイク: \(currentMic() ?? activeMicName())　話すとバーが動きます", size: 11, color: .secondaryLabelColor)
-            views += [vstack([m, cap], spacing: 4)]
-        }
-        return vstack(views + [status(""), tips], spacing: 16)
+            open, status(""), tips,
+        ], spacing: 16)
     }
 
     @objc private func openTextEdit() {

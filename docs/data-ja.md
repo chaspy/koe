@@ -11,7 +11,7 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 
 | もの | 場所 | 中身 | 消えるタイミング |
 |---|---|---|---|
-| 履歴（録音） | `~/Library/Application Support/Koe/history/<日付>/<id>.wav` | 話した録音 | 既定は 14 日で消す |
+| 履歴（録音） | `~/Library/Application Support/Koe/history/<日付>/<id>.wav` | 話した録音。設定 `retranscribe` をオンにしたときは、話している途中に他のキーに触れて取り消した録音も、1 秒以上話していれば残す（もう一度文字起こしできるように。履歴を残さない設定のときは残さない。既定はオフで、取り消した録音は捨てる） | 既定は 14 日で消す |
 | 履歴（文字と記録） | 同じ場所の `<id>.json` | 文字起こし・貼った文・貼った先のアプリ・マイク名・速さなど | 録音の約 2 倍の期間（既定 30 日）で消す |
 | 比較用の録音 | 同じ場所の `<id>.alt.wav` | 使わなかった側のマイクの録音。設定 `saveAllMics` をオンにしたときだけ（既定はオフ） | 録音と同じ |
 | 動作の記録 | `~/Library/Application Support/Koe/events.jsonl` | 押した・貼った・失敗した理由・かかった時間など | 消さない |
@@ -29,7 +29,7 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 
 **予備のマイクの録音も残す（既定はオフ）**: 比べるために予備のマイクの録音も残したいときは、Koe を終了して `defaults write io.github.chaspy.koe saveAllMics -bool true` を実行し、起動し直します。履歴の保存（設定 `saveHistory`、既定はオン）がオンのときだけ残ります。
 
-**iTerm の画面を読む（macOS、既定はオフ）**: `defaults write io.github.chaspy.koe measureVisible -bool true` でオンにしたときだけ、iTerm に貼ったあと最大 10 秒、iTerm の今のセッションの画面の文字（AppleScript の contents）を読み、貼った文の末尾が出るまでの時間を測ります。読んだ画面の中身と貼った文は比べるのにだけ使い、どこにも書きません（履歴と動作の記録には `visible`・`visible_ms` などの数字と結果だけが残ります）。オンにして初めて測るときに macOS がオートメーション（Koe が iTerm を操作する）の許可を求めます。オフの間は画面を読まず、許可も聞きません。許可しなくても貼り付けはそのまま使えます（測れなかった、と記録するだけ）。止めるには `defaults write io.github.chaspy.koe measureVisible -bool false`。
+**iTerm の画面を読む（macOS、既定はオフ）**: `defaults write io.github.chaspy.koe measureVisible -bool true` でオンにしたときだけ、iTerm に貼ったあと最大 10 秒、iTerm の今のセッションの画面の文字（AppleScript の contents）を読み、貼った文の末尾が出るまでの時間を測ります。読んだ画面の中身と貼った文は比べるのにだけ使い、どこにも書きません（履歴と動作の記録には `visible`・`visible_ms` などの数字と結果だけが残ります）。オンにして初めて測るときに macOS がオートメーション（Koe が iTerm を操作する）の許可を求めます。許可のダイアログが出うるその 1 回は、答えるまで待った時間が入るので、測れなかった（`visible_unknown`、理由 `waited_permission`）として記録します。オフの間は画面を読まず、許可も聞きません。許可しなくても貼り付けはそのまま使えます（測れなかった、と記録するだけ）。止めるには `defaults write io.github.chaspy.koe measureVisible -bool false`。
 
 ### Windows
 
@@ -43,7 +43,7 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 | 設定・個人の辞書・用語パック | `%APPDATA%\Koe\config.json`、`glossary.txt`、`packs\` | 設定と語の一覧 | 消さない |
 | 受け取る AI 向けのメモ | `%USERPROFILE%\.claude\koe-voice-glossary.md` と `.full.md` | macOS と同じ | `%USERPROFILE%\.claude` が無ければ書かない |
 
-履歴を残さないようにするには、`config.json` の `saveHistory` を `false` にします。Windows 版には、ロック録音・改善ループ・LLM 整形・組織の辞書はありません。
+履歴を残さないようにするには、`config.json` の `saveHistory` を `false` にします。Windows 版には、LLM 整形・組織の辞書・社員名簿はありません。改善ループ（既定はオフ）の作業ファイルは、`%APPDATA%\Koe\glossary_candidates.json`（辞書に足す語の候補）、`%LOCALAPPDATA%\Koe\improve_last_response.txt`（AI の直近の返答）、`%LOCALAPPDATA%\Koe\improve_preview.txt`（「送る内容を見る」で開いた内容。次の起動で消す）です。
 
 ## 2. 外に出る通信（録音も文字も送らない）
 
@@ -63,9 +63,12 @@ Koe は、声を自分のパソコンの中で文字にします。文字起こ�
 
 `<repo>` は既定では公開版の `chaspy/koe` です（設定 `updateRepo` で変えられます）。更新の確認を止めるには、設定 `updateCheck` を `false` にします（macOS は defaults、Windows は `config.json`）。Windows はその状態でもメニューの「更新を確認」を押せば手で確認できます。macOS は `updateCheck` をオンに戻してから確認してください。
 
-## 3. 自分でオンにしたときだけ外に出るもの（macOS のみ）
+## 3. 自分でオンにしたときだけ外に出るもの
 
-### 「使うほど賢くする（改善ループ）」— 既定はオフ
+### 「使うほど賢くする（改善ループ）」— 既定はオフ（macOS・Windows）
+
+Windows は、トレイの「改善ループ: オフ（有効にすると使うほど賢くなります）」を押し、送り先の確認で「はい」を選ぶとオンになります。`config.json` に `improveEnabled` を直接 `true` と書いた場合も、次の起動で同じ確認を出し、「はい」を選ぶまでは何も送りません（送り先の `improveCommand` を変えたときも確認し直します。同意した送り先は `%APPDATA%\Koe\improve_consent.json` に残します）。送り先は `improveCommand` で、既定は自分の Claude Code の `claude -p --model sonnet` です。送るものは macOS と同じで、文字起こし・辞書の語の一覧と、Claude Code のセッション記録（`%USERPROFILE%\.claude\projects`）の該当部分（送った文・返答・次の発話）です。オフのまま 30 回貼ると、トレイの表示で一度だけ（14 日あけて最大 2 回）改善ループのことを知らせます。知らせるだけで、オンにはしません。トレイの「改善ループの提案を出さない」で止められます。`improveEnabled` が一度でも `config.json` に書かれていれば（トレイで切り替えた・自分や管理者が書いた）、知らせません。「改善ループで送る内容を見る」は、次に送る内容をメモ帳で見せるだけで、何も送りません。
+
 
 メニューの「使うほど賢くする（改善ループ）」（設定 `improveEnabled`）を押し、送り先を確認するとオンになります。オフのまま 30 回話すと、メニューバーの下に「有効にする / 内容を見る / 今はしない」の提案が出ますが、提案から押した場合も同じ確認を出し、黙ってオンにはしません。「改善ループで送る内容を見る…」は、次に送る内容をこの Mac の中で組み立てて見せるだけで、何も送りません。
 

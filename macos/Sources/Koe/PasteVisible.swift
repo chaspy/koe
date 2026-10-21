@@ -18,6 +18,12 @@ enum PasteVisible {
         }.map(Character.init))
     }
 
+    // 初回の読み取りを測った値として使えるか。許可がまだ決まっていなかった（AEDeterminePermissionToAutomateTarget が noErr 以外）ときは、
+    // 初回の読み取りの最中に macOS が許可のダイアログを出し、答えるまで戻らない。待った分が「出るまでの時間」に入る
+    // （手元の Mac で、ダイアログで待った 8 秒が visible_ms 8006 として数えられた）ので、出たかどうかに関わらず
+    // 測れなかった（visible_unknown の waited_permission）とする
+    static func waitedPermission(permission: Int32, firstRead: Bool) -> Bool { firstRead && permission != 0 }
+
     static func tail(_ text: String) -> String {
         String(normalize(text).suffix(tailLength))
     }

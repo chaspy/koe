@@ -12,10 +12,11 @@ const (
 	ActShort         // released too early: discard silently
 	ActCancel        // another key while holding: discard
 	ActLatch         // toggle mode: a tap started recording; keep recording until the next tap
+	ActLock          // hold mode with DoubleTapLock: the second of two quick taps; keep recording (lock) until the next press
 )
 
 func (a Action) String() string {
-	return [...]string{"none", "start", "finish", "short", "cancel", "latch"}[a]
+	return [...]string{"none", "start", "finish", "short", "cancel", "latch", "lock"}[a]
 }
 
 // DefaultTapMax: in toggle mode a press shorter than this is a tap.
@@ -31,11 +32,18 @@ const DefaultTapMax = 500 * time.Millisecond
 // other key in between, it latches (ActLatch) and keeps recording; the next
 // press of the hotkey without another key stops it (ActFinish). While latched,
 // other keys do not cancel. A long first press behaves like hold mode.
+//
+// Lock (hold mode with DoubleTapLock, mac's double tap): a press released
+// before MinHold is ActShort as before; if the next press starts within
+// DoubleTapGap of that release and is also released before MinHold, it is
+// ActLock instead and the recording of that press keeps going with the key
+// up, like a latch. The next press without another key ends it (ActFinish).
 type HoldTracker struct {
-	HotkeyVK uint32
-	MinHold  time.Duration
-	Toggle   bool
-	TapMax   time.Duration // 0 = DefaultTapMax
+	HotkeyVK      uint32
+	MinHold       time.Duration
+	Toggle        bool
+	TapMax        time.Duration // 0 = DefaultTapMax
+	DoubleTapLock bool          // hold mode: two quick taps start a lock recording
 
 	down      bool
 	cancelled bool
@@ -43,6 +51,7 @@ type HoldTracker struct {
 	latched   bool
 	pressedAt time.Time
 	startedAt time.Time
+	shortAt   time.Time // release of the last short tap (hold mode)
 }
 
 func (h *HoldTracker) tapMax() time.Duration {
@@ -90,6 +99,8 @@ func (h *HoldTracker) Up(vk uint32, now time.Time) (Action, time.Duration) {
 	}
 	h.down = false
 	held := now.Sub(h.pressedAt)
+	lastShort := h.shortAt
+	h.shortAt = time.Time{} // only a short tap right before counts
 	if h.latched {
 		if h.other {
 			return ActNone, held // the hotkey was used as a modifier; keep recording
@@ -106,6 +117,11 @@ func (h *HoldTracker) Up(vk uint32, now time.Time) (Action, time.Duration) {
 		return ActLatch, held
 	}
 	if held < h.MinHold {
+		if h.DoubleTapLock && !lastShort.IsZero() && h.pressedAt.Sub(lastShort) < DoubleTapGap {
+			h.latched = true
+			return ActLock, held
+		}
+		h.shortAt = now
 		return ActShort, held
 	}
 	return ActFinish, held
@@ -126,6 +142,7 @@ func (h *HoldTracker) Reset() {
 	h.cancelled = false
 	h.other = false
 	h.latched = false
+	h.shortAt = time.Time{}
 }
 
 // SetHotkey switches to another hotkey. A press in progress is forgotten so
@@ -135,6 +152,15 @@ func (h *HoldTracker) SetHotkey(vk uint32) {
 		return
 	}
 	h.HotkeyVK = vk
+	h.Reset()
+}
+
+// SetDoubleTapLock turns the double-tap lock on or off, forgetting any press.
+func (h *HoldTracker) SetDoubleTapLock(on bool) {
+	if on == h.DoubleTapLock {
+		return
+	}
+	h.DoubleTapLock = on
 	h.Reset()
 }
 

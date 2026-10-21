@@ -66,6 +66,7 @@ let keys = [IndicatorStyle.key, IndicatorPosition.key]
 let saved = keys.map { d.object(forKey: $0) }
 keys.forEach { d.removeObject(forKey: $0) }
 check(IndicatorStyle.current == .off, "default off")
+check(!IndicatorStyle.menuVisible, "menu hidden while the key is unset")
 d.set("bogus", forKey: IndicatorStyle.key)
 check(IndicatorStyle.current == .off, "unknown value → off")
 d.set("top", forKey: IndicatorStyle.key)
@@ -74,6 +75,10 @@ d.set("caret", forKey: IndicatorStyle.key)
 check(IndicatorStyle.current == .pill, "old value caret → pill")
 IndicatorStyle.current = .dot
 check(IndicatorStyle.current == .dot, "dot")
+check(IndicatorStyle.menuVisible, "menu shown once the key is set")
+IndicatorStyle.current = .off
+check(IndicatorStyle.menuVisible, "choosing off from the menu keeps the menu")
+IndicatorStyle.current = .dot
 check(IndicatorPosition.current(for: .pill) == .top && IndicatorPosition.current(for: .dot) == .caret
       && IndicatorPosition.current(for: .wave) == .bottom, "position follows the style when not chosen")
 IndicatorPosition.set(.bottom)

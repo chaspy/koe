@@ -1,5 +1,9 @@
 # Contributing to Koe
 
+## Pull requests
+
+Pull requests to this repository (chaspy/koe) are welcome. Koe is developed in a separate repository and each release is published here as one commit, so a pull request here is not merged as is: a maintainer brings the change into the development repository, it ships in the next release, and the pull request is closed then.
+
 ## Term packs (`packs/`)
 
 Term packs are glossaries for a field, shipped with the app and turned on from the menu (用語パック). They help in three places:
@@ -27,7 +31,8 @@ GitHub
 
 - **Terms**: words people in that field say often and that should be spelled a certain way. Prefer the spelling the community uses.
 - **Misrecognitions**: only forms you have **actually seen** Koe produce. Do not guess.
-- **Not misrecognitions**: plain readings in katakana (イシュー for Issue) are not errors — do not add them as aliases.
+- **Katakana spellings of latin names**: for a name nobody writes in katakana (GitHub, Terraform), the katakana spelling whisper produces (ギットハブ, テラフォーム) may be added without having seen it, as long as the form is not also an ordinary word or another term's form. Check it against your history before adding.
+- **Not misrecognitions**: plain readings in katakana that people do write (イシュー for Issue, ネームスペース) are not errors — do not add them as aliases.
 - **No company-specific words** (internal product names, people, URLs). Those belong in your organization glossary (`orgGlossary`), not in a public pack.
 
 ### Checking

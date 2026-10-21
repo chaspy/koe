@@ -116,6 +116,8 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `terminalPasteKeys` | `false` | （試験中）`true` にすると、ターミナルごとに合った貼り付けキーを使う: Windows Terminal・WezTerm・Alacritty・Hyper・Tabby は Ctrl+Shift+V、mintty（Git Bash）は Shift+Insert、それ以外は Ctrl+V。WezTerm・Alacritty で貼っても何も入らないときに |
 | `pasteKeys` | `{}` | アプリごとの貼り付けキー（`terminalPasteKeys` より優先、オフでも効く）。例 `{"myterm.exe": "ctrl+shift+v"}`。`"ctrl+v"` / `"ctrl+shift+v"` / `"shift+insert"` から選ぶ |
 | `restoreFocus` | `true` | 文字起こしの間に別のアプリが前に出たとき、話し始めたウィンドウを前に戻してから貼る（押してから 20 秒以内）。戻せなかったときと `false` のときは、貼らずにクリップボードに残す |
+| `lineBreaks` | `false` | （試験中）`true` にすると、whisper が区切った文ごとに改行して貼る（Word・Google ドキュメントなど長文向け）。ターミナル（`enterApps`）には改行を入れない。Mac の `lineBreaks` と同じ |
+| `lockRecording` | `false` | （試験中）`true` にすると、押して話すモードでホットキーを素早く 2 回押す（1 回目を離してから 0.5 秒以内）と、手を離したまま録音が続く（ロック録音）。もう一度押すと終了。文字は貼らずに `ドキュメント\Koe\年-月-日-時分.txt` に保存してクリップボードにも入れ、そのファイルを開く。録音中に他のキーやマウスを使っても止まらない。設定を変えたら Koe を再起動 |
 | `sounds` | `true` | 効果音 |
 | `lowLevelWarning` | `false` | `true` にして Koe を起動し直すと、声の部分の平均が −45 dBFS より小さい録音のあとに、入力音量を上げる案内を出す（10 分に 1 回まで）。ミュートは従来の案内のまま。記録するのは数値のレベルだけ |
 | `warmMic` | `true` | マイクを開いたままにする |
@@ -125,6 +127,9 @@ Koe は起動時と、その後 24 時間ごとに、公開版（GitHub Releases
 | `historyKeepDays` | `14` | 録音を残す日数（文字と記録はその約 2 倍：7→14、14→30、30→60、90→180）。`0` は消さない。メニューの「履歴を残す期間」でも変えられます |
 | `updateCheck` | `true` | 新しい版が出ていないか確かめる（起動時、24 時間ごと、メニューを開いたとき〔前回から 1 分以上たっていれば〕） |
 | `updateRepo` | `"chaspy/koe"` | 新しい版を探す GitHub のリポジトリ（`owner/repo`） |
+| `improveEnabled` | `false` | 使うほど賢くする（改善ループ）。トレイの「改善ループ: オフ…」を押して、送り先の確認で「はい」を選ぶとオンになる。`config.json` に直接 `true` と書いた場合も、次の起動で同じ確認を出し、「はい」を選ぶまでは何も送らない（「いいえ」なら `false` に戻す。`improveCommand` を変えたときも確認し直す）。新しい発話が `improveBatch` 件たまるごとに、録音していないときに文字起こし（直近の最大 60 件。ロック録音と文字にできなかった録音は除く）・辞書の語と、Claude Code のセッション記録（`%USERPROFILE%\.claude\projects`）の該当部分（送った文・返答・次の発話）を `improveCommand` に送り、誤変換された語を `glossary.txt` に足す。音声は送らない。「改善ループで送る内容を見る」で、送る前に内容を確かめられる |
+| `improveCommand` | `"claude -p --model sonnet"` | 改善ループの送り先のコマンド（`cmd /c` で動かし、送る内容は標準入力で渡す）。既定は自分の Claude Code（追加のアカウントや料金は要らない） |
+| `improveBatch` | `30` | 何件たまったら改善ループを回すか |
 
 ## 文字起こしエンジン（試験中）
 

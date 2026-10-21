@@ -75,6 +75,21 @@ do {
     check(r.audio == 9 && r.text == 1 && r.dirs == 1 && r.bytes == 910, "result \(r)")
 }
 
+// 空の日のフォルダ: 昨日と今日は残す（History.save が作ったばかりで、まだ録音を移していないことがある）。中身のあるフォルダは消さない
+do {
+    let dir = tempDir()
+    defer { try? fm.removeItem(at: dir) }
+    for n in [0, 1, 2, 40] { try? fm.createDirectory(at: dir.appendingPathComponent(dayAgo(n).0), withIntermediateDirectories: true) }
+    let (d40, _) = dayAgo(41)
+    put(dir, d40, "a.json", 10, now.addingTimeInterval(-60))
+    let r = Retention.prune(dir: dir, keepDays: 14, now: now)
+    let dirs = Set((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+    check(dirs.contains(dayAgo(0).0) && dirs.contains(dayAgo(1).0), "today and yesterday stay even when empty: \(dirs)")
+    check(!dirs.contains(dayAgo(2).0) && !dirs.contains(dayAgo(40).0), "older empty folders removed: \(dirs)")
+    check(dirs.contains(d40) && left(dir).contains(d40 + "/a.json"), "folder with a file stays")
+    check(r.dirs == 2, "dirs \(r.dirs)")
+}
+
 // ずっと
 do {
     let dir = tempDir()

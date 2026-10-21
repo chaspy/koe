@@ -109,3 +109,14 @@ func TestTranscribeUtterance(t *testing.T) {
 		t.Fatalf("server down: %+v", res)
 	}
 }
+
+func TestTranscribeUtteranceLock(t *testing.T) {
+	wav := EncodeWAV(make([]int16, 16000*3))
+	loop := "はい、" + strings.Repeat("はい、", 40)
+	srv, seen := fakeWhisper(t, "一行目\n"+loop)
+	res := TranscribeUtterance(context.Background(), UtteranceRequest{BaseURL: srv.URL, WAV: wav, Voiced: 3, Model: DefaultModel, AudioCtx: AudioCtxAuto,
+		KeepLines: true, KeepRepeats: true, Timeout: LockTimeout(600)})
+	if res.Outcome != OutcomeOK || res.Text != "一行目\n"+loop || len(*seen) != 1 {
+		t.Fatalf("lock keeps lines and repeats: %+v", res)
+	}
+}

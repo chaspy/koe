@@ -56,10 +56,26 @@ type Config struct {
 	HistoryKeepDays     int               `json:"historyKeepDays"` // recordings kept this many days, text about twice as long; 0 = keep everything
 	ContextPrompt       bool              `json:"contextPrompt"`
 	RestoreClipboard    bool              `json:"restoreClipboard"`
-	MenuMaskKey         bool              `json:"menuMaskKey"` // send a dummy key while Alt is held so Alt alone does not open the app menu
-	UpdateCheck         bool              `json:"updateCheck"` // check GitHub Releases for a newer version at start and daily
-	UpdateRepo          string            `json:"updateRepo"`  // "owner/repo" whose releases are checked
+	LineBreaks          bool              `json:"lineBreaks"`    // outside terminals, one line per whisper segment (mac lineBreaks; default off)
+	LockRecording       bool              `json:"lockRecording"` // hold mode: two quick taps start a lock recording written to a text file (default off)
+	MenuMaskKey         bool              `json:"menuMaskKey"`   // send a dummy key while Alt is held so Alt alone does not open the app menu
+	UpdateCheck         bool              `json:"updateCheck"`   // check GitHub Releases for a newer version at start and daily
+	UpdateRepo          string            `json:"updateRepo"`    // "owner/repo" whose releases are checked
+	// Improvement loop (#184, improve.go): off by default because it sends transcripts to ImproveCommand.
+	// Turned on from the tray after a confirmation that shows what is sent and where.
+	ImproveEnabled bool   `json:"improveEnabled"`
+	ImproveCommand string `json:"improveCommand"` // run with the request on stdin; default: the user's own Claude Code
+	ImproveBatch   int    `json:"improveBatch"`   // new utterances that start a run (default 30)
 }
+
+// DefaultImproveCommand is the user's own Claude Code (no new account, no per-token cost).
+const DefaultImproveCommand = "claude -p --model sonnet"
+
+// DefaultImproveBatch is how many new utterances start an improvement run (macOS improveBatch).
+const DefaultImproveBatch = 30
+
+// ImproveTarget is where the improvement loop sends text, for the consent dialog and the preview.
+func (c Config) ImproveTarget() string { return "コマンド: " + c.ImproveCommand }
 
 // DefaultConfig mirrors the mac defaults.
 func DefaultConfig() Config {
@@ -89,6 +105,8 @@ func DefaultConfig() Config {
 		AudioCtx:        AudioCtxAuto,
 		GPU:             GPUAuto,
 		GPUAudioCtx:     0,
+		ImproveCommand:  DefaultImproveCommand,
+		ImproveBatch:    DefaultImproveBatch,
 	}
 }
 
@@ -129,6 +147,7 @@ func ParseConfig(data []byte) (Config, error) {
 	if c.Port <= 0 || c.Port > 65535 {
 		c.Port = d.Port
 	}
+	c.sanitizeImprove()
 	if c.Prompt == "" {
 		c.Prompt = d.Prompt
 	}
@@ -232,4 +251,14 @@ func (c Config) ModelDownloadURL() string {
 		return c.ModelURL
 	}
 	return ModelBaseURL + filepath.Base(strings.ReplaceAll(c.Model, `\`, "/"))
+}
+
+// sanitizeImprove fills the improvement loop's command and batch size when missing or invalid.
+func (c *Config) sanitizeImprove() {
+	if strings.TrimSpace(c.ImproveCommand) == "" {
+		c.ImproveCommand = DefaultImproveCommand
+	}
+	if c.ImproveBatch <= 0 {
+		c.ImproveBatch = DefaultImproveBatch
+	}
 }

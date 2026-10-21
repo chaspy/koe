@@ -29,9 +29,6 @@ func parseHistoryID(id string) (time.Time, bool) {
 // SaveHistory writes <dir>/<YYYY-MM-DD>/<id>.wav and .json.
 func SaveHistory(dir, id string, wav []byte, record map[string]any) error {
 	day := filepath.Join(dir, id[:10])
-	if err := os.MkdirAll(day, 0o755); err != nil {
-		return err
-	}
 	rec := map[string]any{}
 	for k, v := range record {
 		rec[k] = v
@@ -39,7 +36,7 @@ func SaveHistory(dir, id string, wav []byte, record map[string]any) error {
 	rec["id"] = id
 	if wav != nil {
 		rec["audio"] = id + ".wav"
-		if err := os.WriteFile(filepath.Join(day, id+".wav"), wav, 0o644); err != nil {
+		if err := writeDayFile(day, id+".wav", wav); err != nil {
 			return err
 		}
 	}
@@ -47,7 +44,43 @@ func SaveHistory(dir, id string, wav []byte, record map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(day, id+".json"), b, 0o644)
+	return writeDayFile(day, id+".json", b)
+}
+
+// Test hooks: beforeDayWrite, if set, runs between creating the day folder
+// and writing (tests remove the folder there); dayWriteFile writes the file
+// (tests make it fail). Package globals: tests that set them must not run in
+// parallel (no t.Parallel).
+var (
+	beforeDayWrite func(day string)
+	dayWriteFile   = os.WriteFile
+)
+
+// dayWriteRetryWait is the wait before the second try.
+const dayWriteRetryWait = 100 * time.Millisecond
+
+// writeDayFile writes day/name, creating the day folder. If that fails, it
+// waits a moment and tries once more, whatever the error: the folder may be
+// gone between creating it and writing (an empty old day folder removed by
+// HistoryPrune, or by hand), or still be "delete pending" on Windows (another
+// process had it open when it was removed: ERROR_ACCESS_DENIED until closed).
+func writeDayFile(day, name string, data []byte) error {
+	var err error
+	for i := 0; i < 2; i++ {
+		if i > 0 {
+			time.Sleep(dayWriteRetryWait)
+		}
+		if err = os.MkdirAll(day, 0o750); err != nil {
+			continue
+		}
+		if beforeDayWrite != nil {
+			beforeDayWrite(day)
+		}
+		if err = dayWriteFile(filepath.Join(day, name), data, 0o644); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 // Pasted is one pasted utterance from history.

@@ -1,0 +1,2 @@
+### Windows
+- Opt-in lock recording and line breaks, as on the Mac (both off by default; set `"lockRecording": true` / `"lineBreaks": true` in config.json and restart Koe). Lock recording: in hold mode, tap the hotkey twice quickly to keep recording with your hands free; press it again to stop, and the text is saved to `Documents\Koe\<date-time>.txt`, copied to the clipboard and opened instead of pasted. Line breaks: each sentence whisper splits off goes on its own line, except in terminals.

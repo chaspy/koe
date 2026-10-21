@@ -7,6 +7,9 @@ import AudioToolbox
 import ServiceManagement
 import UniformTypeIdentifiers
 
+// A command may close stdin before Koe finishes writing its prompt.
+signal(SIGPIPE, SIG_IGN)
+
 // MARK: - Settings
 //
 // すべて `defaults write io.github.chaspy.koe <key> <value>` で上書きできる。
@@ -73,10 +76,11 @@ enum Settings {
         get { defaults.object(forKey: "restoreFocus") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "restoreFocus") }
     }
-    // 押し方: hold＝押している間だけ録音（既定） / toggle＝短く押すと開始、もう一度短く押すと終了して貼る
-    static var toggleMode: Bool {
-        get { defaults.string(forKey: "pressMode") == "toggle" }
-        set { defaults.set(newValue ? "toggle" : "hold", forKey: "pressMode") }
+    // 押し方: hold＝押している間だけ録音（既定） / auto＝短く押すと手を離して話せる・長押しは押している間 /
+    // toggle＝短く押すと開始、もう一度短く押すと終了して貼る（PressGesture.swift）
+    static var pressMode: PressGesture.Mode {
+        get { PressGesture.mode(defaults.string(forKey: "pressMode")) }
+        set { defaults.set(newValue.rawValue, forKey: "pressMode") }
     }
     // ターミナル以外（Google Docs 等）に貼るとき、whisper の区切りごとに改行する。既定はオフ
     static var lineBreaks: Bool {
@@ -99,6 +103,16 @@ enum Settings {
         get { defaults.object(forKey: "sounds") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "sounds") }
     }
+    // 録音中は音楽・動画の音を小さくする（MediaDuck.swift）。新しい機能なので既定オフ
+    static var duckMedia: Bool {
+        get { defaults.object(forKey: "duckMedia") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "duckMedia") }
+    }
+    // 音質の判定に C++ 版（KoeAudioCore）を使う（AudioCoreQuality.swift）。新しい機能なので既定オフ。
+    // 有効にする: defaults write io.github.chaspy.koe audioCore -bool true
+    static var audioCore: Bool { defaults.object(forKey: "audioCore") as? Bool ?? false }
+    // ⌃⌥V とメニューで最後の文をもう一度貼る（PasteLast.swift）。新しい機能なので既定オフ。切り替えは次の起動から
+    static var pasteLast: Bool { defaults.object(forKey: "pasteLast") as? Bool ?? false }
     // アプリ同梱の音（start / stop）か、macOS 標準の音の名前（Ping 等）
     static var startSound: String { defaults.string(forKey: "startSound") ?? "start" }
     static var stopSound: String { defaults.string(forKey: "stopSound") ?? "stop" }
@@ -130,22 +144,30 @@ enum Settings {
         get { defaults.stringArray(forKey: "enabledPacks") ?? ["developer"] }
         set { defaults.set(newValue, forKey: "enabledPacks") }
     }
-    // 直前の発話（同じアプリ・3 分以内）を初期プロンプトの頭に足す。
-    // 会話の流れが分かると同音異義語・専門用語の取り違えが減る（koe_bench.py で CER 6.5% → 3.9%）
+    // Previous utterance context (same app, within 3 minutes), opt-in.
+    // #203: 180 utterances, CER off 12.5%, always on 12.3%, production rule 12.2%.
+    // Both 95% CIs cross zero; carry-over errors occurred in 7 pairs vs 1 off.
     static var contextPrompt: Bool {
-        get { defaults.object(forKey: "contextPrompt") as? Bool ?? true }
+        get { ContextPrompt.enabled(in: defaults) }
         set { defaults.set(newValue, forKey: "contextPrompt") }
     }
-    static func whisperPrompt(previous: String?) -> String {
-        guard contextPrompt, let prev = previous, !prev.isEmpty else { return whisperPrompt }
-        return String(prev.suffix(150)) + " " + whisperPrompt
+    static func whisperPrompt(previous: String?, repo: RepoContext.Found? = nil) -> String {
+        let base = whisperPrompt(repo: repo)
+        guard contextPrompt, let prev = previous, !prev.isEmpty else { return base }
+        return String(prev.suffix(150)) + " " + base
     }
 
-    // whisper の初期プロンプトは 224 トークンまでなので、用語は約 120 文字ぶんだけ入れる
-    static var whisperPrompt: String {
-        let terms = Glossary.whisperTerms(limit: 120)
-        return terms.isEmpty ? prompt : "\(terms.joined(separator: "、"))。\(prompt)"
+    // whisper の初期プロンプトは 224 トークンまでなので、用語は約 120 文字ぶんだけ入れる。
+    // 前面のターミナルのリポジトリ名・ブランチ名（RepoContext）は先頭に置き、その分だけ用語を減らす（用語のほうが音声の近くに来る）
+    static func whisperPrompt(repo: RepoContext.Found?) -> String {
+        let all = Glossary.whisperTerms(limit: 120)
+        let ctx = RepoContext.promptPart(repo, terms: all)
+        let terms = ctx.isEmpty ? all : Glossary.whisperTerms(limit: 120 - ctx.count - 1)
+        let words = (ctx.isEmpty ? [] : [ctx]) + terms
+        return words.isEmpty ? prompt : "\(words.joined(separator: "、"))。\(prompt)"
     }
+    // 前面のターミナルのリポジトリ名・ブランチ名を whisper の手がかりにする（RepoContext.swift）。新しい機能なので既定オフ
+    static var repoContext: Bool { defaults.object(forKey: "repoContext") as? Bool ?? false }
     static var llmTimeout: Double {
         let v = defaults.double(forKey: "llmTimeout")
         return v > 0 ? v : 8
@@ -250,6 +272,8 @@ let hallucinations = [
 
 final class WhisperServer {
     private var process: Process?
+    private var lifetimePipe: Pipe?
+    private var watchdog: Process?
     // Chosen for each launch (OwnServer.swift); Koe never uses a server it did not start
     private var port = 0
     var baseURL: URL { URL(string: "http://127.0.0.1:\(port)")! }
@@ -259,6 +283,9 @@ final class WhisperServer {
         if process?.isRunning == true {
             return waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
         }
+        lifetimePipe?.fileHandleForWriting.closeFile()
+        lifetimePipe = nil
+        watchdog = nil
         do {
             try launch()
             waitUntilReady(deadline: Date().addingTimeInterval(120), onReady: onReady)
@@ -298,7 +325,32 @@ final class WhisperServer {
         p.standardOutput = handle
         p.standardError = handle
         try p.run()
-        process = p
+        var launchedRecord: ServerLifecycle.Record?
+        do {
+            guard let parent = ServerLifecycle.Identity.read(getpid()),
+                  let child = ServerLifecycle.Identity.read(p.processIdentifier) else {
+                throw NSError(domain: "Koe", code: 7)
+            }
+            let recordURL = ServerLifecycle.directory.appendingPathComponent(UUID().uuidString + ".json")
+            let record = ServerLifecycle.Record(parent: parent, server: child)
+            launchedRecord = record
+            try ServerLifecycle.save(record, at: recordURL)
+            let pipe = Pipe()
+            let watcher = Process()
+            watcher.executableURL = Bundle.main.executableURL
+            watcher.arguments = ["--watch-server-lifetime", recordURL.path]
+            watcher.standardInput = pipe
+            watcher.standardOutput = FileHandle.nullDevice
+            watcher.standardError = FileHandle.nullDevice
+            try watcher.run()
+            pipe.fileHandleForReading.closeFile()
+            lifetimePipe = pipe
+            watchdog = watcher
+            process = p
+        } catch {
+            if let record = launchedRecord { ServerLifecycle.stop(record) } else { p.terminate() }
+            throw error
+        }
     }
 
     static var logURL: URL {
@@ -387,8 +439,11 @@ final class WhisperServer {
     }
 
     func stop() {
+        lifetimePipe?.fileHandleForWriting.closeFile()
+        lifetimePipe = nil
         process?.terminate()
         process = nil
+        watchdog = nil
     }
 }
 
@@ -573,7 +628,8 @@ enum Glossary {
         let rest = (p + k).map(\.term).filter { counts[$0] == nil }
         var out: [String] = []
         var length = 0
-        for t in used + rest {
+        let aliases = Set((p + k + o).flatMap(\.aliases).map(TermRules.aliasKey))
+        for t in TermRules.preferred(used + rest, aliases: aliases) {
             if length + t.count > limit { continue }
             out.append(t)
             length += t.count + 1
@@ -869,37 +925,6 @@ struct Capture {
     var alt: (device: String, url: URL, quality: [String: Any])? = nil  // 使わなかった側のマイクの録音（比較用）
 }
 
-// 音質の客観指標（発話ごとに記録し、伝達の失敗との関係やマイクの比較に使う）
-//   level_db: 声の部分の平均 RMS（dBFS）/ noise_db: 背景（静かな窓の下位 10%）/ snr_db: 差
-//   clip_ratio: 振幅が上限付近に張り付いた割合 / brightness: 高い音の成分の比（こもるほど小さい）
-enum AudioQuality {
-    static func measure(_ pcm: [Int16]) -> [String: Any] {
-        let win = 480  // 30ms
-        guard pcm.count > win * 4 else { return [:] }
-        var rms: [Double] = []
-        var i = 0
-        while i + win <= pcm.count {
-            var sum = 0.0
-            for j in i..<i + win { let v = Double(pcm[j]); sum += v * v }
-            rms.append((sum / Double(win)).squareRoot())
-            i += win
-        }
-        let sorted = rms.sorted()
-        let noise = max(sorted[sorted.count / 10], 1)
-        let voiced = rms.filter { $0 > 330 }
-        guard !voiced.isEmpty else { return [:] }
-        let speech = voiced.reduce(0, +) / Double(voiced.count)
-        func db(_ x: Double) -> Double { (20 * log10(x / 32768) * 10).rounded() / 10 }
-        let clip = Double(pcm.filter { abs(Int($0)) >= 32000 }.count) / Double(pcm.count)
-        var e = 0.0, d = 0.0
-        for k in 1..<pcm.count { let a = Double(pcm[k]), b = Double(pcm[k - 1]); e += a * a; d += (a - b) * (a - b) }
-        return [
-            "level_db": db(speech), "noise_db": db(noise), "snr_db": ((20 * log10(speech / noise)) * 10).rounded() / 10,
-            "clip_ratio": (clip * 10000).rounded() / 10000, "brightness": e > 0 ? ((d / e) * 1000).rounded() / 1000 : 0,
-        ]
-    }
-}
-
 // 録音元の共通インターフェース（既定のマイクは AVAudioEngine、指定したマイクは AVCaptureSession で開く）
 protocol MicInput: AnyObject {
     var name: String { get }
@@ -1087,6 +1112,9 @@ final class Recorder {
     private var lastBufferAt = Date.distantPast
     private var restartPending = false
     private(set) var warm = false
+    // 録音を始めてから最後に声が来た時刻（手を離して録っているときの止めどき用）
+    private var voiceAt: Date?
+    var lastVoiceAt: Date? { lock.lock(); defer { lock.unlock() }; return voiceAt }
     var onRestart: ((String) -> Void)?
     var onSourceChange: ((String) -> Void)?
 
@@ -1221,6 +1249,7 @@ final class Recorder {
         track.level = AudioLevel.rms(chunk)
         if recording {
             track.samples.append(contentsOf: chunk)
+            if PressGesture.rms(chunk) > voiceThreshold { voiceAt = Date() }
         } else {
             track.preRoll.append(contentsOf: chunk)
             let maxPre = Int(preRollSeconds * Recorder.sampleRate)
@@ -1245,7 +1274,9 @@ final class Recorder {
             t.preRoll.removeAll()
         }
         recording = true
+        voiceAt = nil
         lock.unlock()
+        MediaDuck.recordingStarted()
         return true
     }
 
@@ -1265,6 +1296,7 @@ final class Recorder {
             self.lock.lock()
             self.recording = false
             let takes = self.tracks.map { ($0.source.name, $0.samples) }
+            MediaDuck.recordingEnded()
             self.tracks.forEach { $0.samples.removeAll() }
             self.lock.unlock()
             if !self.warm { self.stopEngine() }
@@ -1286,7 +1318,7 @@ final class Recorder {
             Events.log("tracks", ["tracks": takes.map { "\($0.0): \(String(format: "%.1f", Double($0.1.count) / Recorder.sampleRate))s peak \($0.1.reduce(0) { max($0, abs(Int($1))) })" }.joined(separator: " / ")])
             var cap = Capture(url: url, seconds: Double(captured.count) / Recorder.sampleRate,
                               voicedSeconds: Double(trimmed.count) / Recorder.sampleRate, peak: peak, device: chosen.0)
-            cap.quality = AudioQuality.measure(captured)
+            cap.quality = Settings.audioCore ? AudioCoreQuality.measure(captured) { Events.log("audio_core_diff", $0) } : AudioQuality.measure(captured)
             // 比較用に、使わなかった側のマイクの録音も残す（同じ発話のマイク違い）
             if Settings.saveAllMics, let other = takes.first(where: { $0.0 != chosen.0 }), !other.1.isEmpty {
                 let altURL = self.dir.appendingPathComponent("rec-\(UUID().uuidString).alt.wav")
@@ -1297,7 +1329,11 @@ final class Recorder {
         }
     }
 
+    // 取り消した録音を残すとき: 録り足しを待たずにすぐ確定する
+    func stopNow(_ done: @escaping (Capture) -> Void) { finalize(done) }
+
     func discard() {
+        MediaDuck.recordingEnded()
         lock.lock()
         recording = false
         tracks.forEach { $0.samples.removeAll() }
@@ -1605,6 +1641,37 @@ final class Improver {
     private(set) var running = false
     private(set) var lastRun: String?
     var onFinish: ((String) -> Void)?
+    var failures = ImproveFailures(lastNotice: Settings.defaults.object(forKey: "improveLastFailureNotice") as? Date)
+    private var resolvedCommand: (String, ImproveCommand.Match)?
+
+    private func command(_ command: String, prompt: String) throws -> String {
+        guard let token = ImproveCommand.token(command) else {
+            throw NSError(domain: "KoeCommand", code: 127)
+        }
+        for attempt in 0...1 {
+            if resolvedCommand?.0 != command {
+                guard let match = ImproveCommand.find(token.program) else {
+                    throw NSError(domain: "KoeCommand", code: 127)
+                }
+                resolvedCommand = (command, match)
+                Events.log("improve_cmd_resolved", ["location": match.location])
+            }
+            guard let match = resolvedCommand?.1 else { throw NSError(domain: "KoeCommand", code: 127) }
+            let resolved = command.replacingCharacters(in: token.range, with: ImproveCommand.quote(match.path))
+            do {
+                return try LLM.command(resolved, prompt: prompt, timeout: 300,
+                                       path: ImproveCommand.path(home: NSHomeDirectory(),
+                                            inherited: ProcessInfo.processInfo.environment["PATH"] ?? ""))
+            } catch {
+                if (error as NSError).domain == "KoeCommand", (error as NSError).code == 127 {
+                    resolvedCommand = nil
+                    if attempt == 0 { continue }
+                }
+                throw error
+            }
+        }
+        throw NSError(domain: "KoeCommand", code: 127)
+    }
 
     private var koeDir: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe")
@@ -1654,11 +1721,20 @@ final class Improver {
         let batch = judgeOnly ? Array(items.suffix(30)) : Array(items.suffix(60))
         DispatchQueue.global(qos: .utility).async {
             let summary: String
-            do { summary = try self.run(batch, judgeOnly: judgeOnly) } catch { summary = "失敗: \(error.localizedDescription)" }
+            let code: Int
+            do { summary = try self.run(batch, judgeOnly: judgeOnly); code = 0 }
+            catch {
+                let e = error as NSError
+                code = e.domain == "KoeCommand" ? e.code : -1
+                summary = "改善に失敗しました（コード: \(code)）"
+            }
             DispatchQueue.main.async {
                 self.running = false
                 self.lastRun = summary
-                Events.log("improve", ["summary": summary])
+                self.failures.record(code)
+                if code != 0 {
+                    Events.log("improve_failed", ["exit_code": code, "consecutive": self.failures.consecutive])
+                } else { Events.log("improve", ["exit_code": 0]) }
                 self.onFinish?(summary)
             }
         }
@@ -1735,7 +1811,7 @@ final class Improver {
             let content = Settings.improveProvider == "api"
                 ? try LLM.chat(endpoint: Settings.improveEndpoint, model: Settings.improveModel, auth: Settings.improveAuth(),
                                system: system, user: user, timeout: 180)
-                : try LLM.command(Settings.improveCommand, prompt: system + "\n\n---\n\n" + user, timeout: 300)
+                : try command(Settings.improveCommand, prompt: system + "\n\n---\n\n" + user)
             // 解析に失敗したときの調査用に、直近の応答をローカルに残す
             try? content.write(to: koeDir.appendingPathComponent("improve_last_response.txt"), atomically: true, encoding: .utf8)
             guard let s = content.firstIndex(of: "{"), let e = content.lastIndex(of: "}"),
@@ -1801,20 +1877,6 @@ final class Improver {
         if let l = j["label"] as? String, ["understood", "corrected", "unclear"].contains(l) { return l }
         return nil
     }
-    // 辞書に入れてよい「語」か。句（助詞を含む）や、ひらがな・漢字だけの普通の言葉は入れない（人名は除く）
-    static func isTerm(_ w: String, person: Bool) -> Bool {
-        guard (2...20).contains(w.count) else { return false }
-        if person { return true }
-        let hasKanaOrLatin = w.unicodeScalars.contains { (0x30A0...0x30FF).contains($0.value) || ($0.isASCII && CharacterSet.alphanumerics.contains($0)) }
-        if !hasKanaOrLatin { return false }
-        // カタカナ・英字を含んでも、助詞でつながった句は入れない（「新社Slackの一本化」「①の恒久対応」）
-        for p in ["の", "を", "が", "は", "に", "で", "と", "へ", "から", "まで"] where w.contains(p) {
-            // カタカナ語の中の「ノ」等ではなく、ひらがなの助詞のとき
-            return false
-        }
-        return true
-    }
-
     private func mergeTerms(_ terms: [[String: Any]], people: [People.Person] = [], transcripts: [Int: String] = [:],
                             contexts: [Int: String] = [:]) -> [String] {
         let candURL = koeDir.appendingPathComponent("glossary_candidates.json")
@@ -1822,6 +1884,17 @@ final class Improver {
         var promote: [String: [String]] = [:]
         var learned: [(who: String, called: String)] = [], learnedWrongs: [(who: String, wrong: String)] = []
         let knownCalled = people.isEmpty ? [:] : PeopleStore.known().called
+        let existing = Glossary.personal + Glossary.packs + Glossary.org
+        let proposedAliases = terms.flatMap { term in
+            AliasLearning.variants(term: term["right"] as? String ?? "", wrong: term["wrong"] as? String ?? "",
+                termPart: term["term_part"] as? String,
+                enabled: Settings.defaults.bool(forKey: "termAliasLearning") && term["kind"] as? String != "person")
+        }
+        let aliasKeys = Set((existing.flatMap(\.aliases) + cand.values.flatMap { $0["wrongs"] as? [String] ?? [] }
+            + proposedAliases)
+            .map(TermRules.aliasKey))
+        let existingTerms = Set(existing.map { TermRules.key($0.term) })
+        let knownTerms = Set(existing.map(\.term))
         for var t in terms {
             // 近い読みの形は People.judge の守りを通したものだけ使う（人の名前でない語に付いてきたものは捨てる）
             let raw = t.removeValue(forKey: "variants") as? [String] ?? []
@@ -1847,15 +1920,26 @@ final class Improver {
             guard let right = (t["right"] as? String)?.trimmingCharacters(in: .whitespaces), (2...30).contains(right.count),
                   let wrong = (t["wrong"] as? String)?.trimmingCharacters(in: .whitespaces), !wrong.isEmpty, wrong != right,
                   // 語ではなく文・注記になっているもの（「(聞き取り不能)」「〜、〜のやつ」）は辞書に入れない
-                  wrong.count <= 15, !wrong.contains("、"), !right.contains("("), !right.contains("（"),
-                  Improver.isTerm(right, person: t["kind"] as? String == "person") else { continue }
+                  wrong.count <= (Settings.defaults.bool(forKey: "termAliasLearning") ? 30 : 15), !wrong.contains("、"), !right.contains("("), !right.contains("（"),
+                  TermRules.rejection(right, aliases: aliasKeys, person: t["kind"] as? String == "person",
+                      existingMultiword: AliasLearning.existingMultiword(right, knownTerms: knownTerms,
+                          enabled: Settings.defaults.bool(forKey: "termAliasLearning"))) == nil else { continue }
+            // Do not introduce an alias that would turn an existing correct term into a chain.
+            guard TermRules.aliasAllowed(wrong, existingTerms: existingTerms,
+                                         person: t["kind"] as? String == "person") else { continue }
             var c = cand[right] ?? ["count": 0, "wrongs": [String]()]
             // 人の名前・呼び名は個人の辞書にだけ使い、共有パックへの提案には回さない印
             if t["kind"] as? String == "person" { c["person"] = true }
             c["count"] = (c["count"] as? Int ?? 0) + 1
-            var wrongs = c["wrongs"] as? [String] ?? []
+            var wrongs = (c["wrongs"] as? [String] ?? []).filter {
+                TermRules.aliasAllowed($0, existingTerms: existingTerms, person: t["kind"] as? String == "person")
+            }
             // 人の名前は、近い読みの形（People.judge が守りを通したもの）も一緒に別名にする
-            for w in [wrong] + (t["variants"] as? [String] ?? []) where !wrongs.contains(w) { wrongs.append(w) }
+            let aliases = AliasLearning.variants(term: right, wrong: wrong, termPart: t["term_part"] as? String,
+                enabled: Settings.defaults.bool(forKey: "termAliasLearning") && t["kind"] as? String != "person")
+            for w in (aliases + (t["variants"] as? [String] ?? [])).filter({
+                TermRules.aliasAllowed($0, existingTerms: existingTerms, person: t["kind"] as? String == "person")
+            }) where !wrongs.contains(w) { wrongs.append(w) }
             c["wrongs"] = wrongs
             if t["explicit"] as? Bool == true { c["explicit"] = true }
             cand[right] = c
@@ -1864,14 +1948,11 @@ final class Improver {
             // 人の名前で「化けた形>敬称」の別名は、敬称が続くときだけ置き換わる（「パン粉を買う」は変わらない）ので、
             // 確かに検出した 1 回目で辞書に上げて置き換えてよい（出現が少ない名前は 2 回を待つと覚えきれない。IMP-8）
             let anchored = c["person"] as? Bool == true && wrongs.allSatisfy { $0.contains(">") }
-            // ひらがな・漢字だけの形（「かぶる」等）や 3 文字以下は普通の言葉と重なりやすいので、明示されても勝手に置き換えない
-            func common(_ w: String) -> Bool {
-                w.count <= 3 || !w.unicodeScalars.contains { (0x30A0...0x30FF).contains($0.value) || CharacterSet.letters.contains($0) && $0.isASCII }
-            }
             // 人の名前の、敬称の条件が無い別名は置き換えない（受け取る AI へのメモだけ）
             let person = c["person"] as? Bool == true
             if (c["count"] as? Int ?? 0) >= 2 || sure || anchored {
-                promote[right] = wrongs.map { (sure || anchored) && !common($0) && (!person || $0.contains(">")) ? $0 : "~" + $0 }
+                promote[right] = AliasLearning.stored(wrongs, sure: sure, anchored: anchored, person: person,
+                    ordinaryWordNotes: Settings.defaults.bool(forKey: "ordinaryWordNotes"))
             }
         }
         if let data = try? JSONSerialization.data(withJSONObject: cand, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: candURL) }
@@ -1882,7 +1963,7 @@ final class Improver {
         var lines = ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "# Koe 個人の辞書（改善ループが自動で育てる。不要な語は消してよい）\n")
             .split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var added: [String] = []
-        for (term, wrongs) in promote {
+        for (term, wrongs) in promote where !wrongs.isEmpty {
             if let i = lines.firstIndex(where: { $0.split(separator: "\t").first.map(String.init)?.trimmingCharacters(in: .whitespaces) == term }) {
                 let e = Glossary.parse(lines[i]).first
                 let merged = Array(Set((e?.aliases ?? []) + wrongs)).sorted()
@@ -1903,12 +1984,14 @@ final class Improver {
 
     1. terms: 誤変換された語と正しい表記
        - 技術用語・英字略語・サービス名・社内用語・プロダクト名、人の名前・呼び名（ハンドル名・あだ名）が対象
+       - Reject common English words (such as how), inflected phrases, and alias chains.
        - 1 つの語だけ。句や言い回し（「〜の〜」「〜を〜する」）、普通の日本語の言葉（「遅延」「返事不要」等）、文の一部は出さない
        - 人の名前・呼び名には kind: "person"、それ以外は kind: "term" を付ける（人の名前は本人の Mac の個人の辞書にだけ入り、共有されない）
        - 人の名前は、普通の言葉と取り違えやすい（「パン粉を買う」の「パン粉」は人ではない）。「〜さん」などの敬称が付き、前後に人とのやりとり（Slack・レビュー・PR・会議など）がある場合だけ出す。wrong は敬称つきで書く（例: "パン粉さん"）
        - 人の名前の right は、本人が言った呼び方の正しい表記にする。わざと言ったあだ名・ハンドル名を本名に書き換えない
        - 人の名前の term には、同じ名前が化けそうな近い読みの形を variants に最大 5 つ付ける（例: right が "panko" で wrong が "パン粉さん" なら ["パンコ", "パンコア", "バンコ"]）。敬称は付けない。正しい表記そのもの・その人のほかの正しい呼び方やあだ名は入れない。思いつかなければ空の配列
        - 各 term に、その語が出てきた発話の番号 i と、確度 confidence（"high" / "medium" / "low"）を付ける。人の名前は "high" のときだけ辞書に入る
+       - When wrong includes following words beyond the term, also return term_part: only the term's misrecognition, as an exact prefix of wrong. Do not invent a reading. Omit term_part if the boundary is uncertain. Keep the full observed wrong.
        - wrong は文字起こしに実際に含まれる文字列。right は正しい表記（2〜30 文字）
        - 本人の次の発話や送った文の手直しで正しい表記が明示されているか、Claude が「〜と読みました」「〜のことですか？」と読み替えて本人が否定していなければ explicit: true
        - 確信がなければ出さない。既に辞書にある語でも、新しい誤変換の形が見つかれば出す
@@ -1940,36 +2023,7 @@ final class Improver {
 }
 
 // OpenAI 互換の chat/completions、またはコマンド（標準入力→標準出力）を同期で呼ぶ（バックグラウンドから使う）
-enum LLM {
-    static func command(_ cmd: String, prompt: String, timeout: Double) throws -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        p.arguments = ["-lc", cmd]  // ログインシェルで PATH を通す（claude などは ~/.local/bin にある）
-        let input = Pipe(), output = Pipe(), errput = Pipe()
-        p.standardInput = input
-        p.standardOutput = output
-        p.standardError = errput
-        try p.run()
-        input.fileHandleForWriting.write(Data(prompt.utf8))
-        try? input.fileHandleForWriting.close()
-        let deadline = Date().addingTimeInterval(timeout)
-        var out = Data()
-        let reader = DispatchQueue(label: "koe.llm.read")
-        let sem = DispatchSemaphore(value: 0)
-        reader.async { out = output.fileHandleForReading.readDataToEndOfFile(); sem.signal() }
-        if sem.wait(timeout: .now() + max(1, deadline.timeIntervalSinceNow)) == .timedOut {
-            p.terminate()
-            throw NSError(domain: "Koe", code: 25, userInfo: [NSLocalizedDescriptionKey: "コマンドがタイムアウトしました: \(cmd)"])
-        }
-        p.waitUntilExit()
-        let text = String(data: out, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard p.terminationStatus == 0, !text.isEmpty else {
-            let err = String(data: errput.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "Koe", code: 26, userInfo: [NSLocalizedDescriptionKey: "コマンドが失敗しました（\(p.terminationStatus)）: \(err.prefix(200))"])
-        }
-        return text
-    }
-
+extension LLM {
     static func chat(endpoint: String, model: String, auth: String?, system: String, user: String, timeout: Double) throws -> String {
         guard let url = URL(string: endpoint)?.appendingPathComponent("chat/completions") else {
             throw NSError(domain: "Koe", code: 21, userInfo: [NSLocalizedDescriptionKey: "エンドポイントが不正です"])
@@ -2218,7 +2272,8 @@ enum VisibleWatch {
         guard !tail.isEmpty else { return finish(.unknown("empty")) }
         var session: String?
         var readMax = 0
-        var asking = false  // まだ許可を聞いていない（初回の読み取りで macOS がダイアログを出す）
+        var permission: Int32 = 0  // 測り始めたときの許可の状態（noErr 以外なら、初回の読み取りで macOS がダイアログを出しうる）
+        var firstRead = true
         func poll() {
             let started = Date()
             let read = ITermScreen.read()
@@ -2230,9 +2285,9 @@ enum VisibleWatch {
             case .failed:
                 finish(.unknown("error"))
             case .ok(let id, let contents):
-                // 初回は許可のダイアログに答えるまで戻らないことがある。そのあいだに 10 秒過ぎたら測れなかったとする
-                if asking, Date().timeIntervalSince(pastedAt) > timeout { return finish(.unknown("waited_permission")) }
-                asking = false
+                // 初回は許可のダイアログに答えるまで戻らないことがある。待った分が入るので、その回は測れなかったとする
+                if PasteVisible.waitedPermission(permission: permission, firstRead: firstRead) { return finish(.unknown("waited_permission")) }
+                firstRead = false
                 if let session, session != id { return finish(.unknown("session_changed")) }
                 session = id
                 readMax = max(readMax, Int(took * 1000))
@@ -2246,10 +2301,10 @@ enum VisibleWatch {
         }
         ITermScreen.queue.asyncAfter(deadline: .now() + 0.1) {
             if denied { return finish(.unknown("no_permission")) }
-            switch ITermScreen.permission() {
+            permission = ITermScreen.permission()
+            switch permission {
             case OSStatus(errAEEventNotPermitted): denied = true; finish(.unknown("no_permission"))
             case OSStatus(procNotFound): finish(.unknown("not_running"))
-            case OSStatus(errAEEventWouldRequireUserConsent): asking = true; poll()
             default: poll()
             }
         }
@@ -2563,6 +2618,7 @@ final class Utterance {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let server = WhisperServer()
     let recorder = Recorder()
+    private lazy var retranscriber = Retranscriber(server: server)
     private var statusItem: NSStatusItem!
     private var statusLine: NSMenuItem!
     private var missLine: NSMenuItem!
@@ -2573,6 +2629,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var monitors: [Any] = []
     private var hotkeyDown = false
     private var lastShortTap = Date.distantPast
+    private var lastPressAt = Date.distantPast
+    private let handsFree = HandsFreeWatch()
     private var keyUpLagMs = 0
     private var lowLevelWarnedAt = Date.distantPast
     private var lockStopping = false
@@ -2607,6 +2665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var permissionItem: NSMenuItem!
     private let hud = RecordingHUD()
     private var indicatorMenu: NSMenu!
+    private var indicatorItem: NSMenuItem?
     private var improveItem: NSMenuItem!
     private var improveNowItem: NSMenuItem!
     private var improvePreviewItem: NSMenuItem!
@@ -2619,10 +2678,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var transcribing = 0 { didSet { render() } }
     private var cleaning = 0 { didSet { render() } }
 
+    private var quitRecorded = false
+    private var quitFromMenu = false
+    private var quitFromSystem = false
+    private var workspacePowerOff = false
+
+    @objc private func willPowerOff(_ notification: Notification) {
+        workspacePowerOff = true
+    }
+
+    @objc private func quitFromMenuAction(_ sender: Any?) {
+        quitFromMenu = true
+        NSApp.terminate(sender)
+    }
+
+    private func recordQuit() {
+        guard !quitRecorded else { return }
+        quitRecorded = true
+        let event = NSAppleEventManager.shared().currentAppleEvent
+        let appleQuit = event?.eventClass == kCoreEventClass && event?.eventID == kAEQuitApplication
+        let pid = appleQuit ? event?.attributeDescriptor(forKeyword: keySenderPIDAttr)?.int32Value : nil
+        let bundle = pid.flatMap { $0 > 0 ? NSRunningApplication(processIdentifier: $0)?.bundleIdentifier : nil }
+        let source = QuitLog.source(menu: quitFromMenu, appleEvent: appleQuit,
+                                    logout: workspacePowerOff, system: quitFromSystem)
+        Events.log("app_quit", ["source": source, "sender_bundle": bundle ?? "unknown", "busy": isBusy])
+    }
+
+    private let runningMarker = RunningMarker(url:
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Koe/running"))
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let unclean = (try? runningMarker.begin()) ?? false
+        if unclean { Events.log("unclean_shutdown_detected") }
+        let killed = ServerLifecycle.cleanOrphans(in: ServerLifecycle.directory)
+        if killed > 0 { Events.log("orphan_server_killed", ["count": killed]) }
+        if unclean {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Koe が前回、予期せず終了していました"
+                alert.informativeText = "原因はまだ分かっていません。診断情報には終了時の動作の記録が含まれます。不具合の報告に添えてください。"
+                alert.addButton(withTitle: "診断情報を書き出す")
+                alert.addButton(withTitle: "閉じる")
+                if alert.runModal() == .alertFirstButtonReturn { self.exportDiagnostics() }
+            }
+        }
+        // Read the previous state before render() writes the current state.
+        let previousState = try? String(contentsOf: stateURL, encoding: .utf8)
+        if previousState?.trimmingCharacters(in: .whitespacesAndNewlines) == "stopped" {
+            let events = (try? String(contentsOf: Events.url, encoding: .utf8)) ?? ""
+            if QuitLog.previousQuitUnrecorded(state: previousState, events: events) {
+                Events.log("previous_quit_unrecorded")
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(willPowerOff(_:)),
+            name: NSWorkspace.willPowerOffNotification, object: nil)
+
         NSApp.applicationIconImage = AppIcon.image  // no .icns in the bundle; alerts would show the generic icon
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         handleSigterm()
+        MediaDuck.restoreLeftover()
+        PasteLast.shared.onPaste = { [weak self] via in self?.pasteLast(via: via) }
+        PasteLast.shared.register()
         buildMenu()
         render()
         Glossary.refreshUsage()
@@ -2655,6 +2773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         checkUpdate()
         Timer.scheduledTimer(withTimeInterval: 86400, repeats: true) { [weak self] _ in self?.checkUpdate() }
 
+        logLaunch()
         requestPermissions()
         installMonitors()
         recorder.onRestart = { reason in Events.log("mic_restarted", ["reason": reason]) }
@@ -2673,6 +2792,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Glossary.refreshPackSources()
         PeopleStore.refresh()
         improver.onFinish = { _ in self.render() }
+        Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.showImproveFailureIfNeeded()
+        }
 
         prepareModelThenStart()
     }
@@ -2728,13 +2850,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        recordQuit()
+        MediaDuck.restoreNow()
         server.stop()
         writeState("stopped")
+        runningMarker.finish()
     }
 
     // 録音中・文字起こし中に終了を求められたら、貼り終えてから終了する（最大 20 秒）
     private var terminating = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        recordQuit()
         guard isBusy else { return .terminateNow }
         terminating = true
         Events.log("quit_deferred")
@@ -2759,7 +2885,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func handleSigterm() {
         signal(SIGTERM, SIG_IGN)
         let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-        src.setEventHandler { NSApp.terminate(nil) }
+        src.setEventHandler { [weak self] in
+            self?.quitFromSystem = true
+            NSApp.terminate(nil)
+        }
         src.resume()
         sigterm = src
     }
@@ -2777,6 +2906,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Permissions
+
+    // 起動の記録: 版・ビルドと、そのときの許可の状態（入れ替えの後に許可が外れていないかを確かめる用。文は書かない）
+    private func logLaunch() {
+        let mic: String
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: mic = "authorized"
+        case .denied: mic = "denied"
+        case .restricted: mic = "restricted"
+        default: mic = "not_determined"
+        }
+        Events.log("launch", [
+            "version": Updater.current,
+            "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",
+            "accessibility": AXIsProcessTrusted(),
+            "microphone": mic,
+        ])
+    }
 
     private func requestPermissions() {
         permissionGuide.log = { Events.log($0, $1) }
@@ -2834,17 +2980,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let pressed = e.modifierFlags.rawValue & mask != 0
                 if pressed && !hotkeyDown {
                     hotkeyDown = true
+                    lastPressAt = Date()
                     // ロック録音中にもう一度押したら、離したときに終える
                     if current?.locked == true || current?.toggled == true { lockStopping = true } else { begin() }
                 }
                 else if !pressed && hotkeyDown {
-                    hotkeyDown = false
-                    // 実際に離した時刻（イベントに付いている起動からの秒数）と、Koe が気づいた時刻の差。Mac が重いと知らせが遅れる
-                    keyUpLagMs = Int((ProcessInfo.processInfo.systemUptime - e.timestamp) * 1000)
-                    if lockStopping {
-                        lockStopping = false
-                        if current?.locked == true { endLocked() } else { end() }
-                    } else { end() }
+                    hotkeyReleased(e)
                 }
                 else if pressed && hotkeyDown {
                     // 離したイベントを取りこぼしていた。前の録音を確定してから録り直す
@@ -2866,6 +3007,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if hotkeyDown, let u = current, Date().timeIntervalSince(u.pressedAt) < 1.0 { cancel(reason: "mouse", silent: true) }
         default: break
         }
+    }
+
+    // 押して話すキーを離した。ロック録音・手を離して話す録音を終えるか、ふつうの録音を終える
+    private func hotkeyReleased(_ e: NSEvent) {
+        hotkeyDown = false
+        // 実際に離した時刻（イベントに付いている起動からの秒数）と、Koe が気づいた時刻の差。Mac が重いと知らせが遅れる
+        keyUpLagMs = Int((ProcessInfo.processInfo.systemUptime - e.timestamp) * 1000)
+        guard lockStopping else { return end() }
+        lockStopping = false
+        if current?.locked == true { endLocked() }
+        else if let u = current, u.toggled, PressGesture.secondRelease(mode: Settings.pressMode, held: Date().timeIntervalSince(lastPressAt),
+                                                                       gap: lastPressAt.timeIntervalSince(lastShortTap)) == .lock { startLock(u, from: "double_tap") }
+        else { end() }
     }
 
     private func begin() {
@@ -2897,6 +3051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         if recorder.start() {
+            RepoContext.recordingStarted(app: u.record["app"] as? String ?? "", pid: NSWorkspace.shared.frontmostApplication?.processIdentifier)
             // 開始音はマイクに入り込むので小さめに鳴らす
             play(Settings.startSound, volume: 0.35)
             current = u
@@ -2912,6 +3067,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // ロック録音に入る（2 回押し・メニュー）。いつもの開始音と区別できるよう、上がる 2 音を鳴らす
+    private func startLock(_ u: Utterance, from: String) {
+        u.locked = true
+        u.toggled = false
+        lastShortTap = .distantPast
+        play("lock_start", volume: 0.5)
+        Events.log("lock_started", ["from": from])
+        render()
+    }
+
+    // 手を離して録っていたのを自分で止める。声が来ていなければ黙って捨て、話した後なら終えて貼る
+    private func stopHandsFree(_ u: Utterance, _ why: PressGesture.Watch) {
+        guard current === u, u.toggled else { return }
+        Events.log("hands_free_stopped", ["reason": why.rawValue, "seconds": round(Date().timeIntervalSince(u.pressedAt))])
+        guard why == .discard else { return end() }
+        current = nil
+        recorder.discard()
+        play(Settings.stopSound, volume: 0.35)
+        showError("声が聞こえなかったので録音をやめました")
+    }
+
     // ロック録音を終える。押していた時間ではなく、録音の長さで扱う
     private func endLocked() {
         guard let u = current, u.locked else { return }
@@ -2923,8 +3099,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func cancel(reason: String, silent: Bool = false) {
         guard let u = current, !u.locked, !u.toggled else { return }
         current = nil
-        recorder.discard()
         let held = Date().timeIntervalSince(u.pressedAt)
+        // 話した分は履歴に残し、「最近の文字起こし」からもう一度文字起こしできるようにする
+        if RetryList.keepCancelled(enabled: Retranscriber.enabled, held: held, reason: reason, saveHistory: Settings.saveHistory) {
+            recorder.stopNow { Retranscriber.saveCancelled(u, $0, reason: reason, held: held) }
+        } else {
+            recorder.discard()
+        }
         Events.log("cancelled", ["reason": reason, "hold_seconds": round(held * 100) / 100])
         // 1 秒以上押してから取り消された＝話している最中に他のキーに触れた可能性が高いので知らせる
         if held >= 1.0 && !silent { fail("他のキーに触れたので録音を取り消しました") }
@@ -2933,29 +3114,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func end() {
         guard let u = current else { return }
         let held = Date().timeIntervalSince(u.pressedAt)
-        if Settings.toggleMode && !u.toggled && held < 0.5 {
-            // トグルの押し方: 短く押したら録音を続け、次に押したら終えて貼る
+        switch u.toggled || u.locked ? .paste : PressGesture.firstRelease(mode: Settings.pressMode, held: held, minHold: Settings.minHoldSeconds,
+                                                                           sinceLastTap: u.pressedAt.timeIntervalSince(lastShortTap)) {
+        case .handsFree:
+            // 短く押した: 録音を続け、次に押したら終えて貼る。auto では、声が来ない・黙ったまま・長すぎるときは自分で止める
             u.toggled = true
-            Events.log("toggle_started")
+            lastShortTap = Date()
+            Events.log("toggle_started", ["mode": Settings.pressMode.rawValue])
+            if PressGesture.autoStops(Settings.pressMode) {
+                handsFree.start(pressedAt: u.pressedAt, lastVoiceAt: { self.recorder.lastVoiceAt },
+                                active: { self.current === u && u.toggled }, act: { self.stopHandsFree(u, $0) })
+            }
             render()
             return
-        }
-        if held < Settings.minHoldSeconds {
+        case .lock:
             // 短く 2 回続けて押した＝ロック録音。録音は続けたまま、次に押すまで待つ
-            if u.pressedAt.timeIntervalSince(lastShortTap) < 0.5 {
-                u.locked = true
-                lastShortTap = .distantPast
-                // いつもの開始音と区別できるよう、上がる 2 音を鳴らす
-                play("lock_start", volume: 0.5)
-                Events.log("lock_started")
-                render()
-                return
-            }
+            startLock(u, from: "double_tap")
+            return
+        case .tooShort:
             current = nil
             lastShortTap = Date()
             recorder.discard()
             Events.log("too_short", ["hold_seconds": round(held * 100) / 100])
             return
+        case .paste: break
         }
         current = nil
         u.record["hold_seconds"] = round(held * 100) / 100
@@ -2977,11 +3159,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             u.record["device"] = cap.device
             if !cap.quality.isEmpty { u.record["quality"] = cap.quality }
             // 声が小さく録れている（入力音量が低い）と、語が途切れたり聞き取られなかったりする。10 分に 1 回まで知らせる
-            if let l = cap.quality["level_db"] as? Double, l < -45, cap.voicedSeconds > 0,
-               Date().timeIntervalSince(self.lowLevelWarnedAt) > 600 {
+            // 声を検出できなかった録音では、下の no_voice の知らせをこの案内に置き換える（上書きで消えないように）
+            let quiet = AudioQuality.tooQuiet(cap.quality)
+            if let l = quiet, cap.voicedSeconds > 0, Date().timeIntervalSince(self.lowLevelWarnedAt) > 600 {
                 self.lowLevelWarnedAt = Date()
                 Events.log("low_level", ["level_db": l])
-                self.showError(String(format: "声が小さく録れています（%.0f dB）。システム設定 → サウンド → 入力 で入力音量を上げるか、マイクを口元に近づけてください", l))
+                self.showError(AudioQuality.quietMessage(l))
             }
             if let alt = cap.alt { u.record["alt_device"] = alt.device; u.record["alt_quality"] = alt.quality }
             // 部屋の雑音でも peak は数十〜数百ある。ほぼ 0 はミュートか入力停止
@@ -2991,10 +3174,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else if cap.voicedSeconds == 0 {
                 self.transcribing -= 1
                 // 1 秒未満で声もない押下は誤操作のことが多いので音は鳴らさない
-                self.drop(u, outcome: "no_voice", message: "声を検出できませんでした", silent: held < 1.0)
+                if let l = quiet { Events.log("low_level", ["level_db": l, "no_voice": true]) }
+                self.drop(u, outcome: "no_voice", message: quiet.map(AudioQuality.quietMessage) ?? "声を検出できませんでした",
+                          silent: held < 1.0 && quiet == nil)
             } else {
                 let p0 = Date()
-                let prompt = Settings.whisperPrompt(previous: u.locked ? nil : self.previousText(for: u))
+                let app = u.record["app"] as? String ?? ""
+                let repo = RepoContext.current(app: app)
+                if let repo { u.record["repo_context"] = repo.source }
+                let prompt = Settings.whisperPrompt(previous: u.locked ? nil : self.previousText(for: u), repo: repo)
                 u.record["prompt_ms"] = Int(Date().timeIntervalSince(p0) * 1000)
                 self.transcribe(u, prompt: prompt)
             }
@@ -3355,6 +3543,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Glossary.refreshUsage(ifOlderThan: 300)
             ImproveSuggestPanel.notePasted()
             recentByApp[u.record["app"] as? String ?? ""] = (Date(), text)
+            RepoContext.pasted(text, app: u.record["app"] as? String ?? "")
             recent.append((Date(), text))
             if recent.count > 10 { recent.removeFirst(recent.count - 10) }
         }
@@ -3439,6 +3628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         recentMenu.delegate = self
         recentItem.submenu = recentMenu
         menu.addItem(recentItem)
+        menu.addItem(PasteLast.shared.item)
 
         clipboardItem = NSMenuItem(title: "貼り付け後にクリップボードを元に戻す", action: #selector(toggleClipboard), keyEquivalent: "")
         clipboardItem.target = self
@@ -3450,6 +3640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         packItem.submenu = packMenu
         menu.addItem(packItem)
         menu.addItem(GlossaryWindow.menuItem())
+        menu.addItem(StatsWindow.menuItem())
 
         // 押して話すキー。US 配列では右⌘が ⌘+Space（入力切替）や ⌘+Return と競合するので選べるようにする
         let keyItem = NSMenuItem(title: "押して話すキー", action: nil, keyEquivalent: "")
@@ -3465,7 +3656,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let modeItem = NSMenuItem(title: "押し方", action: nil, keyEquivalent: "")
         pressModeMenu = NSMenu()
-        for (tag, name) in [(0, "押している間だけ録音（既定）"), (1, "押すたびに開始・終了（トグル）")] as [(Int, String)] {
+        for (tag, name) in [(0, "押している間だけ録音（既定）"), (2, "自動: 短く押すと手を離して話せる・長押しは押している間"),
+                            (1, "押すたびに開始・終了（トグル）")] as [(Int, String)] {
             let it = NSMenuItem(title: name, action: #selector(choosePressMode(_:)), keyEquivalent: "")
             it.target = self
             it.tag = tag
@@ -3474,7 +3666,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modeItem.submenu = pressModeMenu
         menu.addItem(modeItem)
 
+        // 試験中の機能なので、キーがオンの人にだけ出す（既定オフの間は、ほかの人のメニューを増やさない）
         let indicatorItem = NSMenuItem(title: "録音中の表示", action: nil, keyEquivalent: "")
+        indicatorItem.isHidden = !IndicatorStyle.menuVisible
+        self.indicatorItem = indicatorItem
         indicatorMenu = NSMenu()
         for s in IndicatorStyle.allCases {
             let it = NSMenuItem(title: s.label, action: #selector(chooseIndicator(_:)), keyEquivalent: "")
@@ -3521,6 +3716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         soundItem = NSMenuItem(title: "録音の開始・終了で音を鳴らす", action: #selector(toggleSound), keyEquivalent: "")
         soundItem.target = self
         menu.addItem(soundItem)
+        menu.addItem(MediaDuckMenu.shared.item)
 
         loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
@@ -3560,7 +3756,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let checkItem = NSMenuItem(title: "更新を確認", action: #selector(checkUpdateNow), keyEquivalent: "")
         checkItem.target = self
         menu.addItem(checkItem)
-        let quit = NSMenuItem(title: "終了", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "終了", action: #selector(quitFromMenuAction(_:)), keyEquivalent: "q")
+        quit.target = self
         menu.addItem(quit)
         menu.delegate = self
         statusItem.menu = menu
@@ -3569,12 +3766,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleLock() {
         if let c = current, c.locked {
             endLocked()
+        } else if let c = current, c.toggled {
+            end()
         } else if current == nil {
             begin()
             guard let u = current else { return }
-            u.locked = true
-            play("lock_start", volume: 0.5)
-            Events.log("lock_started", ["from": "menu"])
+            startLock(u, from: "menu")
         }
         render()
     }
@@ -3604,9 +3801,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // サブメニューを開くたびにマイク一覧を作り直す（抜き差しに追従）
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === statusItem.menu {
+            PasteLast.shared.refresh(hasText: PasteLast.pick(recent) != nil)
             // メニューを開いたときも、前に確かめてから 1 分以上たっていれば新しい版を確かめる（起動時と 1 日 1 回だけだと当日中に気づけない）
             if Date().timeIntervalSince(lastUpdateCheck) > 60 { checkUpdate() }
             GlossaryWindow.updateMenuItem(in: menu)
+            StatsWindow.updateMenuItem(in: menu)
+            retranscriber.refresh()
             // 計測はメニューを開いたときだけ数える（履歴を読むので重い）
             let p1 = Events.pasteSuccessToday(), p2 = History.communication()
             func pct(_ a: Int, _ b: Int) -> String { b == 0 ? "-" : String(format: "%.0f%%", Double(a) / Double(b) * 100) }
@@ -3642,6 +3842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 item.toolTip = r.text
                 menu.addItem(item)
             }
+            retranscriber.addMenuItems(to: menu, target: self, action: #selector(retranscribe(_:)))
             return
         }
         if menu === packMenu {
@@ -3744,6 +3945,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    private func showImproveFailureIfNeeded() {
+        guard current == nil, transcribing == 0, Settings.improveEnabled,
+              improver.failures.takeNotice(now: Date()) else { return }
+        Settings.defaults.set(improver.failures.lastNotice, forKey: "improveLastFailureNotice")
+        let alert = NSAlert()
+        let program = ImproveReadiness.program(of: Settings.improveCommand)
+        alert.messageText = improver.failures.exitCode == 127
+            ? "改善ループが動いていません（\(program) が見つかりません）"
+            : "改善ループが動いていません（終了コード: \(improver.failures.exitCode)）"
+        alert.informativeText = improver.failures.exitCode == 127
+            ? "~/.local/bin、/opt/homebrew/bin、/usr/local/bin、~/.claude/local、~/.npm-global/bin とログインシェルで探しました。コマンドのインストールや設定を確認してください。"
+            : "改善ループの送り先の設定・ログイン状態・接続を確認して、もう一度試してください。"
+        alert.addButton(withTitle: "もう一度試す")
+        alert.addButton(withTitle: "閉じる")
+        if alert.runModal() == .alertFirstButtonReturn { improveNow() }
+    }
+
     @objc private func improveNow() {
         improver.runIfNeeded(force: true)
         render()
@@ -3754,11 +3972,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    // 最後の文をもう一度、今のフォーカスに貼る（Enter は送らない）。話している間は貼らない
+    private func pasteLast(via: String) {
+        // 録音中・文字起こし中は貼らない（貼り付けとクリップボードの戻しが重なり、元のクリップボードが戻らないことがある）
+        guard current == nil, transcribing == 0 else { return showError("話し終わってから、もう一度押してください") }
+        guard let r = PasteLast.pick(recent) else { return showError("まだ貼った文がありません") }
+        let age = Int(Date().timeIntervalSince(r.time))
+        guard AXIsProcessTrusted() else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(r.text, forType: .string)
+            Events.log("paste_last", ["via": via, "chars": r.text.count, "age_s": age, "outcome": "no_accessibility"])
+            fail("アクセシビリティの許可が外れています。最後の文はクリップボードにあります（⌘V で貼れます）")
+            return showAccessibilityNotice(reason: "paste_last")
+        }
+        PasteLast.whenModifiersReleased { waited, released in
+            Typist.pasteAndMaybeEnter(r.text, enter: false)
+            Events.log("paste_last", ["via": via, "chars": r.text.count, "age_s": age, "app": NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "",
+                                      "wait_ms": Int(waited * 1000), "mods_released": released])
+        }
+    }
+
     @objc private func copyRecent(_ sender: NSMenuItem) {
         guard let text = sender.representedObject as? String else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         Events.log("recent_copied", ["chars": text.count])
+    }
+
+    @objc private func retranscribe(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        showError("入らなかった録音を、もう一度文字起こししています…")
+        retranscriber.run(id: id, ready: serverReady) { o in
+            switch o {
+            case .ok(let text):
+                self.recent.append((Date(), text))
+                if self.recent.count > 10 { self.recent.removeFirst(self.recent.count - 10) }
+                self.showError("もう一度文字起こししました。クリップボードに入れたので ⌘V で貼れます")
+            case .unheard: self.fail("もう一度やっても聞き取れませんでした")
+            case .failed: self.fail(self.serverReady ? "もう一度の文字起こしに失敗しました" : "文字起こしの準備中です。少し待ってからもう一度押してください")
+            case .gone: self.fail("この録音はもう残っていません（履歴を残す期間を過ぎたか、もうやり直してあります）")
+            case .busy: self.fail("ほかの録音をもう一度文字起こししている最中です。終わってから押してください")
+            }
+        }
     }
 
     @objc private func togglePack(_ sender: NSMenuItem) {
@@ -3836,8 +4091,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func choosePressMode(_ sender: NSMenuItem) {
-        Settings.toggleMode = sender.tag == 1
-        Events.log("press_mode", ["mode": Settings.toggleMode ? "toggle" : "hold"])
+        Settings.pressMode = [2: .auto, 1: .toggle][sender.tag] ?? .hold
+        Events.log("press_mode", ["mode": Settings.pressMode.rawValue])
         render()
     }
 
@@ -3940,12 +4195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         missLine?.title = "マイク: \(recorder.activeName)\(recorder.primaryMuted ? " ※いまミュート中" : "")\(MicNotice.lineSuffix(recorder.notice))"
 
         enterItem?.state = Settings.autoEnter ? .on : .off
-        if current?.locked == true {
-            lockItem?.title = "ロック録音を終えてテキストに書き出す"
-        } else {
-            lockItem?.title = "ロック録音を始める（\(keyName()) を素早く 2 回でも可。もう 1 回押すと終わる）"
-        }
-        lockItem?.isEnabled = current == nil || current?.locked == true
+        renderLockItem()
         lineBreakItem?.state = Settings.lineBreaks ? .on : .off
         warmItem?.state = Settings.warmMic ? .on : .off
         soundItem?.state = Settings.sounds ? .on : .off
@@ -3964,7 +4214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         improveNowItem?.title = improver.running ? "改善中…" : "今すぐ改善する" + (improver.lastRun.map { "（前回: \($0.prefix(40))）" } ?? "")
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         for it in hotkeyMenu?.items ?? [] { it.state = it.tag == Int(Settings.hotkeyKeyCode) ? .on : .off }
-        for it in pressModeMenu?.items ?? [] { it.state = (it.tag == 1) == Settings.toggleMode ? .on : .off }
+        for it in pressModeMenu?.items ?? [] { it.state = it.tag == ([.auto: 2, .toggle: 1][Settings.pressMode] ?? 0) ? .on : .off }
         renderIndicatorMenu()
     }
 
@@ -3975,9 +4225,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                  app: HUDState.appName(bundleID: current?.record["app"] as? String), busy: transcribing + cleaning))
     }
 
+    // メニューの「ロック録音」の行（ロック録音中・手を離して話している間は、終える項目になる）
+    private func renderLockItem() {
+        if current?.locked == true {
+            lockItem?.title = "ロック録音を終えてテキストに書き出す"
+        } else if current?.toggled == true {
+            lockItem?.title = "録音を終えて貼る（\(keyName()) をもう一度押しても終わります）"
+        } else {
+            lockItem?.title = "ロック録音を始める（\(keyName()) を素早く 2 回でも可。もう 1 回押すと終わる）"
+        }
+        lockItem?.isEnabled = current == nil || current?.locked == true || current?.toggled == true
+    }
+
     // メニュー「録音中の表示」の見た目と場所のチェック
     private func renderIndicatorMenu() {
         let style = IndicatorStyle.current
+        indicatorItem?.isHidden = !IndicatorStyle.menuVisible
         for it in indicatorMenu?.items ?? [] {
             let v = it.representedObject as? String
             it.state = v == "style:" + style.rawValue || v == "position:" + IndicatorPosition.current(for: style).rawValue ? .on : .off
@@ -4076,6 +4339,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+// Internal helper: never starts AppKit, audio capture, or the user's server.
+if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--watch-server-lifetime" {
+    ServerLifecycle.watch(URL(fileURLWithPath: CommandLine.arguments[2]))
+    exit(0)
+}
+
 // Koe.app/Contents/MacOS/Koe --check-update [版]: 公開版に新しい版があるかを出す（動作確認用。版を渡すとその版だとみなす）
 if let i = CommandLine.arguments.firstIndex(of: "--check-update") {
     if i + 1 < CommandLine.arguments.count { Settings.defaults.set(CommandLine.arguments[i + 1], forKey: "assumeVersion") }
@@ -4084,6 +4353,25 @@ if let i = CommandLine.arguments.firstIndex(of: "--check-update") {
     done.wait()
     Settings.defaults.removeObject(forKey: "assumeVersion")
     exit(0)
+}
+
+// open -n -g Koe.app --args --paste-test <目印> <結果ファイル>: 「Koe paste test <目印>」を TextEdit に 1 回貼る（入れ替え後の確認用）。
+// open で起動すると Koe 自身のアクセシビリティの許可で動く（端末から直接起動すると端末の許可になる）。
+// 外から好きな文を Koe の許可で貼らせないよう、貼る文は固定で、外から受け取るのは英数字とハイフン 32 字までの目印だけ。
+// 前面が TextEdit でなければ貼らない。結果ファイルに pasted / no_accessibility / not_textedit / bad_marker を書く。文は記録しない
+if let i = CommandLine.arguments.firstIndex(of: "--paste-test") {
+    let marker = i + 1 < CommandLine.arguments.count ? CommandLine.arguments[i + 1] : ""
+    let out = i + 2 < CommandLine.arguments.count ? CommandLine.arguments[i + 2] : nil
+    func finish(_ r: String) -> Never {
+        if let out { try? (r + "\n").write(toFile: out, atomically: true, encoding: .utf8) } else { print(r) }
+        exit(r == "pasted" ? 0 : 1)
+    }
+    if let no = PasteTest.refusal(marker: marker, frontmost: NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                                  trusted: AXIsProcessTrusted()) { finish(no) }
+    Typist.pasteAndMaybeEnter(PasteTest.text(marker), enter: false)
+    // クリップボードを戻すのは 0.8 秒後（Typist）。それを待ってから終わる
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { finish("pasted") }
+    RunLoop.main.run()
 }
 
 // Koe.app/Contents/MacOS/Koe --diagnostics: 診断情報の zip をデスクトップに書き出してパスを出す

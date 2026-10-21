@@ -184,3 +184,34 @@ one. Results and the recommendation are in
 `docs/notes/2026-10-18-vad-before-transcription.md`. On 2026-10-18 (same machine
 as above, warm cache) the full command took **969 seconds (about 16 minutes)**
 for 4,200 scored requests.
+
+## Japanese ASR engines on the Mac (`asr_bench.py`, #180)
+
+`python3 eval/asr_bench.py` runs every engine, one at a time, on the same data. `--engines <name> …` runs some of them. Run `public_bench.py` once first, so that the JSUT clips are cached. Results and the recommendation are in `docs/notes/2026-10-19-asr-engines-on-mac.md`.
+
+- **Data**: public or synthetic only, never a real person's voice.
+  - The JSUT clips of `public_bench.py`, in the length buckets of `audio_ctx_bench.py`: 60 single clips under 5 s, and 20 joined utterances per bucket up to 28 s.
+  - 60 sentences with terms from `packs/developer.txt`, spoken by the macOS voice Kyoko (`say`) into the cache.
+- **Engines**:
+  - `whisper-turbo-metal`: Koe's default, large-v3-turbo on Metal
+  - `whisper-turbo-coreml`: the same model with whisper.cpp's prebuilt Core ML encoder. Its whisper-server is built once from the source revision Koe uses (0c7be69) into the cache.
+  - `kotoba-whisper-v2-metal`: kotoba-whisper v2.0 ggml
+  - `apple-speechanalyzer`: macOS 26 SpeechTranscriber ja_JP, through `speechanalyzer_cli.swift`
+  - `apple-dictation`: the same helper with DictationTranscriber (preset `shortDictation`)
+  - `parakeet-ja-sherpa-cpu`: Parakeet-ja through sherpa-onnx 1.13.8, through `sherpa_cli.py`, in a venv in the cache built from `asr_requirements.txt` with `--require-hashes`
+- **Downloads**: every model is pinned by revision and SHA-256, into the cache (`~/Library/Caches/koe-public-bench/asr-models`).
+- **Conditions**:
+  - `none`: no prompt
+  - `base`: Koe's base prompt
+  - `pack`: the developer pack in the prompt, with pack autocorrect, as Koe runs by default
+
+  - `hints`: every pack term as a vocabulary hint (`AnalysisContext.contextualStrings`), with pack autocorrect
+
+  Engines without a prompt get `none` and `pack` (autocorrect only); the SpeechAnalyzer engines also get `hints`.
+- **Metrics**:
+  - CER before (spaces removed) and after (NFKC, punctuation removed) normalisation, overall and per bucket, with the count of empty answers
+  - median and p90 seconds per bucket
+  - terms right
+  - peak RSS of the engine process
+  - model size and licence
+- **Limits**: `nice 15` and 4 threads. The run stops when free plus inactive memory drops below 6 GB (`--min-available-gb`). Only numbers are printed and stored (`asr-results.json` in the cache); no transcript is kept.

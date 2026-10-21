@@ -55,6 +55,9 @@ enum IndicatorStyle: String, CaseIterable {
     }
 
     static let key = "recordingIndicator"
+    // メニューの「録音中の表示」は、キーを一度でも書いた人にだけ出す（defaults write … recordingIndicator pill など）。
+    // メニューで「出さない」を選んでも off が書かれるので、メニューは消えずに戻せる
+    static var menuVisible: Bool { UserDefaults.standard.object(forKey: key) != nil }
     static var current: IndicatorStyle {
         get {
             // 前の版の値（top / caret）は帯として読む

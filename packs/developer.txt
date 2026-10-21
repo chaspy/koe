@@ -1,4 +1,4 @@
-# Koe 用語パック: 開発者向け（Git・GitHub・CI/CD）
+# Koe 用語パック: 開発者向け（Git・GitHub・CI/CD・クラウド）
 #
 # 書き方: 1 行 1 語。タブの後に、実際に起きた誤変換の形を ／ 区切りで書く。
 #   - そのまま書いた形: 確実な誤変換。貼る前に正しい表記へ自動で置き換える
@@ -7,7 +7,7 @@
 # 読み（イシュー 等）は誤変換ではないので書かない。詳しくは CONTRIBUTING.md
 プルリクエスト	プロリクエスト／フルリクエスト／プロリクルド
 プルリク	プロリク／プロリック／プロレクト
-PR
+PR	ピーアル
 マージ	~マジ／マジ>(され|し|する|した|でき|済)／マージュ
 コンフリクト
 リベース
@@ -23,26 +23,126 @@ Issue
 レビュアー
 Approve
 アプルーブ	アプローブ
-LGTM
+LGTM	エルジーティーエム
 ドラフト
-diff
+diff	ディフ
 main
-GitHub
-GitHub Actions
-GitLab
-CI
-CI/CD
+GitHub	ギットハブ／ギッターブ／ギットアブ／ギッハブ
+GitHub Actions	ギットハブアクションズ／ギットハブアクション
+GitLab	ギットラブ／ギットラップ／ギトラブ
+CI	シーアイ
+CI/CD	シーアイシーディー
 デプロイ
 ステージング
-STG	エステージ
+STG	エステージ／エスティージー
 本番
 ロールバック
 インシデント	インシエント
 リファクタ	リラクター
 リリース
 タグ
-README
-Dependabot
-Copilot
-Claude Code	ClodeCode／Clodecode／Cloud Code／クロードコード
-BQ	~B級
+README	リードミー
+Dependabot	デペンダボット／デペンデボット／デペンダーボット
+Copilot	コパイロット／コーパイロット
+Claude Code	ClodeCode／Clodecode／Cloud Code／クロードコード／クラウドコード
+BQ	~B級／ビーキュー
+
+# クラウド・インフラ・開発の一般用語（英字の語は、whisper がカタカナで書いた形を別名にしている。普通の言葉と重なる形は入れない）
+Pull Request
+GCP	ジーシーピー
+Google Cloud	グーグルクラウド
+AWS	エーダブリューエス
+Azure	アジュール
+Cloud Run	クラウドラン
+Cloud Storage
+Cloud SQL	クラウドエスキューエル
+BigQuery	ビッグクエリ／ビッグクウェリー
+Pub/Sub	パブサブ／パブソブ
+GKE	ジーケーイー
+Secret Manager	シークレットマネージャー／シークレットマネジャー
+IAM	アイエーエム
+VPC	ブイピーシー
+EC2	イーシーツー
+S3	エススリー
+Lambda
+ECS	イーシーエス
+EKS	イーケーエス
+RDS	アールディーエス
+DynamoDB	ダイナモディービー
+CloudFront	クラウドフロント
+CloudWatch	クラウドウォッチ
+Route 53	ルートゴーサン
+Terraform	テラフォーム／テラホーム／テラフォルム
+Kubernetes	クーバネティス／キューバネティス／クバネティス
+kubectl	キューブコントロール／クベクトル／キューブシーティーエル
+Helm
+Docker	ドッカー
+Dockerfile	ドッカーファイル
+namespace
+Argo CD	アルゴシーディー／アーゴシーディー
+Datadog	データドッグ
+Sentry
+PagerDuty	ページャーデューティー／ペイジャーデューティ
+Grafana	グラファナ
+Prometheus	プロメテス
+OpenTelemetry	オープンテレメトリー
+Slack	サーパック
+Notion	ノーション
+Jira	ジラ／ジーラ
+Confluence	コンフルエンス／コンフルーエンス
+Figma	フィグマ
+PostgreSQL	ポストグレスキューエル／ポストグレス
+MySQL	マイエスキューエル／マイシークェル
+Redis
+MongoDB	モンゴディービー
+Elasticsearch	エラスティックサーチ
+SQLite	エスキューライト
+Firestore	ファイアストア
+Firebase	ファイアベース
+Nginx	エンジンエックス
+Linux	リナックス／ライナックス
+Ubuntu	ウブントゥ／ウバンツー
+macOS	マックオーエス
+Homebrew	ホームブリュー
+VS Code	ブイエスコード／ビジュアルスタジオコード
+Xcode	エックスコード
+Node.js	ノードジェイエス
+npm	エヌピーエム
+TypeScript	タイプスクリプト
+JavaScript	ジャバスクリプト
+Python	パイソン
+Rust
+Ruby
+Rails
+Java	ジャバ
+Kotlin	コトリン
+Swift	スウィフト
+SwiftUI	スウィフトユーアイ
+Flutter	フラッター
+React	リアクト
+Next.js	ネクストジェイエス
+GraphQL	グラフキューエル／グラフクェル
+gRPC	ジーアールピーシー
+REST API	レストエーピーアイ
+API	エーピーアイ
+SDK	エスディーケー
+CLI	シーエルアイ
+JSON
+YAML	ヤムル
+OAuth	オーオース
+SSO	エスエスオー
+Webhook	ウェブフック／ウェブホック
+SSH	エスエスエイチ
+VPN	ブイピーエヌ
+DNS	ディーエヌエス
+CDN	シーディーエヌ
+SLO	エスエルオー
+SRE	エスアールイー
+LLM	エルエルエム
+MCP	エムシーピー
+OpenAI	オープンエーアイ
+Anthropic	アンソロピック／アンスロピック
+Gemini	ジェミニ／ジェミナイ
+Claude
+Codex
+Cursor

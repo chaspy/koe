@@ -7,7 +7,7 @@ enum ImproveReadiness: Equatable {
     case missingCommand(String)      // コマンドが見つからない（既定なら claude）
     case missingEndpoint             // api 型なのに送り先が無い
 
-    // found: ログインシェルでそのプログラムが見つかるか（Koe は改善ループのコマンドを zsh -lc で動かす）
+    // found: 実行時と共通の解決関数でプログラムが見つかるか
     static func evaluate(provider: String, command: String, endpoint: String, target: String,
                          found: (String) -> Bool) -> ImproveReadiness {
         if provider == "api" { return endpoint.isEmpty ? .missingEndpoint : .ready(target: target) }
@@ -15,26 +15,8 @@ enum ImproveReadiness: Equatable {
         return !prog.isEmpty && found(prog) ? .ready(target: target) : .missingCommand(prog)
     }
 
-    // コマンドの最初の語（環境変数の代入 `A=b claude -p` は飛ばす）。'…' か "…" で囲んだ語は、空白を含めて 1 語
     static func program(of command: String) -> String {
-        words(command).first { !$0.contains("=") } ?? ""
-    }
-
-    private static func words(_ s: String) -> [String] {
-        var out: [String] = [], cur = "", quote: Character?
-        for c in s {
-            if let q = quote {
-                if c == q { quote = nil } else { cur.append(c) }
-            } else if c == "'" || c == "\"" {
-                quote = c
-            } else if c == " " {
-                if !cur.isEmpty { out.append(cur); cur = "" }
-            } else {
-                cur.append(c)
-            }
-        }
-        if !cur.isEmpty { out.append(cur) }
-        return out
+        ImproveCommand.token(command)?.program ?? ""
     }
 
     var canEnable: Bool { if case .ready = self { return true }; return false }

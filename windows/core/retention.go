@@ -117,10 +117,15 @@ func HistoryPrune(dir string, keepDays int, capBytes int64, now time.Time) Prune
 			total -= f.size
 		}
 	}
-	// empty day folders
+	// empty day folders before yesterday. SaveHistory runs on the transcription
+	// worker ("create the folder -> write the .wav -> write the .json") while
+	// this runs on its own goroutine, so right after midnight the folder of an
+	// utterance pressed before midnight may still be empty: yesterday's folder
+	// is kept (mac: the same, #131). os.Remove only removes an empty folder.
+	keepFrom := today.AddDate(0, 0, -1).Format("2006-01-02")
 	if entries, err := os.ReadDir(dir); err == nil {
 		for _, e := range entries {
-			if isDayDir(e) && e.Name() < today.Format("2006-01-02") {
+			if isDayDir(e) && e.Name() < keepFrom {
 				if os.Remove(filepath.Join(dir, e.Name())) == nil { // only succeeds when empty
 					r.Dirs++
 				}

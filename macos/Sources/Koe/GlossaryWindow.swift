@@ -16,12 +16,14 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         let learnedAt: Date?
         let used: Int
         let inHint: Bool
+        let cleanupReason: TermRules.Rejection?
     }
 
     private var window: NSWindow?
     private var tabs: NSSegmentedControl!
     private var search: NSSearchField!
     private var recentOnly: NSButton!
+    private var cleanupOnly: NSButton!
     private var about: NSTextField!
     private var openFile: NSButton!
     private var table: NSTableView!
@@ -41,6 +43,13 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         self.tab = tab
         tabs.selectedSegment = tab.rawValue
         recentOnly.state = recent ? .on : .off
+        cleanupOnly.state = .off
+        // Offer the list once, without deleting or rewriting any dictionary entry.
+        if tab == .personal, !recent, !Settings.defaults.bool(forKey: "termCleanupOffered"),
+           rows[0].contains(where: { $0.cleanupReason != nil }) {
+            cleanupOnly.state = .on
+            Settings.defaults.set(true, forKey: "termCleanupOffered")
+        }
         search.stringValue = ""
         apply()
         NSApp.activate(ignoringOtherApps: true)
@@ -77,8 +86,10 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
     private func reload() {
         let koe = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Koe")
         let learned = GlossaryCatalog.learnedDates(events: (try? String(contentsOf: Events.url, encoding: .utf8)) ?? "")
-        let cands = Set(((try? JSONSerialization.jsonObject(with: Data(contentsOf: koe.appendingPathComponent("glossary_candidates.json")))) as? [String: Any] ?? [:]).keys)
+        let candidates = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: koe.appendingPathComponent("glossary_candidates.json")))) as? [String: [String: Any]] ?? [:])
+        let cands = Set(candidates.keys)
         let personal = Glossary.personal, packs = Glossary.packs, org = Glossary.org
+        let aliasKeys = Set((personal + packs + org).flatMap(\.aliases).map(TermRules.aliasKey))
         let counts = Glossary.usageCounts(personal + packs + org)
         let hint = Glossary.whisperTerms(limit: 120)
         let inHint = Set(hint)
@@ -86,7 +97,9 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             let l = GlossaryCatalog.aliasLabels(e.aliases)
             return Row(term: e.term, sure: l.sure, noteOnly: l.noteOnly,
                        origin: mark ? GlossaryCatalog.origin(e.term, learned: learned, candidates: cands) : nil,
-                       learnedAt: learned[e.term], used: counts[e.term] ?? 0, inHint: inHint.contains(e.term))
+                       learnedAt: learned[e.term], used: counts[e.term] ?? 0, inHint: inHint.contains(e.term),
+                       cleanupReason: mark ? TermRules.rejection(e.term, aliases: aliasKeys,
+                           person: candidates[e.term]?["person"] as? Bool == true) : nil)
         }
         rows = [personal.map { row($0, mark: true) }, org.map { row($0, mark: false) }, packs.map { row($0, mark: false) }]
         hintCount = hint.count
@@ -114,6 +127,7 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         if tab == .personal, recentOnly.state == .on {
             list = list.filter { ($0.learnedAt ?? .distantPast) >= weekAgo }.sorted { ($0.learnedAt ?? .distantPast) > ($1.learnedAt ?? .distantPast) }
         }
+        if tab == .personal, cleanupOnly.state == .on { list = list.filter { $0.cleanupReason != nil } }
         if !q.isEmpty {
             list = list.filter { r in ([r.term] + r.sure + r.noteOnly).contains { $0.lowercased().contains(q) } }
         }
@@ -130,13 +144,16 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         shown = list
         table.tableColumn(withIdentifier: .init("mark"))?.isHidden = tab != .personal
         recentOnly.isHidden = tab != .personal
+        cleanupOnly.isHidden = tab != .personal
         openFile.isHidden = tab != .personal
-        about.stringValue = aboutText()
-        empty.stringValue = emptyText(filtered: !q.isEmpty || (tab == .personal && recentOnly.state == .on))
+        about.stringValue = tab == .personal && cleanupOnly.state == .on
+            ? "見直し候補の一覧です（自動では削除しません）。語にカーソルを合わせると理由を表示します。不要な語は「辞書のファイルを開いて直す…」から手動で削除できます。"
+            : aboutText()
+        empty.stringValue = emptyText(filtered: !q.isEmpty || (tab == .personal && (recentOnly.state == .on || cleanupOnly.state == .on)))
         empty.isHidden = !shown.isEmpty
         table.reloadData()
         footer.stringValue = "文字起こしのヒントに入るのは約 120 文字ぶんで、いま \(hintCount) 語が入っています（右の列の ●）。"
-            + (notInHint > 0 ? "\(notInHint) 語は入りきっていません。最近よく使う語から順に入ります。" : "")
+            + (notInHint > 0 ? "\(notInHint) 語は入りきっていません。用語の条件を満たす語を優先し、その中で最近よく使う順に入ります。" : "")
             + "ヒントに入らない語でも、自分の辞書と用語パックにある「聞き間違えた形」は貼る前に直します。"
     }
 
@@ -222,6 +239,7 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             t.toolTip = r.origin == .learned ? "使っているうちに Koe が覚えた語" : "自分で入れた語（または覚えた記録が残っていない語）"
         case "term":
             t.stringValue = r.term
+            t.toolTip = r.cleanupReason?.label
         case "sure":
             t.stringValue = r.sure.isEmpty ? "—" : r.sure.joined(separator: "、")
             t.textColor = r.sure.isEmpty ? .tertiaryLabelColor : .labelColor
@@ -262,6 +280,7 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         search.placeholderString = "語・聞き間違えた形で探す"
         search.delegate = self
         recentOnly = NSButton(checkboxWithTitle: "この 1 週間に覚えた語だけ", target: self, action: #selector(toggleRecent))
+        cleanupOnly = NSButton(checkboxWithTitle: "見直し候補だけ（削除は手動）", target: self, action: #selector(toggleRecent))
         openFile = NSButton(title: "辞書のファイルを開いて直す…", target: self, action: #selector(openPersonal))
         openFile.bezelStyle = .rounded
         about = NSTextField(wrappingLabelWithString: "")
@@ -297,7 +316,7 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         empty.alignment = .center
 
         let content = w.contentView!
-        for v in [tabs, search, recentOnly, openFile, about, scroll, empty, footer] as [NSView] {
+        for v in [tabs, search, recentOnly, cleanupOnly, openFile, about, scroll, empty, footer] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -315,7 +334,9 @@ final class GlossaryWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             recentOnly.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
             openFile.centerYAnchor.constraint(equalTo: recentOnly.centerYAnchor),
             openFile.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
-            scroll.topAnchor.constraint(equalTo: recentOnly.bottomAnchor, constant: 8),
+            cleanupOnly.topAnchor.constraint(equalTo: recentOnly.bottomAnchor, constant: 6),
+            cleanupOnly.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
+            scroll.topAnchor.constraint(equalTo: cleanupOnly.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: m),
             scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -m),
             empty.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),

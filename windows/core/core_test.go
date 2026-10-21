@@ -51,6 +51,11 @@ func TestAutocorrect(t *testing.T) {
 		{"プロリクエストを出す", "プルリクエストを出す"},
 		{"リポジテルを見て", "リポジトリを見て"},
 		{"Cloud Codeで", "Claude Codeで"},
+		// katakana spellings of latin names
+		{"ギットアブに上げる", "GitHubに上げる"},
+		{"ギットハブアクションズで回す", "GitHub Actionsで回す"},
+		{"テラフォームのリポジトリ", "Terraformのリポジトリ"},
+		{"シークレットマネジャーに入れる", "Secret Managerに入れる"},
 		// inside a longer katakana word: not replaced
 		{"プロリクルド", "プルリクエスト"},
 		{"アプロリク", "アプロリク"},
@@ -141,10 +146,10 @@ func TestReceiverNotes(t *testing.T) {
 	if !strings.Contains(short, "- マージ ← マジ（直後が (して) のとき）、マジ（直後が (され|し|する|した|でき|済) のとき）、マージュ（文脈によっては「マジ」と化ける）") {
 		t.Fatal(short)
 	}
-	if !strings.Contains(short, "`~\\.claude\\koe-voice-glossary.full.md` を grep してから読み替える（11 語）") {
+	if !strings.Contains(short, "`~\\.claude\\koe-voice-glossary.full.md` を grep してから読み替える（106 語）") {
 		t.Fatal(short)
 	}
-	if !strings.Contains(full, "## よく使う語（この表記が正しい）\n\nPR、コンフリクト") {
+	if !strings.Contains(full, "## よく使う語（この表記が正しい）\n\nコンフリクト、リベース") {
 		t.Fatal(full)
 	}
 }

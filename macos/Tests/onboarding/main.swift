@@ -8,33 +8,33 @@ func check(_ ok: Bool, _ msg: @autoclosure () -> String) { if !ok { failures += 
 // 段: 許可 → マイク → キー → 貼ってみる。最後の段だけ本物の録音に回す
 check(OnboardingStep.allCases.map(\.short) == ["許可", "マイク", "キー", "貼ってみる", "賢くする"], "steps in order")
 
-// 流れの案: 既定はオフ。案ごとの段の並びと、前後の段
+// 流れ: 既定はオフ。案を選んでいたころの値が残っていても、オンとして同じ流れ
 let d = UserDefaults.standard
 let savedFlow = d.object(forKey: OnboardingFlow.key)
 d.removeObject(forKey: OnboardingFlow.key)
-check(OnboardingFlow.current == .off && !OnboardingFlow.enabled, "default off")
-d.set("bogus", forKey: OnboardingFlow.key)
-check(OnboardingFlow.current == .off, "unknown value → off")
+check(!OnboardingFlow.enabled, "default off")
 d.set("short", forKey: OnboardingFlow.key)
-check(OnboardingFlow.current == .short && OnboardingFlow.enabled, "short")
+check(OnboardingFlow.enabled, "an old choice (short) still turns it on")
+d.set(false, forKey: OnboardingFlow.key)
+check(!OnboardingFlow.enabled, "-bool false is off")
 if let savedFlow { d.set(savedFlow, forKey: OnboardingFlow.key) } else { d.removeObject(forKey: OnboardingFlow.key) }
-check(OnboardingFlow.allCases.map(\.rawValue) == ["off", "steps", "auto", "short"], "flow choices")
-let four: [OnboardingStep] = [.permissions, .mic, .key, .paste]
-check(OnboardingFlow.steps.steps == four && OnboardingFlow.auto.steps == four, "steps / auto: all four")
-// 使うほど賢くする（#168）: 決まっていないときだけ最後に足す。足さないときは前と同じ並び
-for f in [OnboardingFlow.steps, .auto, .short] {
-    check(f.steps(improve: false) == f.steps && f.steps(improve: true) == f.steps + [.improve], "\(f): improve is appended last")
-    check(f.next(after: .paste, improve: true) == .improve && f.next(after: .paste) == nil, "\(f): paste → improve only when shown")
-    check(f.next(after: .improve, improve: true) == nil && f.previous(before: .improve, improve: true) == .paste, "\(f): improve is the last step")
+for v: Any in ["on", "steps", "auto", "short", "B", "true", "1", true, 1] {
+    check(OnboardingFlow.isOn(v), "\(v) → on")
 }
+for v: Any? in [nil, "off", "OFF", " off ", "", "false", "no", "0", false, 0] {
+    check(!OnboardingFlow.isOn(v), "\(String(describing: v)) → off")
+}
+let four: [OnboardingStep] = [.permissions, .mic, .key, .paste]
+check(OnboardingFlow.steps == four, "all four steps")
+// 使うほど賢くする（#168）: 決まっていないときだけ最後に足す。足さないときは前と同じ並び
+check(OnboardingFlow.steps(improve: false) == four && OnboardingFlow.steps(improve: true) == four + [.improve], "improve is appended last")
+check(OnboardingFlow.next(after: .paste, improve: true) == .improve && OnboardingFlow.next(after: .paste) == nil, "paste → improve only when shown")
+check(OnboardingFlow.next(after: .improve, improve: true) == nil && OnboardingFlow.previous(before: .improve, improve: true) == .paste, "improve is the last step")
 check(!OnboardingStep.improve.practisesKey, "the improve step does not take the key")
-check(OnboardingFlow.short.steps == [.permissions, .paste], "short: permissions → paste")
-check(OnboardingFlow.steps.next(after: .permissions) == .mic && OnboardingFlow.steps.next(after: .key) == .paste
-      && OnboardingFlow.steps.next(after: .paste) == nil, "next")
-check(OnboardingFlow.short.next(after: .permissions) == .paste && OnboardingFlow.short.previous(before: .paste) == .permissions
-      && OnboardingFlow.short.previous(before: .permissions) == nil, "short next / previous")
-check(OnboardingFlow.short.next(after: .mic) == nil, "a step not in the flow has no next")
-check(OnboardingFlow.auto.advancesItself && !OnboardingFlow.steps.advancesItself && !OnboardingFlow.short.advancesItself, "only auto advances itself")
+check(OnboardingFlow.next(after: .permissions) == .mic && OnboardingFlow.next(after: .key) == .paste
+      && OnboardingFlow.next(after: .paste) == nil, "next")
+check(OnboardingFlow.previous(before: .mic) == .permissions && OnboardingFlow.previous(before: .permissions) == nil, "previous")
+check(OnboardingFlow.next(after: .improve) == nil, "a step not in the flow has no next")
 check(OnboardingStep.allCases.filter(\.practisesKey) == [.permissions, .mic, .key], "only the last step records for real")
 check(OnboardingText.keyName(54) == "右⌘" && OnboardingText.keyName(63) == "fn" && OnboardingText.keyName(99) == "keyCode 99", "key names")
 

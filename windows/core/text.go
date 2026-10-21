@@ -232,14 +232,22 @@ func collapseSentences(text string) string {
 
 // CleanServerText joins the non-empty trimmed lines of whisper-server's text
 // response with a space (mac behavior). Control characters are removed.
-func CleanServerText(raw string) string {
+func CleanServerText(raw string) string { return CleanServerTextLines(raw, false) }
+
+// CleanServerTextLines is CleanServerText, joining with "\n" when keepLines
+// (lineBreaks / lock recording).
+func CleanServerTextLines(raw string, keepLines bool) string {
 	var parts []string
 	for _, l := range splitLines(raw) {
 		if l = strings.TrimSpace(StripControl(l)); l != "" {
 			parts = append(parts, l)
 		}
 	}
-	return strings.Join(parts, " ")
+	sep := " "
+	if keepLines {
+		sep = "\n"
+	}
+	return strings.Join(parts, sep)
 }
 
 // StripControl removes control characters from text before it is pasted:

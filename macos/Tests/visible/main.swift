@@ -41,5 +41,11 @@ check("半角カナ", seen("テストを回して", "> ﾃｽﾄを回して"), 
 // 末尾だけ違う（貼り付けが途中で切れた）
 check("途中まで", seen(text, "> このファイルのテストを足しておいてください。終わったら"), false)
 
+// 許可のダイアログで待った回（初回の読み取りで、許可がまだ決まっていなかった）は測れなかったとする
+check("許可済みなら初回も測る", PasteVisible.waitedPermission(permission: 0, firstRead: true), false)
+check("許可を聞いた初回は測らない（-1744）", PasteVisible.waitedPermission(permission: -1744, firstRead: true), true)
+check("許可の状態が分からない初回も測らない", PasteVisible.waitedPermission(permission: -1750, firstRead: true), true)
+check("2 回目からは測る", PasteVisible.waitedPermission(permission: -1744, firstRead: false), false)
+
 if failures > 0 { print("\(failures) failure(s)"); exit(1) }
 print("visible: ok")

@@ -1,0 +1,79 @@
+# PR risk rules. Read by the PR gate from the base branch (a PR cannot lower its own risk).
+#
+# Each line: <level> <kind> <pattern>
+#   level: high | low        (anything that matches neither is mid)
+#   kind:  path  — shell glob on the changed file's path (* also matches /)
+#          diff  — regex on the changed lines (+/-) of files that are not low
+#          diff-all — the same, but also on low files (except docs/*, *.md): for what must never pass unseen
+#
+# A file that matches both a high and a low path is high.
+# A PR's risk is the highest of its files: any high → high; all files low → low; otherwise mid.
+# When unsure, add the file to a higher level.
+#
+# To see the level of a branch: python3 scripts/pr_risk.py --base origin/main --head <branch>
+# (tests: python3 -m unittest discover -s scripts -p 'test_*.py')
+
+# --- high: update, signing, permissions, distribution, redaction/privacy, CI ---
+high path .github/*
+high path REVIEW.md
+# Release tooling (folds changelog.d into CHANGELOG.md, which the apps read for the update prompt)
+high path scripts/*
+high path macos/Package.swift
+high path macos/scripts/*
+high path macos/*.entitlements
+high path macos/Sources/Koe/UpdatePrompt.swift
+# In-app update: checking the signature of the downloaded app before it replaces Koe (#177)
+high path macos/Sources/Koe/UpdateVerify.swift
+high path macos/Sources/Koe/Redaction.swift
+high path macos/Sources/Koe/Retention.swift
+high path windows/build.sh
+high path windows/update_windows.go
+high path windows/diag_windows.go
+high path windows/core/update.go
+high path windows/core/updateprompt.go
+high path windows/core/download.go
+high path windows/core/diag.go
+high path windows/core/history.go
+high path windows/core/log.go
+high path windows/core/retention.go
+high path windows/assets/*.manifest
+high path windows/go.mod
+high path windows/go.sum
+# Tests that guard redaction, update and retention: weakening them needs a human
+high path macos/Tests/redaction/*
+high path macos/Tests/update/*
+high path macos/Tests/updateverify/*
+high path macos/Tests/history/*
+high path windows/core/update_test.go
+high path windows/core/updateprompt_test.go
+high path windows/core/retention_test.go
+
+# High-risk code inside the big files (main.swift, *_windows.go, ...)
+# Asking for a permission (reading whether it is granted is mid)
+high diff kAXTrustedCheckOptionPrompt|requestAccess|tccutil|UsageDescription|com\.apple\.security\.
+# Any key added to or removed from Info.plist (a version bump only changes <string> lines and stays mid)
+high diff ^\s*<key>
+high diff checkForUpdate|releases/(latest|download)|raw\.githubusercontent|huggingface\.co|updateChannel|UpdatePrompt|installUpdate|SUFeedURL
+high diff codesign|SecItem|SecKeychain|SIGN_|sign\.sh|hdiutil|INSTALL_DIR|^(install|dist):
+# The updater (enum Updater in main.swift) and the signature check it relies on
+high diff UpdateVerify|SecStaticCode|SecRequirement|SecCodeCheckValidity|enum Updater\b|Updater\.(install|download|replace)|com\.apple\.quarantine|xattr
+# Changing the app's identity (not mentioning it: `defaults write io.github.chaspy.koe ...` in a comment is fine)
+high diff CFBundleIdentifier|PRODUCT_BUNDLE_IDENTIFIER|bundleIdentifier *=|CFBundleExecutable|^APP_NAME|\$\(BUNDLE\)
+high diff [Rr]edact|伏せ
+# Where events and history are stored, and the code that writes or deletes them. Reading them, or adding
+# an event or a record field, is mid:
+# REVIEW.md asks the reviewer to check that no text, title or path goes into it.
+high diff SaveHistory|Retention\.prune|pruneHistory|enum (History|Events)\b|appendingPathComponent\("(Koe/)?(events\.jsonl|history)"\)|(write\(to|removeItem\(at|os\.Remove(All)?\().*([Hh]istory|events)
+# Where text can leave the machine (eval scripts read the history)
+high diff-all [Ee]ndpoint|KOE_OLLAMA
+high diff-all urlopen|urllib\.request|requests\.(get|post)|http\.(Post|NewRequest)|URLSession|subprocess\..*(curl|wget)
+
+# --- low: docs, eval, tests, pack terms ---
+low path docs/*
+low path *.md
+low path eval/*
+low path macos/Tests/*
+low path windows/*_test.go
+low path windows/core/testdata/*
+low path windows/bench/*
+low path packs/*.txt

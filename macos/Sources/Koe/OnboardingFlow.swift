@@ -21,37 +21,39 @@ enum OnboardingStep: Int, CaseIterable {
     var practisesKey: Bool { self == .permissions || self == .mic || self == .key }
 }
 
-// 流れの案（どれを残すかは chaspy が触って選ぶ。選ばれなかった案は後で消す）。既定はオフ（新しい機能は既定オフで出す）
-//   defaults write io.github.chaspy.koe onboarding steps|auto|short   （off で前の「ようこそ」に戻す）
-enum OnboardingFlow: String, CaseIterable {
-    case off, steps, auto, short
-
-    // 段の並び。短い案は、許可 → 貼ってみる（マイクの揺れは貼る段に出す）
-    var steps: [OnboardingStep] { self == .short ? [.permissions, .paste] : [.permissions, .mic, .key, .paste] }
+// 流れ: 4 段（＋賢くする）で、できたら自分で次の段へ進む（マイクが聞こえた・キーの練習ができた）。「次へ」でも進める。
+// 3 案（steps / auto / short）から auto に決めた（2026-10-19、docs/notes/onboarding-variants）。既定はオフ（新しい機能は既定オフで出す）
+//   defaults write io.github.chaspy.koe onboarding on   （off か未設定で前の「ようこそ」）
+// 案を選んでいたころの値（steps / auto / short など）が残っていても、オンとして同じ流れで開く
+enum OnboardingFlow {
+    static let steps: [OnboardingStep] = [.permissions, .mic, .key, .paste]
 
     // improve: 最後に「使うほど賢くする」を足すか（ImproveStepText.shows）
-    func steps(improve: Bool) -> [OnboardingStep] { improve ? steps + [.improve] : steps }
+    static func steps(improve: Bool) -> [OnboardingStep] { improve ? steps + [.improve] : steps }
 
-    // できたら自分で次の段へ進む（マイクが聞こえた・キーの練習ができた）。許可が揃ったときはどの案でも進む
-    var advancesItself: Bool { self == .auto }
-
-    func next(after s: OnboardingStep, improve: Bool = false) -> OnboardingStep? {
+    static func next(after s: OnboardingStep, improve: Bool = false) -> OnboardingStep? {
         let all = steps(improve: improve)
         guard let i = all.firstIndex(of: s), i + 1 < all.count else { return nil }
         return all[i + 1]
     }
 
-    func previous(before s: OnboardingStep, improve: Bool = false) -> OnboardingStep? {
+    static func previous(before s: OnboardingStep, improve: Bool = false) -> OnboardingStep? {
         let all = steps(improve: improve)
         guard let i = all.firstIndex(of: s), i > 0 else { return nil }
         return all[i - 1]
     }
 
     static let key = "onboarding"
-    static var current: OnboardingFlow {
-        UserDefaults.standard.string(forKey: key).flatMap(OnboardingFlow.init(rawValue:)) ?? .off
+    // 設定の値からオンかを決める。未設定・off・false・0・空はオフ、それ以外（on・true・古い案の名前）はオン
+    static func isOn(_ value: Any?) -> Bool {
+        switch value {
+        case let b as Bool: return b
+        case let n as NSNumber: return n.boolValue
+        case let s as String: return !["", "off", "false", "no", "0"].contains(s.trimmingCharacters(in: .whitespaces).lowercased())
+        default: return false
+        }
     }
-    static var enabled: Bool { current != .off }
+    static var enabled: Bool { isOn(UserDefaults.standard.object(forKey: key)) }
 }
 
 enum OnboardingText {

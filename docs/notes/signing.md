@@ -48,6 +48,25 @@ Up to 0.8.0, releases were signed with the self-signed "Koe Code Signing" certif
 
 Installing a dev build over a Developer ID release (or the other way round) changes the signer, so the Accessibility permission has to be granted again.
 
+### Prerequisites
+
+- Xcode Command Line Tools: `xcode-select --install` (Swift, make, codesign).
+- CMake: `brew install cmake` (to build the bundled whisper-server).
+- OpenSSL: the one that comes with macOS, or `brew install openssl@3`. To use Homebrew's, put it first in the PATH: `export PATH="$(brew --prefix openssl@3)/bin:$PATH"`.
+
+`security import` cannot read a PKCS#12 file written with OpenSSL 3's default encryption and fails with `MAC verification failed during PKCS12 import (wrong password?)`, so the setup exports with `-legacy` on OpenSSL 3 (not on OpenSSL 1.1 or LibreSSL, which do not have the option). If the import still fails, the setup removes the half-made keychain and its password item in the login keychain, and exits with an error. Fix the cause and run the setup again.
+
+### Installing a source build after the dmg
+
+The certificate created on your Mac is not the one the public dmg is signed with, so the `certificate leaf` in the designated requirement differs. System Settings may still show Koe as allowed while `AXIsProcessTrusted()` is false. `make install` compares the designated requirements of the installed app and the new build, and warns on stderr before replacing it when they differ (the install goes on).
+
+1. Quit the dmg's Koe, set up the certificate, and build from source.
+2. Install in the same place as the dmg's Koe. `make install` installs to `~/Applications` by default; when `/Applications/Koe.app` exists it stops before building rather than adding a second Koe.app, and shows both choices. To replace the dmg's app, run `make install INSTALL_DIR=/Applications` in `macos/`.
+3. Quit Koe. In System Settings → Privacy & Security → Accessibility, remove Koe, add the Koe.app you just installed, and turn it on.
+4. Grant the Microphone permission again too. The Microphone list has no remove button, so run `tccutil reset Microphone io.github.chaspy.koe` in Terminal, then start Koe and allow the microphone when it asks on the first recording.
+
+Later updates signed with the same certificate keep the designated requirement, so the permissions stay.
+
 ## Check a build
 ```sh
 bash macos/scripts/check-signature.sh --developer-id macos/build/Koe.app   # release build

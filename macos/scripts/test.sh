@@ -3,7 +3,8 @@
 # XCTest, so each test is compiled with swiftc). A test lists the files it
 # needs, relative to Sources/Koe, on a line of its main.swift:
 #   // test-sources: People.swift AliasReplace.swift
-# Objective-C files (e.g. ../KoeObjC/KoeObjC.m) are compiled with clang, and
+# Objective-C files (e.g. ../KoeObjC/KoeObjC.m) are compiled with clang, C++20 files
+# (../KoeAudioCore/koe_audio.cpp) with clang++, and
 # the include directory next to them is passed to swiftc.
 #   bash scripts/test.sh          # all tests (make test)
 #   bash scripts/test.sh people   # one test (make test T=people)
@@ -34,6 +35,11 @@ for t in $names; do
         obj="build/$t-$(basename "$f" .m).o"
         clang -fobjc-arc -I "$inc" -c "$p" -o "$obj"
         inputs+=("$obj") flags+=(-I "$inc") ;;
+      *.cpp)
+        inc="$(dirname "$p")/include"
+        obj="build/$t-$(basename "$f" .cpp).o"
+        clang++ -std=c++20 -O1 -I "$inc" -c "$p" -o "$obj"
+        inputs+=("$obj") flags+=(-I "$inc" -Xlinker -lc++) ;;
       *) inputs+=("$p") ;;
     esac
   done

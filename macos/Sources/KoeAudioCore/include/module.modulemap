@@ -1,0 +1,4 @@
+module KoeAudioCore {
+    header "koe_audio.h"
+    export *
+}

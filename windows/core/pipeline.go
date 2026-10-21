@@ -28,6 +28,13 @@ type UtteranceRequest struct {
 	AudioCtxFor func(seconds float64, model string) int
 	// OnPass, if set, is called after each request (for logging).
 	OnPass func(attempt int, p Pass)
+	// KeepLines / Timeout go to the whisper-server request (lineBreaks, lock recording).
+	KeepLines bool
+	Timeout   time.Duration
+	// KeepRepeats: a lock recording (long talk) is written out as heard: a
+	// short reply said many times is not a loop, so no retry and no collapsing
+	// (mac does the same). Stock phrases are still removed.
+	KeepRepeats bool
 }
 
 // Pass is one request of an utterance.
@@ -86,7 +93,7 @@ func TranscribeUtterance(ctx context.Context, r UtteranceRequest) UtteranceResul
 	fallback := r.Fallback
 	asr := r.Recognizer
 	if asr == nil {
-		asr = WhisperHTTP{BaseURL: r.BaseURL}
+		asr = WhisperHTTP{BaseURL: r.BaseURL, KeepLines: r.KeepLines, Timeout: r.Timeout}
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		retry := attempt == 0 && !r.SingleShot
@@ -117,7 +124,7 @@ func TranscribeUtterance(ctx context.Context, r UtteranceRequest) UtteranceResul
 			res.Outcome = OutcomeHallucination
 			return res
 		}
-		loop, stock := IsRepetitive(t), HasStockPhrase(t)
+		loop, stock := loopAndStock(t, r.KeepRepeats)
 		if (loop || stock) && retry {
 			if loop {
 				res.RetriedForRepetition, res.RepetitionBeforeRetry = true, t
@@ -150,4 +157,11 @@ func TranscribeUtterance(ctx context.Context, r UtteranceRequest) UtteranceResul
 	}
 	res.Outcome = OutcomeHallucination
 	return res
+}
+
+// loopAndStock reports whether t loops and whether it has a stock phrase. A
+// lock recording (keepRepeats) is written out as heard: a short reply said many
+// times is not treated as a loop.
+func loopAndStock(t string, keepRepeats bool) (loop, stock bool) {
+	return !keepRepeats && IsRepetitive(t), HasStockPhrase(t)
 }

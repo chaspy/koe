@@ -7,6 +7,9 @@ let package = Package(
     targets: [
         // Objective-C shim: catches NSException so AVFAudio errors do not abort the app (see MicTap.swift)
         .target(name: "KoeObjC", path: "Sources/KoeObjC"),
-        .executableTarget(name: "Koe", dependencies: ["KoeObjC"], path: "Sources/Koe"),
-    ]
+        // C++20 port of AudioQuality.swift, imported from koe-audio-core (off by default, see AudioCoreQuality.swift)
+        .target(name: "KoeAudioCore", path: "Sources/KoeAudioCore"),
+        .executableTarget(name: "Koe", dependencies: ["KoeObjC", "KoeAudioCore"], path: "Sources/Koe"),
+    ],
+    cxxLanguageStandard: .cxx20
 )

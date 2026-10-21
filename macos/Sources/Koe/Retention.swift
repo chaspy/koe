@@ -101,12 +101,13 @@ enum Retention {
         for f in left where total > capBytes {
             if isAudio(f.url.lastPathComponent) && remove(f) { total -= f.size }
         }
-        // 空になった日のフォルダ（今日より前）
+        // 空になった日のフォルダ（昨日より前）。History.save はメインスレッドで「フォルダを作る → 録音を移す → json を書く」の順に動き、
+        // これは裏の queue で動くので、日付が変わった直後に、作ったばかりの昨日のフォルダを消さないよう昨日の分は残す。
+        // 消すのは rmdir（空のときだけ消える）。調べてから消す間に書かれたファイルを、フォルダごと消さないため
         if !dryRun {
-            let todayName = fmt.string(from: today)
-            for d in ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []) where isDayDir(d) && d < todayName {
-                let u = dir.appendingPathComponent(d)
-                if ((try? fm.contentsOfDirectory(atPath: u.path)) ?? ["x"]).isEmpty, (try? fm.removeItem(at: u)) != nil { r.dirs += 1 }
+            let keepFrom = fmt.string(from: cal.date(byAdding: .day, value: -1, to: today)!)
+            for d in ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []) where isDayDir(d) && d < keepFrom {
+                if rmdir(dir.appendingPathComponent(d).path) == 0 { r.dirs += 1 }
             }
         }
         r.sizeAfter = dryRun ? total : usage(dir).bytes

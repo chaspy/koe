@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Engines the config "engine" can name. whisper is the default; parakeet is
@@ -29,10 +30,15 @@ type Recognizer interface {
 }
 
 // WhisperHTTP is the local whisper-server (POST /inference).
-type WhisperHTTP struct{ BaseURL string }
+// KeepLines keeps whisper's segments on their own lines; Timeout 0 = 120 s.
+type WhisperHTTP struct {
+	BaseURL   string
+	KeepLines bool
+	Timeout   time.Duration
+}
 
 func (w WhisperHTTP) Recognize(ctx context.Context, wav []byte, prompt string, fallback bool, audioCtx int) (string, error) {
-	return Transcribe(ctx, w.BaseURL, wav, prompt, fallback, audioCtx)
+	return TranscribeLines(ctx, w.BaseURL, wav, prompt, fallback, audioCtx, w.KeepLines, w.Timeout)
 }
 
 // Parakeet-ja (NVIDIA parakeet-tdt_ctc-0.6b-ja, CC-BY-4.0) converted to

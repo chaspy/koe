@@ -23,8 +23,11 @@ type trayItems struct {
 	speed     *systray.MenuItem
 	gpu       *systray.MenuItem
 	keep      map[int]*systray.MenuItem
+	improve   *systray.MenuItem
 	lastTip   string
 	lastIcon  int
+
+	suggestNever *systray.MenuItem
 }
 
 var (
@@ -129,6 +132,24 @@ func (a *App) setupTray() {
 			}
 		}()
 	}
+	t.improve = systray.AddMenuItemCheckbox("改善ループ: オフ（有効にすると使うほど賢くなります）", "誤変換を自分の辞書に足していきます。オンにするときに、送るものと送り先を確かめます", false)
+	go func() {
+		for range t.improve.ClickedCh {
+			go a.toggleImprove()
+		}
+	}()
+	mPreview := systray.AddMenuItem("改善ループで送る内容を見る", "次に送る内容をメモ帳で見せます（何も送りません）")
+	go func() {
+		for range mPreview.ClickedCh {
+			go a.previewImprove()
+		}
+	}()
+	t.suggestNever = systray.AddMenuItemCheckbox("改善ループの提案を出さない", "オフのまま話していると、一度だけ（最大 2 回）トレイの表示で改善ループのことを知らせます。それを止めます", false)
+	go func() {
+		for range t.suggestNever.ClickedCh {
+			go a.toggleSuggestNever()
+		}
+	}()
 	mDiag := systray.AddMenuItem("診断情報を書き出す（送る用）", "デスクトップに zip を作ります（録音・文字起こしの中身は入りません）")
 	go func() {
 		for range mDiag.ClickedCh {

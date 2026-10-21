@@ -39,6 +39,8 @@ type utterance struct {
 	app        string       // exe name of the foreground app at press time
 	hwnd       windows.HWND // foreground window at press time (brought back if another app is in front at paste time)
 	held       time.Duration
+	locked     bool // lock recording (two quick taps): written to a file, not pasted
+	chars      int  // characters of the text before CRLF (logs count like mac)
 	pcm        []int16
 	micKind    core.MicKind // alternate microphone used after a hardware-mute fallback ("" = none)
 	record     map[string]any
@@ -78,7 +80,11 @@ type App struct {
 	queue      chan *utterance
 	cur        *utterance // event loop only
 	recording  atomic.Bool
+	locked     atomic.Bool // the current recording is a lock recording
 	processing atomic.Int32
+
+	improveOn      atomic.Bool // improvement loop on (config improveEnabled; the tray switches it)
+	improveRunning atomic.Bool // one improvement run at a time
 
 	mu        sync.Mutex
 	errMsg    string
@@ -180,6 +186,8 @@ func (a *App) startup() {
 	a.audioCtx.Store(int64(cfg.AudioCtx))
 	a.gpuOff.Store(cfg.GPU == core.GPUOff)
 	a.keepDays.Store(int64(cfg.HistoryKeepDays))
+	a.improveOn.Store(cfg.ImproveEnabled)
+	_ = os.Remove(a.improvePreviewPath()) // the last preview of the improvement loop (text from the history)
 	a.gpuNames = readGPUAdapters()
 	a.usage.Compute = a.computeUsage
 	a.renderHotkey()
@@ -188,6 +196,8 @@ func (a *App) startup() {
 	a.renderSpeedFirst()
 	a.renderGPU()
 	a.renderHistoryKeep()
+	a.renderImprove()
+	go a.checkImproveConsent() // improveEnabled written in config.json: ask before anything is sent
 	a.log.Printf("start Koe %s rev=%s windows=%d.%d.%d cpus=%d exe=%s", version, rev, v.MajorVersion, v.MinorVersion, v.BuildNumber, runtime.NumCPU(), a.exeDir)
 	si := readSysInfo()
 	a.log.Printf("system cpu=%q logical_cpus=%d ram_mb=%d ram_free_mb=%d threads=%d (config threads=%d)",
@@ -206,7 +216,7 @@ func (a *App) startup() {
 	}
 
 	vk := a.hotkeyVK.Load()
-	a.hold = core.HoldTracker{HotkeyVK: vk, MinHold: time.Duration(cfg.MinHoldSeconds * float64(time.Second)), Toggle: a.toggle.Load()}
+	a.hold = core.HoldTracker{HotkeyVK: vk, MinHold: time.Duration(cfg.MinHoldSeconds * float64(time.Second)), Toggle: a.toggle.Load(), DoubleTapLock: cfg.LockRecording}
 	a.rec = NewRecorder(cfg.WarmMic, a.log.Printf)
 	if cfg.FallbackMic {
 		a.rec.fallback = &micFallback{preferred: cfg.FallbackMicName}
@@ -782,17 +792,13 @@ func (a *App) eventLoop(keys <-chan keyEvent) {
 	defer a.recoverLog("eventLoop")
 	for ev := range keys {
 		if vk := a.hotkeyVK.Load(); vk != a.hold.HotkeyVK {
-			if a.cur != nil {
-				a.cancel(ev.at)
-			}
+			a.stopForSettingChange(ev.at)
 			a.holding.Store(false)
 			a.hold.SetHotkey(vk)
 			a.log.Printf("hotkey_applied vk=0x%X", vk)
 		}
 		if tg := a.toggle.Load(); tg != a.hold.Toggle {
-			if a.cur != nil {
-				a.cancel(ev.at)
-			}
+			a.stopForSettingChange(ev.at)
 			a.holding.Store(false)
 			a.hold.SetToggle(tg)
 			a.log.Printf("press_mode_applied toggle=%v", tg)
@@ -838,6 +844,17 @@ func (a *App) eventLoop(keys <-chan keyEvent) {
 				}
 				a.log.Printf("toggle_latched (recording until the next tap)")
 				a.render()
+			case core.ActLock:
+				a.holding.Store(false)
+				if a.cur == nil {
+					a.hold.Reset()
+					break
+				}
+				a.cur.locked = true
+				a.locked.Store(true)
+				a.log.Printf("lock_recording (recording until the next press)")
+				a.playSound("start")
+				a.render()
 			case core.ActFinish:
 				a.holding.Store(false)
 				a.end(ev.at, held)
@@ -848,6 +865,21 @@ func (a *App) eventLoop(keys <-chan keyEvent) {
 			}
 		}
 	}
+}
+
+// stopForSettingChange ends the recording before the hotkey or the press mode
+// changes: a held press is cancelled as before; a recording running with the
+// key up (lock / toggle) may be minutes long, so it is transcribed instead.
+func (a *App) stopForSettingChange(at time.Time) {
+	if a.cur == nil {
+		return
+	}
+	if a.hold.Latched() {
+		a.log.Printf("setting_changed_while_latched -> finish")
+		a.end(at, at.Sub(a.cur.pressedAt))
+		return
+	}
+	a.cancel(at)
 }
 
 func (a *App) begin(ev keyEvent) {
@@ -891,6 +923,7 @@ func (a *App) cancel(at time.Time) {
 	}
 	a.rec.Discard()
 	a.recording.Store(false)
+	a.locked.Store(false)
 	held := at.Sub(u.pressedAt)
 	a.log.Printf("cancelled held=%.2fs", held.Seconds())
 	if held >= time.Second {
@@ -919,6 +952,7 @@ func (a *App) end(at time.Time, held time.Duration) {
 	}
 	u.releasedAt = at
 	u.held = held
+	a.locked.Store(false)
 	a.processing.Add(1)
 	a.tail.Add(1)
 	go func() {
@@ -1009,7 +1043,11 @@ func (a *App) process(u *utterance) {
 	prompt := "" // Parakeet-ja takes no prompt; the terms still go to Autocorrect
 	if !a.parakeet() {
 		terms := core.WhisperTerms(personal, packs, usage, core.WhisperPromptTermLimit)
-		prompt = core.BuildWhisperPrompt(a.cfg.Prompt, terms, a.previousText(u))
+		prev := a.previousText(u)
+		if u.locked {
+			prev = "" // a long talk on its own (mac: the same)
+		}
+		prompt = core.BuildWhisperPrompt(a.cfg.Prompt, terms, prev)
 	}
 	tPrompt := time.Now()
 	rec["engine"] = a.cfg.Engine
@@ -1033,6 +1071,31 @@ func (a *App) process(u *utterance) {
 		return
 	}
 	u.record["release_to_transcribed_ms"] = time.Since(u.releasedAt).Milliseconds()
+	u.chars = len([]rune(text))
+	if u.locked || core.KeepLines(a.cfg.LineBreaks, false, u.app, a.cfg.EnterApps) {
+		// Windows line breaks for the clipboard; done here (not in
+		// setClipboardText) so the text Koe compares when restoring the
+		// clipboard is the same, and the user's own clipboard is never changed
+		text = core.ToCRLF(text)
+	}
+	if u.locked {
+		// not a pasted text: kept out of the recent list and the term counts
+		// (mac: the same); the text stays in "raw"
+		rec["locked"] = true
+		path, err := a.saveLocked(u, text)
+		if err != nil {
+			rec["outcome"] = "lock_save_failed"
+			rec["error"] = core.ErrWithoutDir(err)
+			a.save(u, wav, nil)
+			a.fail("ファイルに保存できませんでした（文はクリップボードにあります）: " + core.ErrWithoutDir(err))
+			return
+		}
+		a.log.Printf("lock_saved chars=%d seconds=%.0f", u.chars, seconds)
+		rec["outcome"] = "lock_saved"
+		a.save(u, wav, nil)
+		a.log.Printf("lock_opened file=%s", filepath.Base(path)) // the opened file is the feedback
+		return
+	}
 	if err := a.paste(u, text); errors.Is(err, errTargetChanged) {
 		// the user moved to another app while Koe was transcribing: do not
 		// paste into it; the text is on the clipboard
@@ -1050,6 +1113,8 @@ func (a *App) process(u *utterance) {
 	}
 	rec["outcome"] = "pasted"
 	a.save(u, wav, &text)
+	a.noteImprovePaste()
+	a.maybeImprove(false)
 	a.usage.RefreshIfStale(time.Now(), core.UsageMaxAge)
 }
 
@@ -1063,7 +1128,15 @@ func (a *App) transcribe(u *utterance, wav []byte, prompt string, voiced float64
 		req := core.UtteranceRequest{
 			WAV: wav, Prompt: prompt, Voiced: voiced, Model: model,
 			AudioCtx: setting, Fallback: a.cfg.TemperatureFallback,
-			Entries: append(append([]core.Entry{}, personal...), packs...),
+			Entries:     append(append([]core.Entry{}, personal...), packs...),
+			KeepLines:   core.KeepLines(a.cfg.LineBreaks, u.locked, u.app, a.cfg.EnterApps),
+			KeepRepeats: u.locked,
+		}
+		if u.locked {
+			req.Timeout = core.LockTimeout(core.Seconds(u.pcm))
+		}
+		if req.KeepLines {
+			rec["keep_lines"] = true
 		}
 		key := "whisper"
 		if a.asr != nil {
@@ -1189,7 +1262,7 @@ func (a *App) paste(u *utterance, text string) error {
 		}
 	}
 	if decision != core.FocusPaste {
-		a.log.Printf("paste_target_changed start_app=%s paste_app=%s chars=%d -> clipboard only", u.app, name, len([]rune(text)))
+		a.log.Printf("paste_target_changed start_app=%s paste_app=%s chars=%d -> clipboard only", u.app, name, u.chars)
 		if err := setClipboardText(text); err != nil {
 			return err
 		}
@@ -1218,7 +1291,7 @@ func (a *App) paste(u *utterance, text string) error {
 	ms := time.Since(u.releasedAt).Milliseconds()
 	u.record["release_to_paste_ms"] = ms
 	u.record["paste_key"] = pasteKey
-	a.log.Printf("paste app=%s start_app=%s key=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, u.app, pasteKey, len([]rune(text)), time.Since(t0).Milliseconds(), ms)
+	a.log.Printf("paste app=%s start_app=%s key=%s chars=%d clipboard_ms=%d release_to_paste_ms=%d", name, u.app, pasteKey, u.chars, time.Since(t0).Milliseconds(), ms)
 
 	entered := false
 	if a.cfg.AutoEnter && core.IsTerminal(exe, a.cfg.EnterApps) && u.record["synced_pack_replaced"] == true {
@@ -1427,6 +1500,8 @@ func (a *App) statusText() string {
 		return a.busyMsg
 	case a.download >= 0:
 		return fmt.Sprintf("モデル取得中 %.0f%%", a.download)
+	case a.recording.Load() && a.locked.Load():
+		return "ロック録音中（もう一度 " + core.HotkeyLabel(a.hotkey()) + " を押すと終了、ファイルに保存）"
 	case a.recording.Load() && a.toggle.Load():
 		return "録音中（もう一度 " + core.HotkeyLabel(a.hotkey()) + " を押すと終了）"
 	case a.recording.Load():

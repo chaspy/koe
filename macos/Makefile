@@ -36,7 +36,12 @@ build:
 
 # 録音中・文字起こし中なら終わるまで待ってから入れ替える（使いながら入れ直しても発話を失わない）
 STATE := $(HOME)/Library/Application Support/Koe/state
-install: build
+# /Applications に Koe.app（公開版の dmg など）があるのに既定の ~/Applications へ入れると、Koe.app が 2 つ並ぶ。
+# ビルドの前に止めて、どちらにするかを知らせる（INSTALL_DIR を指定したときはそのとおりに入れる）
+check-install-dir:
+	@bash scripts/check-install-dir.sh "$(INSTALL_DIR)" "$(origin INSTALL_DIR)"
+install: check-install-dir build
+	@bash scripts/check-install-signature.sh "$(INSTALL_DIR)/$(APP_NAME).app" "$(BUNDLE)"
 	@for i in $$(seq 1 120); do [ "$$(cat "$(STATE)" 2>/dev/null)" = "busy" ] || break; sleep 0.5; done
 	-osascript -e 'tell application id "io.github.chaspy.koe" to quit' 2>/dev/null
 	@for i in $$(seq 1 40); do pgrep -x $(APP_NAME) >/dev/null || break; sleep 0.5; done
@@ -68,8 +73,10 @@ notarize: dist
 T ?=
 test:
 	bash scripts/test.sh $(T)
+	# 署名・入れ替えのシェルスクリプト（openssl・security・codesign は偽物に差し替える。本物の鍵束やアプリには触らない）
+	@if [ -z "$(T)" ]; then python3 scripts/tests/test_signing.py; fi
 
 clean:
 	rm -rf .build build
 
-.PHONY: build install dist notarize clean test
+.PHONY: build install check-install-dir dist notarize clean test

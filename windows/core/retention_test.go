@@ -1,6 +1,8 @@
 package core
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -150,5 +152,97 @@ func TestHistoryPruneCap(t *testing.T) {
 	b, files, oldestDay := HistoryUsage(dir)
 	if b != r.SizeAfter || files == 0 || oldestDay != oldest {
 		t.Fatalf("usage %d %d %s vs %+v", b, files, oldestDay, r)
+	}
+}
+
+// Right after midnight the folder of an utterance pressed before midnight may
+// still be empty (SaveHistory creates it, then writes): it must not be removed.
+func TestHistoryPruneKeepsYesterdaysEmptyFolder(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 10, 17, 0, 0, 5, 0, time.Local) // 5 s after midnight
+	name := func(n int) string { return now.AddDate(0, 0, -n).Format("2006-01-02") }
+	for _, n := range []int{0, 1, 2, 30} {
+		if err := os.MkdirAll(filepath.Join(dir, name(n)), 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// an old day folder with a file in it is never removed as a folder
+	put(t, dir, name(3), "a.json", 10, now.Add(-time.Hour))
+
+	r := HistoryPrune(dir, 14, HistoryCapBytes, now)
+	for _, n := range []int{0, 1, 3} {
+		if _, err := os.Stat(filepath.Join(dir, name(n))); err != nil {
+			t.Errorf("day -%d folder must stay: %v", n, err)
+		}
+	}
+	for _, n := range []int{2, 30} {
+		if _, err := os.Stat(filepath.Join(dir, name(n))); !os.IsNotExist(err) {
+			t.Errorf("empty day -%d folder is removed", n)
+		}
+	}
+	if r.Dirs != 2 {
+		t.Errorf("removed dirs %d", r.Dirs)
+	}
+
+	// the save of an utterance pressed before midnight still lands after the prune
+	id := NewHistoryID(now.Add(-10 * time.Second))
+	if err := SaveHistory(dir, id, []byte("RIFF"), map[string]any{"outcome": "pasted"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, name(1), id+".wav")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// SaveHistory creates the day folder again if it is removed between creating
+// it and writing (HistoryPrune right after midnight).
+func TestWriteDayFileRecreatesFolder(t *testing.T) {
+	defer func() { beforeDayWrite = nil }()
+	day := filepath.Join(t.TempDir(), "2026-10-16")
+	calls := 0
+	beforeDayWrite = func(d string) {
+		calls++
+		if calls == 1 {
+			if err := os.Remove(d); err != nil { // the folder is empty here, as for HistoryPrune
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := writeDayFile(day, "a.wav", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := fs.ReadFile(os.DirFS(day), "a.wav"); err != nil || string(b) != "x" || calls != 2 {
+		t.Fatalf("second try: %q %v calls=%d", b, err, calls)
+	}
+
+	// any error is tried once more (Windows: a "delete pending" folder gives
+	// ERROR_ACCESS_DENIED for a moment). The write is replaced, so this runs
+	// the same on every OS.
+	beforeDayWrite = nil
+	defer func() { dayWriteFile = os.WriteFile }()
+	denied := func(name string) error {
+		return &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
+	}
+	day2 := filepath.Join(t.TempDir(), "2026-10-17")
+	calls = 0
+	dayWriteFile = func(name string, data []byte, perm os.FileMode) error {
+		calls++
+		if calls == 1 {
+			return denied(name)
+		}
+		return os.WriteFile(name, data, perm)
+	}
+	if err := writeDayFile(day2, "a.json", []byte("{}")); err != nil || calls != 2 {
+		t.Fatalf("access denied once: %v calls=%d", err, calls)
+	}
+	if _, err := os.Stat(filepath.Join(day2, "a.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// still failing after the second try: the error is returned
+	calls = 0
+	dayWriteFile = func(name string, data []byte, perm os.FileMode) error { calls++; return denied(name) }
+	if err := writeDayFile(day2, "b.json", []byte("{}")); !errors.Is(err, fs.ErrPermission) || calls != 2 {
+		t.Fatalf("access denied twice: %v calls=%d", err, calls)
 	}
 }

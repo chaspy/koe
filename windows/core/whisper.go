@@ -191,11 +191,20 @@ func BuildInferenceBody(wav []byte, prompt string, fallback bool, audioCtx int) 
 
 // Transcribe posts wav to /inference and returns the cleaned text.
 func Transcribe(ctx context.Context, baseURL string, wav []byte, prompt string, fallback bool, audioCtx int) (string, error) {
+	return TranscribeLines(ctx, baseURL, wav, prompt, fallback, audioCtx, false, 0)
+}
+
+// TranscribeLines is Transcribe, keeping whisper's segments on their own
+// lines when keepLines, and waiting up to timeout (0 = 120 s).
+func TranscribeLines(ctx context.Context, baseURL string, wav []byte, prompt string, fallback bool, audioCtx int, keepLines bool, timeout time.Duration) (string, error) {
 	body, ct, err := BuildInferenceBody(wav, prompt, fallback, audioCtx)
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/inference", bytes.NewReader(body))
 	if err != nil {
@@ -218,5 +227,5 @@ func Transcribe(ctx context.Context, baseURL string, wav []byte, prompt string, 
 		}
 		return "", fmt.Errorf("whisper-server HTTP %d: %s", resp.StatusCode, s)
 	}
-	return CleanServerText(string(raw)), nil
+	return CleanServerTextLines(string(raw), keepLines), nil
 }

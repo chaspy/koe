@@ -1,4 +1,4 @@
-// test-sources: ImproveSuggest.swift ImproveStep.swift
+// test-sources: ImproveSuggest.swift ImproveStep.swift ImproveCommand.swift
 // make test: Sources/Koe/ImproveSuggest.swift の単体テスト（XCTest なしで動く）
 import Foundation
 
