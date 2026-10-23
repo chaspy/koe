@@ -30,3 +30,22 @@ Run the dry run first; it stops at the first problem. It works in its own worktr
 8. **Check**: download the published dmg (the dry run uses the local one), compare its checksum, and run `codesign --verify --deep --strict`, the Developer ID checks, `spctl -a -vvv -t install` on the dmg and `spctl -t exec` on the app (with `--no-notarize` spctl is expected to reject; its result is printed but does not stop the script).
 
 If something fails after step 7 started, finish the remaining commands of step 7 by hand (they are printed by a dry run) rather than rerunning the script: the version is already used.
+
+## Accessibility re-grant notice (macOS)
+
+When a release changes the signing identity, add a `Re-grant:` item under the
+`### macOS` section of its changelog fragment, for example:
+
+```markdown
+### macOS
+- Re-grant: Signing identity changes; allow Accessibility again after updating.
+```
+
+The macOS updater scans the whole target version's macOS section, even when this
+item is not first. It shows a separate, untruncated Japanese warning before
+installation, including removing Koe with − and adding it again with + if the
+switch already looks on. The menu update action also shows this confirmation.
+Releases without the marker keep their usual summary. This marker does not change
+signing, grant permissions, or reset TCC. Older clients without marker support do
+not recognize it; it cannot retrofit a pre-update warning into an installed old
+version. Include the warning in the first item too when supporting those clients.

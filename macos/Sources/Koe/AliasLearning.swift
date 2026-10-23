@@ -8,7 +8,7 @@ enum AliasLearning {
     ]
 
     static func isCommon(_ alias: String) -> Bool {
-        alias.count <= 3 || !alias.unicodeScalars.contains {
+        alias.count <= 3 || TermRules.isCommonWord(alias) || !alias.unicodeScalars.contains {
             (0x30A0...0x30FF).contains($0.value) || (CharacterSet.letters.contains($0) && $0.isASCII)
         }
     }
@@ -37,17 +37,48 @@ enum AliasLearning {
         return aliases
     }
 
+    // Count each literal alias once per utterance, never duplicate LLM rows or inferred variants.
+    static func observedCounts(term: String, aliases: [String], index: Int?, transcripts: [Int: String],
+                               previous: [String: Int], seen: inout Set<String>) -> [String: Int] {
+        guard let index, let transcript = transcripts[index] else { return previous }
+        var counts = previous
+        for alias in aliases {
+            let plain = alias.hasPrefix("~") ? String(alias.dropFirst()) : alias
+            let key = "\(term)\u{0}\(plain)\u{0}\(index)"
+            guard !seen.contains(key), AliasReplace.apply(transcript, wrong: plain, right: plain).hit else { continue }
+            seen.insert(key)
+            counts[plain, default: 0] += 1
+        }
+        return counts
+    }
+
+    static func merged(existing: [String], learned: [String]) -> [String] {
+        let definite = Set(learned.filter { !$0.hasPrefix("~") })
+        return Array(Set(existing.filter { !$0.hasPrefix("~") || !definite.contains(String($0.dropFirst())) } + learned)).sorted()
+    }
+
     static func stored(_ aliases: [String], sure: Bool, anchored: Bool, person: Bool,
-                       ordinaryWordNotes: Bool) -> [String] {
+                       ordinaryWordNotes: Bool, observations: [String: Int] = [:], englishWords: Set<String>? = nil) -> [String] {
         var result: [String] = []
         for alias in aliases {
             let plain = alias.hasPrefix("~") ? String(alias.dropFirst()) : alias
+            let asciiWord = plain.unicodeScalars.allSatisfy { $0.isASCII && CharacterSet.letters.contains($0) }
+            let common = isCommon(plain) || (asciiWord && (englishWords?.contains(plain.lowercased()) ?? true))
             // Option (a): new ordinary-word aliases are opt-in and always memo-only.
-            if !person && isCommon(plain) && !ordinaryWordNotes { continue }
-            let replace = (sure || anchored) && !isCommon(plain) && (!person || plain.contains(">"))
-            let value = replace && !alias.hasPrefix("~") ? plain : "~" + plain
+            if !person && common && !ordinaryWordNotes { continue }
+            let repeated = !person && (observations[plain] ?? 0) >= 2
+            let replace = (sure || anchored || repeated) && !common && (!person || plain.contains(">"))
+            let value = replace && (!alias.hasPrefix("~") || repeated) ? plain : "~" + plain
             if !result.contains(value) { result.append(value) }
         }
         return result
     }
+}
+
+// System vocabulary only; no user dictionary or history. Missing vocabulary fails conservatively for English aliases.
+enum AliasVocabulary {
+    static let englishWords: Set<String>? = {
+        guard let text = try? String(contentsOfFile: "/usr/share/dict/words", encoding: .utf8) else { return nil }
+        return Set(text.split(whereSeparator: \.isNewline).map { $0.lowercased() })
+    }()
 }

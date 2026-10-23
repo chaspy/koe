@@ -5,38 +5,41 @@ import Foundation
 var failures = 0
 func check(_ ok: Bool, _ msg: @autoclosure () -> String) { if !ok { failures += 1; print("FAIL: \(msg())") } }
 
-// 段: 許可 → マイク → キー → 貼ってみる。最後の段だけ本物の録音に回す
-check(OnboardingStep.allCases.map(\.short) == ["許可", "マイク", "キー", "貼ってみる", "賢くする"], "steps in order")
+// 段: 使い方 → 許可 → マイク → キー → 貼ってみる。最後の段だけ本物の録音に回す
+check(OnboardingStep.allCases.map(\.short) == ["使い方", "許可", "マイク", "キー", "貼ってみる", "賢くする"], "steps in order")
 
-// 流れ: 既定はオフ。案を選んでいたころの値が残っていても、オンとして同じ流れ
-let d = UserDefaults.standard
-let savedFlow = d.object(forKey: OnboardingFlow.key)
-d.removeObject(forKey: OnboardingFlow.key)
-check(!OnboardingFlow.enabled, "default off")
-d.set("short", forKey: OnboardingFlow.key)
-check(OnboardingFlow.enabled, "an old choice (short) still turns it on")
-d.set(false, forKey: OnboardingFlow.key)
-check(!OnboardingFlow.enabled, "-bool false is off")
-if let savedFlow { d.set(savedFlow, forKey: OnboardingFlow.key) } else { d.removeObject(forKey: OnboardingFlow.key) }
+// 旧設定値の読み取り互換性
 for v: Any in ["on", "steps", "auto", "short", "B", "true", "1", true, 1] {
     check(OnboardingFlow.isOn(v), "\(v) → on")
 }
 for v: Any? in [nil, "off", "OFF", " off ", "", "false", "no", "0", false, 0] {
     check(!OnboardingFlow.isOn(v), "\(String(describing: v)) → off")
 }
-let four: [OnboardingStep] = [.permissions, .mic, .key, .paste]
-check(OnboardingFlow.steps == four, "all four steps")
+let five: [OnboardingStep] = [.expectations, .permissions, .mic, .key, .paste]
+check(OnboardingFlow.steps == five, "all five steps")
 // 使うほど賢くする（#168）: 決まっていないときだけ最後に足す。足さないときは前と同じ並び
-check(OnboardingFlow.steps(improve: false) == four && OnboardingFlow.steps(improve: true) == four + [.improve], "improve is appended last")
+check(OnboardingFlow.steps(improve: false) == five && OnboardingFlow.steps(improve: true) == five + [.improve], "improve is appended last")
 check(OnboardingFlow.next(after: .paste, improve: true) == .improve && OnboardingFlow.next(after: .paste) == nil, "paste → improve only when shown")
 check(OnboardingFlow.next(after: .improve, improve: true) == nil && OnboardingFlow.previous(before: .improve, improve: true) == .paste, "improve is the last step")
 check(!OnboardingStep.improve.practisesKey, "the improve step does not take the key")
 check(OnboardingFlow.next(after: .permissions) == .mic && OnboardingFlow.next(after: .key) == .paste
       && OnboardingFlow.next(after: .paste) == nil, "next")
-check(OnboardingFlow.previous(before: .mic) == .permissions && OnboardingFlow.previous(before: .permissions) == nil, "previous")
+check(OnboardingFlow.previous(before: .mic) == .permissions && OnboardingFlow.previous(before: .permissions) == .expectations, "previous")
 check(OnboardingFlow.next(after: .improve) == nil, "a step not in the flow has no next")
-check(OnboardingStep.allCases.filter(\.practisesKey) == [.permissions, .mic, .key], "only the last step records for real")
+check(OnboardingStep.allCases.filter(\.practisesKey) == [.expectations, .permissions, .mic, .key], "only the last step records for real")
 check(OnboardingText.keyName(54) == "右⌘" && OnboardingText.keyName(63) == "fn" && OnboardingText.keyName(99) == "keyCode 99", "key names")
+
+// Fresh install and the first five successful pastes are pure decisions.
+for welcome in [false, true] {
+    for existing in [false, true] {
+        check(OnboardingFlow.isFreshInstall(welcomeShown: welcome, hasExistingSettings: existing) == (!welcome && !existing), "fresh install matrix")
+    }
+}
+check(OnboardingFlow.next(after: .expectations) == .permissions, "expectations precede permissions")
+for count in -1...7 {
+    check(OnboardingFlow.showsPasteHint(successfulPastes: count, recording: false) == (1...5).contains(count), "first five only")
+    check(!OnboardingFlow.showsPasteHint(successfulPastes: count, recording: true), "never during recording")
+}
 
 // マイクテスト: しきい値を合わせて 0.4 秒超えたら合格。6 秒聞こえなければ直し方を出す
 var m = MicTest()

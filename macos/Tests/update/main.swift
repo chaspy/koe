@@ -46,6 +46,23 @@ check(s.summary(changelog: md, version: "0.4.2", platform: "macOS").line == "Old
 let none = s.summary(changelog: md, version: "0.9.9", platform: "macOS")
 check(none.line == nil && !none.noChanges, "missing section")
 
+// 先頭以外の Re-grant も省略せず拾う。対象版・macOS 節の外には波及させない。
+let marked = md.replacingOccurrences(of: "- Second item.", with: "- Second item.\n- Re-grant: Signing identity changes.")
+let markedSummary = s.summary(changelog: marked, version: "0.5.0", platform: "macOS", maxLength: 20)
+check(markedSummary.requiresRegrant && markedSummary.line?.count == 20, "marker separate from truncated summary")
+check(!s.summary(changelog: marked, version: "0.4.2", platform: "macOS").requiresRegrant, "no marker in older version")
+check(!s.summary(changelog: marked, version: "0.5.0", platform: "Windows").requiresRegrant, "macOS marker does not affect Windows")
+check(!mac.requiresRegrant && !none.requiresRegrant, "unmarked and missing releases unchanged")
+let markerOnly = "## 1.0.0\n### macOS\n- Re-grant: Required.\n### Windows\n- No changes."
+let only = s.summary(changelog: markerOnly, version: "1.0.0", platform: "macOS")
+check(only.requiresRegrant && only.line == nil && !only.noChanges, "marker-only release prompts")
+let firstMarker = markerOnly.replacingOccurrences(of: "### Windows", with: "- Fixed: Other change.\n### Windows")
+check(s.summary(changelog: firstMarker, version: "1.0.0", platform: "macOS").line == "Fixed: Other change.", "marker before normal summary")
+let winMarker = "## 1.0.0\n### macOS\n- Fixed: Other change.\n### Windows\n- Re-grant: Required."
+check(!s.summary(changelog: winMarker, version: "1.0.0", platform: "macOS").requiresRegrant, "ignore Windows marker")
+let contradictory = markerOnly.replacingOccurrences(of: "- Re-grant:", with: "- No changes.\n- Re-grant:")
+check(!s.summary(changelog: contradictory, version: "1.0.0", platform: "macOS").noChanges, "regrant overrides no changes")
+
 // 確認の画面: Enter / Esc で「今すぐ更新」が押されない（既定は「あとで」）
 final class Recorder: NSObject {
     var pressed: [String] = []
@@ -56,6 +73,11 @@ _ = NSApplication.shared
 let rec = Recorder()
 let alert = UpdatePrompt.makeAlert(version: "0.5.0", line: "Fixed something.", target: rec, now: #selector(Recorder.now), later: #selector(Recorder.later))
 alert.layout()
+let warning = UpdatePrompt.makeAlert(version: "1.0.0", line: markedSummary.line,
+                                     requiresRegrant: true, target: rec, now: #selector(Recorder.now), later: #selector(Recorder.later))
+check(warning.informativeText.hasPrefix(UpdatePrompt.regrantNotice + "\n\n"), "complete warning shown before summary")
+check(warning.informativeText.contains("「−」") && warning.informativeText.contains("「+」"), "warning includes repair steps")
+check(!alert.informativeText.contains(UpdatePrompt.regrantNotice), "unmarked alert unchanged")
 let buttons = alert.buttons
 check(buttons.first?.title == "あとで" && buttons.first?.keyEquivalent == "\r", "default (Return) button is あとで: \(buttons.map { ($0.title, $0.keyEquivalent) })")
 let nowButton = buttons.first { $0.title == "今すぐ更新" }

@@ -7,6 +7,8 @@
 
 # koe
 
+Koe is for talking to an AI such as Claude Code or ChatGPT. Small transcription mistakes usually do not need fixing: send them as they are and let the AI understand your intent. Koe is not yet suited to final text pasted straight into chat or documents; ask the AI to polish what you said instead.
+
 Local voice input for macOS and Windows (preview) using [whisper.cpp](https://github.com/ggerganov/whisper.cpp). Audio never leaves your machine. Hold a key to talk, release to paste into any app.
 
 ## Platforms

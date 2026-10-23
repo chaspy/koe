@@ -51,7 +51,7 @@ def is_version(title, version):
     return title == version or title.startswith(version + " ")
 
 
-def notes(text, version, install, notarized=True, mac_only=False):
+def notes(text, version, install, notarized=True, mac_only=False, intro=""):
     lines = text.split("\n")
     try:
         start, end = find_section(lines, lambda t: is_version(t, version))
@@ -66,7 +66,8 @@ def notes(text, version, install, notarized=True, mac_only=False):
         if not any(p.startswith("Windows") for p in paragraphs):
             raise ChangelogError("install notes have no Windows paragraph to replace")
         install = "\n\n".join(WINDOWS_HELD if p.startswith("Windows") else p for p in paragraphs)
-    return f"## Changes\n\n{body}\n\n## Install\n{install}\n"
+    prefix = intro.strip() + "\n\n" if intro.strip() else ""
+    return prefix + f"## Changes\n\n{body}\n\n## Install\n{install}\n"
 
 
 def main(argv=None):
@@ -80,8 +81,10 @@ def main(argv=None):
     try:
         with open(a.file, encoding="utf-8") as f:
             text = f.read()
+        with open(os.path.join(HERE, "intro-notes.md"), encoding="utf-8") as f:
+            intro = f.read()
         with open(a.install, encoding="utf-8") as f:
-            sys.stdout.write(notes(text, a.version, f.read(), notarized=not a.not_notarized, mac_only=a.mac_only))
+            sys.stdout.write(notes(text, a.version, f.read(), notarized=not a.not_notarized, mac_only=a.mac_only, intro=intro))
     except (ChangelogError, OSError) as e:
         print(f"notes: error: {e}", file=sys.stderr)
         return 1

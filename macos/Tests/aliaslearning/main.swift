@@ -1,4 +1,4 @@
-// test-sources: AliasLearning.swift AliasReplace.swift ../../Tests/TestSupport.swift
+// test-sources: AliasLearning.swift AliasReplace.swift TermRules.swift ../../Tests/TestSupport.swift
 import Foundation
 
 let term = "Example Security"
@@ -31,5 +31,25 @@ check(AliasLearning.stored(["パン粉>さん"], sure: true, anchored: true, per
 let learned = AliasLearning.stored([long, short], sure: true, anchored: false, person: false, ordinaryWordNotes: false)
 check(learned == [long, short], "both unambiguous aliases learned")
 check(AliasReplace.apply(short, wrong: learned[1], right: term).text == term, "standalone short alias is corrected")
+let madeUp = "ネブロロン"
+func stored(_ aliases: [String], counts: [String: Int], words: Set<String>? = []) -> [String] {
+    AliasLearning.stored(aliases, sure: false, anchored: false, person: false,
+                         ordinaryWordNotes: true, observations: counts, englishWords: words)
+}
+check(stored([madeUp], counts: [madeUp: 1]) == ["~" + madeUp], "one observation remains a hint")
+check(stored(["~" + madeUp], counts: [madeUp: 2]) == [madeUp], "second observation promotes made-up form")
+check(stored(["ネブロラン"], counts: [madeUp: 9]) == ["~ネブロラン"], "counts are per alias")
+for word in ["鏡", "確認", "オーケー", "how", "orange"] {
+    check(stored([word], counts: [word: 20], words: ["orange"]) == ["~" + word], "ordinary word stays hint-only")
+}
+check(stored(["nebulonn"], counts: ["nebulonn": 2], words: []) == ["nebulonn"], "misspelling can become definite")
+check(stored(["nebulonn"], counts: ["nebulonn": 2], words: nil) == ["~nebulonn"], "missing English vocabulary is conservative")
+var seen = Set<String>()
+let once = AliasLearning.observedCounts(term: "Nebulon", aliases: [madeUp], index: 0, transcripts: [0: madeUp], previous: [:], seen: &seen)
+let duplicate = AliasLearning.observedCounts(term: "Nebulon", aliases: [madeUp], index: 0, transcripts: [0: madeUp], previous: once, seen: &seen)
+check(duplicate[madeUp] == 1, "duplicate LLM rows do not count twice")
+let twice = AliasLearning.observedCounts(term: "Nebulon", aliases: [madeUp, "ネブロラン"], index: 1, transcripts: [1: madeUp], previous: duplicate, seen: &seen)
+check(twice[madeUp] == 2 && twice["ネブロラン"] == nil, "only literal observations count")
+check(AliasLearning.merged(existing: ["~" + madeUp, "~鏡"], learned: [madeUp]) == [madeUp, "~鏡"].sorted(), "promotion removes obsolete memo form only")
 if failures > 0 { exit(1) }
 print("aliaslearning: ok")

@@ -4,6 +4,19 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 Changes that are not released yet are in [`changelog.d/`](changelog.d/), one file per pull request; they are folded into a version section here when a release is made (`python3 scripts/changelog.py release <version>`).
 
+## 0.9.4 — 2026-10-23
+
+### macOS
+- Fixed: アクセシビリティがオンに見えても貼り付けられない場合、Koe を「−」で削除して「+」で再追加する手順をメニューと常時有効の案内に表示します。
+- Fixed: 署名変更を Re-grant: で記した版では、更新前にアクセシビリティの再許可が必要な旨と再追加の手順を表示します。
+- Added: Optional automatic restart after an unexpected exit. Enable it explicitly from the menu; it is off by default and stays stopped after an intentional quit.
+- Added: 改善ループの聞き間違い判定を履歴に保存し、日次レポートに聞き間違い率と伝わらなかった率を表示します。7日間に3回以上の同じ誤認識は、プロンプトの用語選択とエンジン限界に分けてローカル報告に表示します。標準出力とイベントは数値集計だけです。
+- Added: 新規インストールの初回案内で、AI に話しかける使い方と合成例を紹介します。既存利用者には自動表示しません。新規利用者の最初の 5 回の貼り付け成功後に、小さな聞き間違いはそのまま送れると案内します。
+- Fixed: 用語選択で直近 300 発話の raw に出た別名（~ のヒントを含む）も数え、聞き間違いが続く語をプロンプトへ優先します。改善ループは非一般語の別名を異なる発話で 2 回確認すると置き換え候補にし、短い語・一般語・英単語は保護します。
+
+### Windows
+- No changes.
+
 ## 0.9.3 — 2026-10-23
 
 ### macOS

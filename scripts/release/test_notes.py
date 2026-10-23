@@ -17,6 +17,10 @@ class NotesTest(unittest.TestCase):
         out = notes.notes(text, "0.9.0", "get Koe-{version}.dmg\n")
         self.assertEqual(out, "## Changes\n\n### macOS\n- a\n\n### Windows\n- b\n\n## Install\nget Koe-0.9.0.dmg\n")
 
+    def test_expectations_precede_changes(self):
+        out = notes.notes(HEAD + OLD, "0.8.0", "install", intro="Talk to an AI.")
+        self.assertTrue(out.startswith("Talk to an AI.\n\n## Changes"))
+
     def test_notarization_note(self):
         text = HEAD + OLD
         self.assertIn("and notarized", notes.notes(text, "0.8.0", "Koe-{version}.dmg. {gatekeeper}"))

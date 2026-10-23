@@ -21,6 +21,8 @@ high path scripts/*
 high path macos/Package.swift
 high path macos/scripts/*
 high path macos/*.entitlements
+# Opt-in LaunchAgent installation and automatic relaunch policy
+high path macos/Sources/Koe/AutoRestart.swift
 high path macos/Sources/Koe/UpdatePrompt.swift
 # In-app update: checking the signature of the downloaded app before it replaces Koe (#177)
 high path macos/Sources/Koe/UpdateVerify.swift

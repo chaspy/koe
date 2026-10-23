@@ -215,3 +215,24 @@ for 4,200 scored requests.
   - peak RSS of the engine process
   - model size and licence
 - **Limits**: `nice 15` and 4 threads. The run stops when free plus inactive memory drops below 6 GB (`--min-available-gb`). Only numbers are printed and stored (`asr-results.json` in the cache); no transcript is kept.
+
+### 聞き間違い率と反復ペア
+
+`koe_eval.py daily` は、履歴の `asr_error` と従来の `communication` から
+「聞き間違い」「伝わらなかった」を日別に表示します。対象期間は既存の `--days` と同じ
+録音日時基準、分母は understood + corrected（unclear は別欄）です。
+`asr_error` のない旧履歴が判定済み件数に混在する日は、聞き間違い率を `-` とし推測しません。
+`improve_judged` の judged はループで保存できた判定件数（unclear を含む）です。
+
+標準出力は数値集計だけです。`reports/daily-YYYY-MM-DD.md` のローカル報告だけに、
+7日間で同じ wrong/right が3発話以上のペアを表示します。既存の候補採用条件を通ったペアを
+発話履歴の `mishearings` に記録するため、候補ファイルの累積回数を7日間の回数と誤認しません。
+履歴に保存した `prompt_terms` に正しい語が毎回あれば「エンジン限界」、一度でも無ければ
+「辞書・用語選択」、欠損だけで有無が確定しなければ「分類保留」です。
+別名の登録は提案だけで、このレポートは辞書を変更しません。
+
+新しい履歴フィールドは `asr_error`（回答に error があるときだけ）、`read_ok`（bool/null）、
+`impact`（misacted/redo/dropped/null）、`unknown`、`judged_at`、`prompt_terms`、`mishearings`。
+従来の communication / communication_impact は維持します。新しい語の記録は履歴内だけで、
+既存の履歴保持期間が適用されます。日次報告は既存と同じローカル reports 内に保存します。
+Windows への対応は別途です。

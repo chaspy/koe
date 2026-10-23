@@ -24,10 +24,18 @@ check(c.shouldShow(manual: true, lastClosed: now.addingTimeInterval(-1), now: no
 
 // 文言: 外れたとき（一度は許可されていた）は「−」で消して入れ直す手順。マイクは外に送らないと書く
 let t = PermissionText.self
-check(t.steps(.accessibility, stale: true).first?.contains("「−」で消す") == true, "stale: remove first")
-check(t.steps(.accessibility, stale: true).last?.contains("ドラッグ") == true, "stale: drag back in")
-check(t.steps(.accessibility, stale: false).first?.contains("スイッチをオン") == true, "fresh: turn on")
-check(!t.steps(.accessibility, stale: false).joined().contains("−"), "fresh: no remove step")
+for stale in [false, true] {
+    let steps = t.steps(.accessibility, stale: stale).joined()
+    check(steps.contains("すでに Koe がオン") && steps.contains("「−」で削除") && steps.contains("「+」で Koe を追加し直"),
+          "re-add instructions regardless of trusted history")
+}
+check(t.accessibilityMenu.contains("「−」") && t.accessibilityMenu.contains("「+」"), "menu explains re-add")
+check(c.guidedMissing(ax: false, mic: .denied, extendedGuide: false) == [.accessibility], "default: accessibility repair enabled")
+check(c.guidedMissing(ax: true, mic: .denied, extendedGuide: false).isEmpty, "default: mic guide still opt-in")
+check(c.guidedMissing(ax: false, mic: .denied, extendedGuide: true) == [.accessibility, .microphone], "both guides enabled")
+check(c.guidedMissing(ax: true, mic: .authorized, extendedGuide: false).isEmpty, "no repair when trusted")
+check(Permission.accessibility.settingsURL.absoluteString ==
+      "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility", "exact accessibility settings URL")
 check(t.title(.accessibility, stale: true).contains("外れています") && t.title(.accessibility, stale: false).contains("必要です"), "stale title")
 check(t.reason(.accessibility, stale: true).contains("オンに見えていても"), "stale reason")
 check(t.reason(.microphone, stale: false).contains("外に送りません"), "mic: says audio stays local")
@@ -63,7 +71,7 @@ check(o5 == CGPoint(x: 2212, y: 600), "second screen \(o5)")
 let r = pl.cocoaRect(CGRect(x: 10, y: 50, width: 700, height: 600), primaryHeight: 900)
 check(r == CGRect(x: 10, y: 250, width: 700, height: 600), "flip coordinates \(r)")
 
-// 既定はオフ（permissionGuide を入れたときだけ新しい案内）
+// マイクの追加ガイドは従来どおり既定オフ（アクセシビリティは guidedMissing で常時有効）
 let savedFlag = UserDefaults.standard.object(forKey: "permissionGuide")
 UserDefaults.standard.removeObject(forKey: "permissionGuide")
 check(!PermissionGuide.enabled, "off by default")

@@ -7,7 +7,7 @@ import ApplicationServices
 // - システム設定の窓を動かすと付いていく。システム設定が開いていなければ画面の右上（メニューバーの Koe の下あたり）
 // - 許可されたら自動で「オンになりました」と出して閉じる。もう一方の許可も無ければ続けてそちらを案内する
 // - 一度は許可されていたのに外れた（更新で署名が変わった等）ときは、一覧で「オン」に見えても効いていないので、
-//   「−」で消してアイコンをドラッグし直す手順を出す（0.5.0 の案内を広げたもの）
+//   「−」で消して「+」で追加し直す手順を出す。許可の履歴がない場合も条件付きで案内する。
 // 送るもの・書くものは増やさない。events には許可の種類ときっかけだけを書く
 enum Permission: String {
     case accessibility, microphone
@@ -35,6 +35,11 @@ enum PermissionCheck {
         missing(ax: AXIsProcessTrusted(), mic: AVCaptureDevice.authorizationStatus(for: .audio))
     }
 
+    // アクセシビリティの修復案内は設定によらず有効。マイクの追加ガイドだけ opt-in。
+    static func guidedMissing(ax: Bool, mic: AVAuthorizationStatus, extendedGuide: Bool) -> [Permission] {
+        missing(ax: ax, mic: mic).filter { $0 == .accessibility || extendedGuide }
+    }
+
     // 自動で出す案内は、本人が閉じてから 1 分は出し直さない（貼り付けに失敗するたびに出ると邪魔）。メニューから開いたときはいつでも出す
     static let quietAfterClose: TimeInterval = 60
     static func shouldShow(manual: Bool, lastClosed: Date?, now: Date) -> Bool {
@@ -46,6 +51,9 @@ enum PermissionCheck {
 
 // 案内の文言（テストで中身を確かめる）
 enum PermissionText {
+    static let readd = "一覧ですでに Koe がオンなら、Koe を選んで「−」で削除し、「+」で Koe を追加し直してオンにしてください。"
+    static let accessibilityMenu = "アクセシビリティ未許可（すでにオンなら Koe を「−」で削除→「+」で再追加）"
+
     static func title(_ p: Permission, stale: Bool) -> String {
         switch p {
         case .accessibility: return stale ? "Koe の「アクセシビリティ」の許可が外れています" : "Koe に「アクセシビリティ」の許可が必要です"
@@ -67,20 +75,19 @@ enum PermissionText {
     static func steps(_ p: Permission, stale: Bool) -> [String] {
         switch p {
         case .accessibility where stale:
-            return ["一覧の Koe を選び、下の「−」で消す",
-                    "右の Koe のアイコンを一覧へドラッグして、スイッチをオンにする"]
+            return [readd, "一覧に Koe が無いときも「+」から追加できます。右のアイコンのドラッグでも追加できます。"]
         case .accessibility:
             return ["開いた一覧で、Koe のスイッチをオンにする",
-                    "一覧に Koe が無いときは、右の Koe のアイコンを一覧へドラッグする"]
+                    "一覧に Koe が無いときは「+」で追加する（右のアイコンのドラッグでも追加できます）", readd]
         case .microphone:
             return ["開いた一覧で、Koe のスイッチをオンにする",
                     "オンにしても声が入らないときは、下の「Koe を再起動」を押す"]
         }
     }
 
-    static let waiting = "まだオフです。オンにすると、この案内は自動で閉じます"
+    static let waiting = "まだ許可を確認できません。許可されると、この案内は自動で閉じます"
     static let granted = "オンになりました"
-    static let stillOff = "まだオフのままです。上の手順をもう一度お試しください"
+    static let stillOff = "まだ許可を確認できません。上の手順をもう一度お試しください"
 }
 
 // 案内を置く場所（Cocoa の座標。左下が原点）。
@@ -158,7 +165,7 @@ final class GuidePanel: NSPanel {
 }
 
 final class PermissionGuide: NSObject, NSWindowDelegate {
-    // 既定はオフ（新しい機能は既定オフで出す）。オフの間は 0.5.0 の案内（起動中 1 回の確認の窓）のまま。
+    // マイクの追加ガイドは既定オフ。アクセシビリティの修復案内は常時有効。
     // defaults write io.github.chaspy.koe permissionGuide -bool true でオン
     static var enabled: Bool { UserDefaults.standard.bool(forKey: "permissionGuide") }
 
@@ -190,8 +197,9 @@ final class PermissionGuide: NSObject, NSWindowDelegate {
     @discardableResult
     func showIfNeeded(reason: String, manual: Bool = false, only: Permission? = nil) -> Bool {
         Self.noteTrusted()
-        guard Self.enabled else { return legacyNotice(only: only) }
-        let missing = PermissionCheck.missingNow().filter { only == nil || $0 == only }
+        let missing = PermissionCheck.guidedMissing(ax: AXIsProcessTrusted(),
+                                                    mic: AVCaptureDevice.authorizationStatus(for: .audio),
+                                                    extendedGuide: Self.enabled).filter { only == nil || $0 == only }
         guard let p = missing.first else { return false }
         // 別の許可を案内している最中なら差し替えない（そちらが済んだら続けて案内する）
         if isVisible && current != nil {
@@ -391,22 +399,6 @@ final class PermissionGuide: NSObject, NSWindowDelegate {
                        String(ProcessInfo.processInfo.processIdentifier), Bundle.main.bundlePath]
         try? p.run()
         NSApp.terminate(nil)
-    }
-
-    // オフのとき: 0.5.0 の案内（アクセシビリティが外れたときに、起動中 1 回だけ確認の窓を出す。マイクは案内しない）
-    private var legacyShown = false
-    private func legacyNotice(only: Permission?) -> Bool {
-        guard only != .microphone, !AXIsProcessTrusted(), !legacyShown else { return false }
-        legacyShown = true
-        log("accessibility_notice", [:])
-        let a = NSAlert()
-        a.messageText = "アクセシビリティの許可が外れています"
-        a.informativeText = "このままでは貼り付けられません。システム設定で Koe を一度消して追加し直してください（プライバシーとセキュリティ > アクセシビリティ で Koe を選んで「−」、もう一度「+」で Koe を追加）。話した文はクリップボードに残してあるので ⌘V で貼れます。"
-        a.addButton(withTitle: "システム設定を開く")
-        a.addButton(withTitle: "閉じる")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.open(Permission.accessibility.settingsURL) }
-        return true
     }
 
     func windowWillClose(_ notification: Notification) {

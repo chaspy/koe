@@ -1,14 +1,15 @@
 import Foundation
 
 // 初回の案内（U-1）の判定と文言。画面（OnboardingWindow.swift）から呼ぶ。ここは AppKit に触れず、単体テストできるものだけ
-// 許可 → マイクテスト → キーの練習 → 別のアプリに 1 回貼る。モデル（約 1.6GB）のダウンロード中も 1〜3 は進められる
+// 使い方 → 許可 → マイクテスト → キーの練習 → 別のアプリに 1 回貼る。モデル（約 1.6GB）のダウンロード中も 1〜3 は進められる
 
 enum OnboardingStep: Int, CaseIterable {
-    case permissions, mic, key, paste
+    case expectations, permissions, mic, key, paste
     case improve   // 使うほど賢くする（#168）。改善ループのオン・オフがまだ決まっていないときだけ、最後に足す
 
     var short: String {
         switch self {
+        case .expectations: return "使い方"
         case .permissions: return "許可"
         case .mic: return "マイク"
         case .key: return "キー"
@@ -17,16 +18,13 @@ enum OnboardingStep: Int, CaseIterable {
         }
     }
 
-    // 押して話すキーを Koe の録音に回さず、練習に使う段（許可・マイク・キー）。最後の段だけ本物の録音で貼る
-    var practisesKey: Bool { self == .permissions || self == .mic || self == .key }
+    // 押して話すキーを Koe の録音に回さず、練習に使う段（使い方・許可・マイク・キー）。最後の段だけ本物の録音で貼る
+    var practisesKey: Bool { self == .expectations || self == .permissions || self == .mic || self == .key }
 }
 
-// 流れ: 4 段（＋賢くする）で、できたら自分で次の段へ進む（マイクが聞こえた・キーの練習ができた）。「次へ」でも進める。
-// 3 案（steps / auto / short）から auto に決めた（2026-10-19、docs/notes/onboarding-variants）。既定はオフ（新しい機能は既定オフで出す）
-//   defaults write io.github.chaspy.koe onboarding on   （off か未設定で前の「ようこそ」）
-// 案を選んでいたころの値（steps / auto / short など）が残っていても、オンとして同じ流れで開く
+// 新規インストールの自動案内は maintainer 指定の既定オフの例外（#224）。
 enum OnboardingFlow {
-    static let steps: [OnboardingStep] = [.permissions, .mic, .key, .paste]
+    static let steps: [OnboardingStep] = [.expectations, .permissions, .mic, .key, .paste]
 
     // improve: 最後に「使うほど賢くする」を足すか（ImproveStepText.shows）
     static func steps(improve: Bool) -> [OnboardingStep] { improve ? steps + [.improve] : steps }
@@ -53,7 +51,20 @@ enum OnboardingFlow {
         default: return false
         }
     }
-    static var enabled: Bool { isOn(UserDefaults.standard.object(forKey: key)) }
+    // Only the app's persistent domain counts; global/registered defaults are not Koe settings.
+    static func isFreshInstall(welcomeShown: Bool, hasExistingSettings: Bool) -> Bool {
+        !welcomeShown && !hasExistingSettings
+    }
+
+    static func showsPasteHint(successfulPastes: Int, recording: Bool) -> Bool {
+        (1...5).contains(successfulPastes) && !recording
+    }
+
+    static let pasteCountKey = "expectationSuccessfulPastes"
+    static let hint = "多少間違っていても、そのまま送って大丈夫です"
+    static let title = "Koe は、AI に話しかけるための入力です"
+    static let introduction = "Claude Code などの AI に、キーボードよりずっと多く・速く伝えられます。多少聞き間違えても AI が意味を汲み取るので、直さずにそのまま送って大丈夫です。"
+    static let finalText = "Slack やドキュメントにそのまま貼る清書には、まだ向いていません。清書したいときは、話した内容を AI に渡して整えてもらうのがおすすめです。"
 }
 
 enum OnboardingText {

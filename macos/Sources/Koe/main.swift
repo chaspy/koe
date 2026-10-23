@@ -148,18 +148,19 @@ enum Settings {
         get { ContextPrompt.enabled(in: defaults) }
         set { defaults.set(newValue, forKey: "contextPrompt") }
     }
-    static func whisperPrompt(previous: String?, repo: RepoContext.Found? = nil) -> String {
-        let base = whisperPrompt(repo: repo)
+    static func whisperPrompt(previous: String?, repo: RepoContext.Found? = nil, recordTerms: (([String]) -> Void)? = nil) -> String {
+        let base = whisperPrompt(repo: repo, recordTerms: recordTerms)
         guard contextPrompt, let prev = previous, !prev.isEmpty else { return base }
         return String(prev.suffix(150)) + " " + base
     }
 
     // whisper の初期プロンプトは 224 トークンまでなので、用語は約 120 文字ぶんだけ入れる。
     // 前面のターミナルのリポジトリ名・ブランチ名（RepoContext）は先頭に置き、その分だけ用語を減らす（用語のほうが音声の近くに来る）
-    static func whisperPrompt(repo: RepoContext.Found?) -> String {
+    static func whisperPrompt(repo: RepoContext.Found?, recordTerms: (([String]) -> Void)? = nil) -> String {
         let all = Glossary.whisperTerms(limit: 120)
         let ctx = RepoContext.promptPart(repo, terms: all)
         let terms = ctx.isEmpty ? all : Glossary.whisperTerms(limit: 120 - ctx.count - 1)
+        recordTerms?(terms)
         let words = (ctx.isEmpty ? [] : [ctx]) + terms
         return words.isEmpty ? prompt : "\(words.joined(separator: "、"))。\(prompt)"
     }
@@ -600,14 +601,10 @@ enum Glossary {
         let list = entries ?? (personal + packs + org)
         DispatchQueue.global(qos: .utility).async {
             let started = Date()
-            // NSString の検索は Swift の String.contains よりずっと速い
-            let texts = History.recentPasted(300).map { $0.text.lowercased() as NSString }
-            var u: [String: Int] = [:]
-            for e in list {
-                let keys = ([e.term] + e.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }).map { $0.lowercased() }.filter { $0.count >= 2 }
-                let n = texts.reduce(0) { acc, t in acc + (keys.contains { t.range(of: $0).location != NSNotFound } ? 1 : 0) }
-                if n > 0 { u[e.term] = n }
+            let samples = History.recentRecords(300).map {
+                TermSelection.Sample(pasted: $0["pasted"] as? String ?? "", raw: $0["raw"] as? String ?? "")
             }
+            let u = TermSelection.counts(list.map { .init(term: $0.term, aliases: $0.aliases) }, samples: samples)
             usageLock.lock(); usage = u; usageAt = Date(); usageRefreshing = false; usageLock.unlock()
             Events.log("usage_refreshed", ["ms": Int(Date().timeIntervalSince(started) * 1000), "terms": list.count])
         }
@@ -620,18 +617,9 @@ enum Glossary {
         let k = packs.filter { e in !p.contains { $0.term == e.term } }
         let o = org.filter { e in !p.contains { $0.term == e.term } && !k.contains { $0.term == e.term } }
         let counts = usageCounts(p + k + o)
-        let used = (p + k + o).map(\.term).filter { counts[$0] != nil }.sorted { counts[$0]! > counts[$1]! }
-        // 最近出てこなかった語は、個人の辞書（本人が育てた・入れた語）を先に、パックを後に
-        let rest = (p + k).map(\.term).filter { counts[$0] == nil }
-        var out: [String] = []
-        var length = 0
-        let aliases = Set((p + k + o).flatMap(\.aliases).map(TermRules.aliasKey))
-        for t in TermRules.preferred(used + rest, aliases: aliases) {
-            if length + t.count > limit { continue }
-            out.append(t)
-            length += t.count + 1
-        }
-        return out
+        return TermSelection.select(personal: p.map { .init(term: $0.term, aliases: $0.aliases) },
+            packs: k.map { .init(term: $0.term, aliases: $0.aliases) },
+            organization: o.map { .init(term: $0.term, aliases: $0.aliases) }, counts: counts, limit: limit)
     }
 
     // 個人の辞書の別名は、実際に起きた誤変換の形（改善ループが記録する）。出てきたら正しい表記に置き換える。
@@ -1849,29 +1837,18 @@ final class Improver {
             }
             throw NSError(domain: "Koe", code: 21, userInfo: [NSLocalizedDescriptionKey: "改善ループの応答に伝達の判定がありませんでした（次回やり直す）"])
         }
-        // 伝達の判定を履歴に書く
-        var judged = 0, failed = 0
-        let judgements = json["judgements"] as? [[String: Any]] ?? []
-        var byIndex: [Int: [String: Any]] = [:]
-        for j in judgements { if let i = j["i"] as? Int { byIndex[i] = j } }
-        for (i, (url, r)) in items.enumerated() {
-            var rec = r
-            if let j = byIndex[i], let label = Improver.label(j) {
-                rec["communication"] = label
-                rec["communication_note"] = j["reason"] as? String ?? ""
-                // 伝わらなかったときの困り具合: misacted＝誤解したまま作業が進んだ / redo＝言い直し・聞き返しが要った / dropped＝一部が落ちたが言い直さずに進んだ
-                if label == "corrected" { rec["communication_impact"] = (j["impact"] as? String).flatMap { ["misacted", "redo", "dropped"].contains($0) ? $0 : nil } ?? "redo" }
-                else { rec.removeValue(forKey: "communication_impact") }
-                judged += 1
-                if label == "corrected" { failed += 1 }
+        // 採用可能なペアを発話単位で残す。再判定では再カウントしない。
+        var pairs: [Int: [[String: String]]] = [:]
+        let added = judgeOnly ? [] : mergeTerms(json["terms"] as? [[String: Any]] ?? [], people: people,
+            transcripts: transcripts, contexts: contexts) { i, wrong, right in
+                guard items.indices.contains(i) else { return }
+                let pair = ["wrong": wrong, "right": right]
+                if !(pairs[i] ?? []).contains(pair) { pairs[i, default: []].append(pair) }
             }
-            rec["glossary_scanned"] = true
-            if judgeOnly { rec["judge_attempts"] = (r["judge_attempts"] as? Int ?? 0) + 1 }
-            if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: url) }
-        }
+        let (judged, failed) = try saveJudgements(items, judgements: json["judgements"] as? [[String: Any]] ?? [],
+                                                   pairs: pairs, judgeOnly: judgeOnly, termsAdded: added.count)
         // 語を候補に積み、条件を満たしたら個人の辞書へ（判定のやり直しでは、語は前回数えたので数えない）
         if judgeOnly { return "判定のやり直し \(items.count) 件（判定 \(judged)、伝わらなかった \(failed)）" }
-        let added = mergeTerms(json["terms"] as? [[String: Any]] ?? [], people: people, transcripts: transcripts, contexts: contexts)
         if !people.isEmpty {
             let called = (json["people"] as? [[String: Any]] ?? []).compactMap { x -> (who: String, called: String)? in
                 guard let c = x["called"] as? String, let w = x["who"] as? String, let i = x["i"] as? Int, let t = transcripts[i] else { return nil }
@@ -1883,18 +1860,42 @@ final class Improver {
         return "\(items.count) 件を処理（判定 \(judged)、伝わらなかった \(failed)）。辞書に追加: \(added.isEmpty ? "なし" : added.joined(separator: "、"))"
     }
 
-    // ラベルは LLM に直接選ばせず、段階ごとの答えから決める（LLM は「読み替えた」と書きながら corrected を付けがち）
-    static func label(_ j: [String: Any]) -> String? {
-        if j["unknown"] as? Bool == true { return "unclear" }
-        if let err = j["error"] as? Bool {
-            if !err { return "understood" }
-            return j["read_ok"] as? Bool == true ? "understood" : "corrected"
+    private func saveJudgements(_ items: [(URL, [String: Any])], judgements: [[String: Any]],
+                                pairs: [Int: [[String: String]]], judgeOnly: Bool, termsAdded: Int) throws -> (Int, Int) {
+        let judgedAt = ISO8601DateFormatter().string(from: Date())
+        var savedJudgements: [[String: Any]] = []
+        // 伝達の判定を履歴に書く
+        var judged = 0, failed = 0
+        var byIndex: [Int: [String: Any]] = [:]
+        for j in judgements { if let i = j["i"] as? Int { byIndex[i] = j } }
+        for (i, (url, r)) in items.enumerated() {
+            var rec = r
+            if let j = byIndex[i], let label = Improver.label(j) {
+                rec.removeValue(forKey: "asr_error")
+                rec.merge(ImprovementJudgement.fields(j, at: judgedAt)) { _, new in new }
+                rec["communication"] = label
+                rec["communication_note"] = j["reason"] as? String ?? ""
+                // 伝わらなかったときの困り具合: misacted＝誤解したまま作業が進んだ / redo＝言い直し・聞き返しが要った / dropped＝一部が落ちたが言い直さずに進んだ
+                if label == "corrected" { rec["communication_impact"] = (j["impact"] as? String).flatMap { ["misacted", "redo", "dropped"].contains($0) ? $0 : nil } ?? "redo" }
+                else { rec.removeValue(forKey: "communication_impact") }
+                judged += 1
+                if label == "corrected" { failed += 1 }
+            }
+            if !judgeOnly { rec["mishearings"] = pairs[i] ?? [] }
+            rec["glossary_scanned"] = true
+            if judgeOnly { rec["judge_attempts"] = (r["judge_attempts"] as? Int ?? 0) + 1 }
+            let data = try JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: url, options: .atomic)
+            if let j = byIndex[i], Improver.label(j) != nil { savedJudgements.append(j) }
         }
-        if let l = j["label"] as? String, ["understood", "corrected", "unclear"].contains(l) { return l }
-        return nil
+        Events.log("improve_judged", ImprovementJudgement.counts(savedJudgements, termsAdded: termsAdded))
+        return (judged, failed)
     }
+
+    // ラベルは LLM に直接選ばせず、段階ごとの答えから決める（LLM は「読み替えた」と書きながら corrected を付けがち）
+    static func label(_ j: [String: Any]) -> String? { ImprovementJudgement.label(j) }
     private func mergeTerms(_ terms: [[String: Any]], people: [People.Person] = [], transcripts: [Int: String] = [:],
-                            contexts: [Int: String] = [:]) -> [String] {
+                            contexts: [Int: String] = [:], onPair: (Int, String, String) -> Void = { _, _, _ in }) -> [String] {
         let candURL = koeDir.appendingPathComponent("glossary_candidates.json")
         var cand = (try? JSONSerialization.jsonObject(with: Data(contentsOf: candURL))) as? [String: [String: Any]] ?? [:]
         var promote: [String: [String]] = [:]
@@ -1911,7 +1912,9 @@ final class Improver {
             .map(TermRules.aliasKey))
         let existingTerms = Set(existing.map { TermRules.key($0.term) })
         let knownTerms = Set(existing.map(\.term))
+        var seenObservations = Set<String>()
         for var t in terms {
+            let utteranceIndex = t["i"] as? Int
             // 近い読みの形は People.judge の守りを通したものだけ使う（人の名前でない語に付いてきたものは捨てる）
             let raw = t.removeValue(forKey: "variants") as? [String] ?? []
             // 人の名前・呼び名（名簿にある名前を kind: "term" で返したものも）は、文字起こしと前後から確かなときだけ足す（People.judge）
@@ -1943,6 +1946,7 @@ final class Improver {
             // Do not introduce an alias that would turn an existing correct term into a chain.
             guard TermRules.aliasAllowed(wrong, existingTerms: existingTerms,
                                          person: t["kind"] as? String == "person") else { continue }
+            ImprovementJudgement.reportPair(index: utteranceIndex, transcripts: transcripts, wrong: wrong, right: right, report: onPair)
             var c = cand[right] ?? ["count": 0, "wrongs": [String]()]
             // 人の名前・呼び名は個人の辞書にだけ使い、共有パックへの提案には回さない印
             if t["kind"] as? String == "person" { c["person"] = true }
@@ -1958,8 +1962,11 @@ final class Improver {
             }) where !wrongs.contains(w) { wrongs.append(w) }
             c["wrongs"] = wrongs
             if t["explicit"] as? Bool == true { c["explicit"] = true }
+            let observations = AliasLearning.observedCounts(term: right, aliases: wrongs, index: t["i"] as? Int,
+                transcripts: transcripts, previous: c["aliasCounts"] as? [String: Int] ?? [:], seen: &seenObservations)
+            c["aliasCounts"] = observations
             cand[right] = c
-            // 本人が正しい表記を示した語は確かな置き換え、回数だけで上げた語は「~」（受け取る AI へのメモだけ。勝手に置き換えない）。
+            // 明示訂正、または同じ非一般語の別名を別の発話で 2 回確認したら確かな置き換えにする。
             let sure = c["explicit"] as? Bool == true
             // 人の名前で「化けた形>敬称」の別名は、敬称が続くときだけ置き換わる（「パン粉を買う」は変わらない）ので、
             // 確かに検出した 1 回目で辞書に上げて置き換えてよい（出現が少ない名前は 2 回を待つと覚えきれない。IMP-8）
@@ -1968,7 +1975,8 @@ final class Improver {
             let person = c["person"] as? Bool == true
             if (c["count"] as? Int ?? 0) >= 2 || sure || anchored {
                 promote[right] = AliasLearning.stored(wrongs, sure: sure, anchored: anchored, person: person,
-                    ordinaryWordNotes: Settings.defaults.bool(forKey: "ordinaryWordNotes"))
+                    ordinaryWordNotes: Settings.defaults.bool(forKey: "ordinaryWordNotes"), observations: observations,
+                    englishWords: AliasVocabulary.englishWords)
             }
         }
         if let data = try? JSONSerialization.data(withJSONObject: cand, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: candURL) }
@@ -1982,7 +1990,7 @@ final class Improver {
         for (term, wrongs) in promote where !wrongs.isEmpty {
             if let i = lines.firstIndex(where: { $0.split(separator: "\t").first.map(String.init)?.trimmingCharacters(in: .whitespaces) == term }) {
                 let e = Glossary.parse(lines[i]).first
-                let merged = Array(Set((e?.aliases ?? []) + wrongs)).sorted()
+                let merged = AliasLearning.merged(existing: e?.aliases ?? [], learned: wrongs)
                 lines[i] = term + "\t" + merged.joined(separator: "／")
             } else if Glossary.personal.count + added.count < 300 {
                 lines.insert(term + "\t" + wrongs.joined(separator: "／"), at: min(1, lines.count))
@@ -2554,12 +2562,12 @@ enum Updater {
     }
 
     // その版の CHANGELOG（タグの CHANGELOG.md。API は使わない）から macOS の最初の項目を 1 行で取る
-    static func summary(_ r: Release, done: @escaping ((line: String?, noChanges: Bool)) -> Void) {
-        guard let url = URL(string: "https://raw.githubusercontent.com/\(repo)/v\(r.version)/CHANGELOG.md") else { return done((nil, false)) }
+    static func summary(_ r: Release, done: @escaping (UpdatePrompt.Summary) -> Void) {
+        guard let url = URL(string: "https://raw.githubusercontent.com/\(repo)/v\(r.version)/CHANGELOG.md") else { return done(UpdatePrompt.Summary()) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 20
         URLSession.shared.dataTask(with: req) { data, resp, _ in
-            guard (resp as? HTTPURLResponse)?.statusCode == 200, let data, let md = String(data: data, encoding: .utf8) else { return done((nil, false)) }
+            guard (resp as? HTTPURLResponse)?.statusCode == 200, let data, let md = String(data: data, encoding: .utf8) else { return done(UpdatePrompt.Summary()) }
             done(UpdatePrompt.summary(changelog: md, version: r.version, platform: "macOS"))
         }.resume()
     }
@@ -2642,6 +2650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var enterItem: NSMenuItem!
     private var lineBreakItem: NSMenuItem!
     private var loginItem: NSMenuItem!
+    private var autoRestartItem: NSMenuItem!
     private var monitors: [Any] = []
     private var hotkeyDown = false
     private var lastShortTap = Date.distantPast
@@ -2664,7 +2673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 了承型の更新通知（UpdatePrompt）
     private var lastUsedAt: Date?                 // 最後に押した / 貼った時刻
     private var updateSnoozedUntil: Date?         // 「あとで」から 24 時間（この起動中だけ）
-    private var updateSummary: (version: String, line: String?, noChanges: Bool)?
+    private var updateSummary: (version: String, summary: UpdatePrompt.Summary)?
     private var updatePromptTimer: Timer?
     private var updateAlert: NSAlert?
     private var packMenu: NSMenu!
@@ -2676,8 +2685,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let improver = Improver()
     let permissionGuide = PermissionGuide()
     let onboarding = OnboardingWindow()
-    // 初めての起動で、初回の案内を出すか（案内が許可を順に聞くので、起動時にまとめて聞かない）。案内がオフなら前のまま
-    private let firstRun = !Settings.defaults.bool(forKey: "welcomeShown") && OnboardingFlow.enabled
+    // 初めての起動で、初回の案内を出すか（案内が許可を順に聞くので、起動時にまとめて聞かない）。既存設定を書き込む前に判定を保存する
+    private let firstRun = OnboardingFlow.isFreshInstall(
+        welcomeShown: Settings.defaults.bool(forKey: "welcomeShown"),
+        hasExistingSettings: !(Settings.defaults.persistentDomain(forName: Bundle.main.bundleIdentifier ?? "io.github.chaspy.koe") ?? [:]).isEmpty)
+    private let expectationHint = ExpectationHint()
     private var permissionItem: NSMenuItem!
     private let hud = RecordingHUD()
     private var indicatorMenu: NSMenu!
@@ -2708,8 +2720,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.terminate(sender)
     }
 
-    private func recordQuit() {
-        guard !quitRecorded else { return }
+    @discardableResult private func recordQuit() -> Bool {
+        guard !quitRecorded else { return true }
+        do {
+            let saved = try AutoRestart.protectQuit(session: AutoRestart.read(AutoRestart.sessionURL), pid: getpid(),
+                save: { try AutoRestart.write($0, to: AutoRestart.sessionURL) },
+                disarm: {
+                    if FileManager.default.fileExists(atPath: AutoRestart.plistURL.path) {
+                        try AutoRestart.disable(destination: AutoRestart.plistURL, domain: "gui/\(getuid())", run: AutoRestart.launchctl)
+                    }
+                })
+            if !saved { Events.log("auto_restart_quit_disarmed") }
+        } catch {
+            Events.log("auto_restart_quit_failed")
+            showError("自動再起動を停止できないため終了を中止しました。設定をオフにして、もう一度終了してください。")
+            return false
+        }
         quitRecorded = true
         let event = NSAppleEventManager.shared().currentAppleEvent
         let appleQuit = event?.eventClass == kCoreEventClass && event?.eventID == kAEQuitApplication
@@ -2718,6 +2744,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let source = QuitLog.source(menu: quitFromMenu, appleEvent: appleQuit,
                                     logout: workspacePowerOff, system: quitFromSystem)
         Events.log("app_quit", ["source": source, "sender_bundle": bundle ?? "unknown", "busy": isBusy])
+        return true
     }
 
     private let runningMarker = RunningMarker(url:
@@ -2725,6 +2752,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .appendingPathComponent("Koe/running"))
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if let identity = ServerLifecycle.Identity.read(getpid()) {
+            do {
+                try AutoRestart.write(.init(identity: identity, quitRequested: false), to: AutoRestart.sessionURL)
+                // Re-arm an already opted-in job after a manual relaunch. Never install on startup.
+                if FileManager.default.fileExists(atPath: AutoRestart.plistURL.path) {
+                    try AutoRestart.launchctl(["kickstart", "gui/\(getuid())/\(AutoRestart.label)"])
+                }
+            } catch { Events.log("auto_restart_session_failed") }
+        }
         let unclean = (try? runningMarker.begin()) ?? false
         if unclean { Events.log("unclean_shutdown_detected") }
         let killed = ServerLifecycle.cleanOrphans(in: ServerLifecycle.directory)
@@ -2876,7 +2912,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // 録音中・文字起こし中に終了を求められたら、貼り終えてから終了する（最大 20 秒）
     private var terminating = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        recordQuit()
+        guard recordQuit() else { return .terminateCancel }
         guard isBusy else { return .terminateNow }
         terminating = true
         Events.log("quit_deferred")
@@ -3197,7 +3233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let app = u.record["app"] as? String ?? ""
                 let repo = RepoContext.current(app: app)
                 if let repo { u.record["repo_context"] = repo.source }
-                let prompt = Settings.whisperPrompt(previous: u.locked ? nil : self.previousText(for: u), repo: repo)
+                let prompt = Settings.whisperPrompt(previous: u.locked ? nil : self.previousText(for: u), repo: repo) { u.record["prompt_terms"] = $0 }
                 u.record["prompt_ms"] = Int(Date().timeIntervalSince(p0) * 1000)
                 self.transcribe(u, prompt: prompt)
             }
@@ -3318,6 +3354,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let started = Date()
         u.record["whisper_model"] = (Settings.model as NSString).lastPathComponent
         u.record["whisper_prompt"] = prompt
+        ImprovementJudgement.recordPrompt(prompt, in: &u.record)
         // 窓は送る音声（無音を削った後）の長さに合わせる。繰り返しのやり直しは 30 秒の枠全体
         let actx = loopRetry || fullWindow ? 0 : AudioWindow.ctx(setting: Settings.audioCtx, seconds: cap.voicedSeconds > 0 ? cap.voicedSeconds : cap.seconds)
         u.record[loopRetry || fullWindow ? "whisper_audio_ctx_retry" : "whisper_audio_ctx"] = actx
@@ -3560,6 +3597,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastUsedAt = Date()
         onboarding.notePaste(pasted: pasted != nil, pasteApp: u.record["paste_app"] as? String)
         if let text = pasted {
+            if Settings.defaults.object(forKey: OnboardingFlow.pasteCountKey) != nil {
+                let count = min(6, Settings.defaults.integer(forKey: OnboardingFlow.pasteCountKey) + 1)
+                Settings.defaults.set(count, forKey: OnboardingFlow.pasteCountKey)
+                if OnboardingFlow.showsPasteHint(successfulPastes: count, recording: current != nil) {
+                    expectationHint.show()
+                }
+            }
             Glossary.refreshUsage(ifOlderThan: 300)
             ImproveSuggestPanel.notePasted()
             recentByApp[u.record["app"] as? String ?? ""] = (Date(), text)
@@ -3741,6 +3785,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem = NSMenuItem(title: "ログイン時に起動", action: #selector(toggleLogin), keyEquivalent: "")
         loginItem.target = self
         menu.addItem(loginItem)
+        autoRestartItem = NSMenuItem(title: "予期せず終了したら自動で再起動", action: #selector(toggleAutoRestart), keyEquivalent: "")
+        autoRestartItem.target = self
+        menu.addItem(autoRestartItem)
 
         let importItem = NSMenuItem(title: "設定ファイルを読み込む…", action: #selector(importConfig), keyEquivalent: "")
         importItem.target = self
@@ -3755,7 +3802,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(help)
         let guide = NSMenuItem(title: "はじめての案内を開く…", action: #selector(openOnboarding), keyEquivalent: "")
         guide.target = self
-        guide.isHidden = !OnboardingFlow.enabled
         menu.addItem(guide)
         let diag = NSMenuItem(title: "診断情報を書き出す（不具合を送る用）", action: #selector(exportDiagnostics), keyEquivalent: "")
         diag.target = self
@@ -4088,6 +4134,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
+    @objc private func toggleAutoRestart() {
+        let destination = AutoRestart.plistURL
+        do {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try AutoRestart.disable(destination: destination, domain: "gui/\(getuid())", run: AutoRestart.launchctl)
+                Events.log("auto_restart_disabled")
+            } else {
+                guard Bundle.main.bundleURL.pathExtension == "app",
+                      let executable = Bundle.main.executableURL,
+                      let session = AutoRestart.read(AutoRestart.sessionURL),
+                      session.identity.isCurrent, session.identity.pid == getpid() else {
+                    throw NSError(domain: "KoeAutoRestart", code: 1)
+                }
+                try AutoRestart.enable(executable: executable.path, bundle: Bundle.main.bundleURL.path,
+                                       destination: destination, session: AutoRestart.sessionURL,
+                                       domain: "gui/\(getuid())", run: AutoRestart.launchctl)
+                Events.log("auto_restart_enabled")
+            }
+        } catch {
+            Events.log("auto_restart_change_failed")
+            showError("自動再起動の設定を変更できませんでした。メニューの状態を確認してください。")
+        }
+        render()
+    }
+
     @objc private func toggleLogin() {
         let svc = SMAppService.mainApp
         do {
@@ -4137,23 +4208,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // 初めて起動したときに、初回の案内（許可 → マイク → キー → 貼ってみる）を開く
+    // 初めて起動したときに、初回の案内（使い方 → 許可 → マイク → キー → 貼ってみる）を開く
     private func showWelcomeIfFirstLaunch() {
-        guard !Settings.defaults.bool(forKey: "welcomeShown") else { return }
+        guard firstRun else { return }
         Settings.defaults.set(true, forKey: "welcomeShown")
-        if OnboardingFlow.enabled { onboarding.show(reason: "first_launch"); return }
-        let a = NSAlert()
-        a.messageText = "Koe へようこそ"
-        a.informativeText = """
-        ・\(keyName()) を押している間だけ話し、離すと貼り付けます（ターミナルでは Enter も送ります）
-        ・\(keyName()) を素早く 2 回押すとロック録音（ハンズフリー）。もう 1 回押すと終わってテキストに書き出します
-        ・押すキー・押し方（トグル）・改行はメニューで変えられます。困ったら「診断情報を書き出す」を送ってください
-        メニューバーの吹き出しアイコンが Koe です。
-        """
-        a.addButton(withTitle: "はじめる")
-        a.addButton(withTitle: "使い方を見る")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertSecondButtonReturn { openHelp() }
+        Settings.defaults.set(0, forKey: OnboardingFlow.pasteCountKey)
+        onboarding.show(reason: "first_launch")
     }
 
     @objc private func openLog() {
@@ -4161,6 +4221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func render() {
+        expectationHint.update(recording: current != nil)
         guard let button = statusItem?.button else { return }
         var symbol = ""
         var image: NSImage = KoeIcon.outline
@@ -4191,13 +4252,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             line = "他のアプリがキー入力を保護中のため、右⌘を検知できません（パスワード欄・iTerm の Secure Keyboard Entry など）"
         }
         if !AXIsProcessTrusted() {
-            line = PermissionGuide.enabled ? "アクセシビリティの許可が必要です（下の「許可の案内を開く」）" : "アクセシビリティの許可が必要です（システム設定 > プライバシーとセキュリティ）"
+            line = PermissionText.accessibilityMenu
             tint = .systemYellow
         } else if PermissionGuide.enabled && PermissionCheck.micDenied {
             line = "マイクの許可が必要です（下の「許可の案内を開く」）"
             tint = .systemYellow
         }
-        permissionItem?.isHidden = !PermissionGuide.enabled || PermissionCheck.missingNow().isEmpty
+        permissionItem?.isHidden = PermissionCheck.guidedMissing(ax: AXIsProcessTrusted(),
+            mic: AVCaptureDevice.authorizationStatus(for: .audio), extendedGuide: PermissionGuide.enabled).isEmpty
         button.image = symbol.isEmpty ? image : NSImage(systemSymbolName: symbol, accessibilityDescription: "Koe")
         button.image?.accessibilityDescription = "Koe"
         button.contentTintColor = tint
@@ -4233,6 +4295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         improveNowItem?.isEnabled = Settings.improveEnabled && !improver.running
         improveNowItem?.title = improver.running ? "改善中…" : "今すぐ改善する" + (improver.lastRun.map { "（前回: \($0.prefix(40))）" } ?? "")
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        autoRestartItem?.state = FileManager.default.fileExists(atPath: AutoRestart.plistURL.path) ? .on : .off
         for it in hotkeyMenu?.items ?? [] { it.state = it.tag == Int(Settings.hotkeyKeyCode) ? .on : .off }
         for it in pressModeMenu?.items ?? [] { it.state = it.tag == ([.auto: 2, .toggle: 1][Settings.pressMode] ?? 0) ? .on : .off }
         renderIndicatorMenu()
@@ -4292,7 +4355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func prepareUpdatePrompt(_ r: Updater.Release) {
         if updateSummary?.version != r.version {
             Updater.summary(r) { s in
-                DispatchQueue.main.async { self.updateSummary = (r.version, s.line, s.noChanges) }
+                DispatchQueue.main.async { self.updateSummary = (r.version, s) }
             }
         }
         guard updatePromptTimer == nil else { return }
@@ -4303,12 +4366,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard updateAlert == nil, let r = availableUpdate, let sum = updateSummary, sum.version == r.version else { return }
         let busy = current != nil || transcribing > 0 || cleaning > 0
         guard UpdatePrompt.shouldPrompt(now: Date(), available: r.version, busy: busy, lastUsed: lastUsedAt,
-                                        snoozedUntil: updateSnoozedUntil, noChanges: sum.noChanges) else { return }
+                                        snoozedUntil: updateSnoozedUntil, noChanges: sum.summary.noChanges) else { return }
         // 同じ版は 24 時間（この起動中）もう聞かない。答えなくても同じ
         updateSnoozedUntil = Date().addingTimeInterval(UpdatePrompt.snooze)
         Events.log("update_prompt", ["version": r.version])
         // モーダルにしない（開いている間も右⌘で話せるように）。フォーカスも奪わない（打っている文字や Enter を吸わない）
-        let a = UpdatePrompt.makeAlert(version: r.version, line: sum.line, icon: AppIcon.image, target: self,
+        presentUpdatePrompt(r, summary: sum.summary)
+    }
+
+    private func presentUpdatePrompt(_ r: Updater.Release, summary: UpdatePrompt.Summary) {
+        guard updateAlert == nil else { return }
+        let a = UpdatePrompt.makeAlert(version: r.version, line: summary.line,
+                                       requiresRegrant: summary.requiresRegrant, icon: AppIcon.image, target: self,
                                        now: #selector(updatePromptNow), later: #selector(updatePromptLater))
         updateAlert = a
         UpdatePrompt.present(a)
@@ -4318,7 +4387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         updateAlert?.window.orderOut(nil)
         updateAlert = nil
         Events.log("update_prompt_answer", ["answer": "now"])
-        installUpdate()
+        performInstallUpdate()
     }
 
     @objc private func updatePromptLater() {
@@ -4328,6 +4397,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func installUpdate() {
+        guard let r = availableUpdate else { return }
+        guard current == nil, transcribing == 0, cleaning == 0 else { return showError("話し終わってから、もう一度押してください") }
+        // 取得済みの対象版の案内を使い、確認前にインストールしない。
+        guard let sum = updateSummary, sum.version == r.version else {
+            return showError("更新内容を確認中です。少し待ってから、もう一度押してください")
+        }
+        if sum.summary.requiresRegrant {
+            presentUpdatePrompt(r, summary: sum.summary)
+        } else {
+            performInstallUpdate()
+        }
+    }
+
+    private func performInstallUpdate() {
         guard let r = availableUpdate else { return }
         // 録音中・文字起こし中は待つ
         guard current == nil, transcribing == 0 else { return showError("話し終わってから、もう一度押してください") }
@@ -4357,6 +4440,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default: return "keyCode \(Settings.hotkeyKeyCode)"
         }
     }
+}
+
+// launchd owns only this watcher, not the interactive app. A successful exit stays stopped.
+if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--auto-restart-agent" {
+    exit(AutoRestart.watch(bundle: CommandLine.arguments[2],
+                          destination: URL(fileURLWithPath: CommandLine.arguments[3]),
+                          sessionURL: URL(fileURLWithPath: CommandLine.arguments[4])))
 }
 
 // Internal helper: never starts AppKit, audio capture, or the user's server.

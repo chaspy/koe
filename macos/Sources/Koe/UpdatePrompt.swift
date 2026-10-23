@@ -5,17 +5,23 @@ import AppKit
 // 「あとで」ならこの起動中は 24 時間出さない（次の起動ではまた聞く）。
 // その版がこの OS に変更なし（CHANGELOG の節が「No changes.」）なら聞かない（メニューの「新しい版」はそのまま出る）
 enum UpdatePrompt {
+    struct Summary {
+        var line: String?
+        var noChanges = false
+        var requiresRegrant = false
+    }
+    static let regrantNotice = "この更新後は、アクセシビリティをもう一度許可する必要があります。一覧ですでに Koe がオンなら、「−」で削除し「+」で追加し直してください。"
     static let quietAfterUse: TimeInterval = 30
     static let snooze: TimeInterval = 24 * 3600
 
     // 確認の画面。手で打っている最中に出ても Enter / Esc で更新が走らないように:
     // 既定（Return）は「あとで」、「今すぐ更新」はキーを持たない（クリックだけ）、Esc で押されるボタンも作らない。
     // フォーカスは奪わない（呼ぶ側は activate せず orderFrontRegardless で前に出すだけ）
-    static func makeAlert(version: String, line: String?, icon: NSImage? = nil, target: AnyObject, now: Selector, later: Selector) -> NSAlert {
+    static func makeAlert(version: String, line: String?, requiresRegrant: Bool = false, icon: NSImage? = nil, target: AnyObject, now: Selector, later: Selector) -> NSAlert {
         let a = NSAlert()
         if let icon { a.icon = icon }
         a.messageText = "新しい版 v\(version) があります"
-        a.informativeText = (line.map { $0 + "\n\n" } ?? "") + "今すぐ更新すると、Koe が数秒止まって起動し直します。あとでにすると、24 時間後か次の起動でもう一度お知らせします。"
+        a.informativeText = (requiresRegrant ? regrantNotice + "\n\n" : "") + (line.map { $0 + "\n\n" } ?? "") + "今すぐ更新すると、Koe が数秒止まって起動し直します。あとでにすると、24 時間後か次の起動でもう一度お知らせします。"
         let l = a.addButton(withTitle: "あとで")       // 最初のボタン＝既定
         l.keyEquivalent = "\r"
         l.target = target
@@ -58,9 +64,11 @@ enum UpdatePrompt {
     }
 
     // CHANGELOG.md の「## <version>」の節から、platform（"macOS" / "Windows"）の小見出しの最初の項目を 1 行にして返す。
-    // 小見出しが「No changes.」なら noChanges。見つからなければ (nil, false)
-    static func summary(changelog: String, version: String, platform: String, maxLength: Int = 100) -> (line: String?, noChanges: Bool) {
+    // macOS の Re-grant: は節全体から拾い、通常の要約とは別に省略せず表示する。
+    static func summary(changelog: String, version: String, platform: String, maxLength: Int = 100) -> Summary {
         var inVersion = false, inPlatform = false
+        var result = Summary()
+        var foundFirst = false
         for raw in changelog.components(separatedBy: "\n") {
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("## ") {
@@ -76,11 +84,18 @@ enum UpdatePrompt {
             }
             guard inPlatform, line.hasPrefix("- ") else { continue }
             var t = String(line.dropFirst(2))
-            if t.lowercased().hasPrefix("no changes") { return (nil, true) }
             t = t.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
-            if t.count > maxLength { t = String(t.prefix(maxLength - 1)) + "…" }
-            return (t, false)
+            if platform.lowercased() == "macos", t.hasPrefix("Re-grant:") {
+                result.requiresRegrant = true
+                continue
+            }
+            guard !foundFirst else { continue }
+            foundFirst = true
+            if t.lowercased().hasPrefix("no changes") { result.noChanges = true; continue }
+            if t.count > maxLength { t = String(t.prefix(max(0, maxLength - 1))) + "…" }
+            result.line = t
         }
-        return (nil, false)
+        if result.requiresRegrant { result.noChanges = false }
+        return result
     }
 }

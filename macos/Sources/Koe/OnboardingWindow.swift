@@ -82,9 +82,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         if window == nil { build() }
         practiced = false; pasted = false; micPassed = false; permissionsWereMissing = false
         withImprove = ImproveStepText.shows(undecided: improveUndecided(), enabled: improveEnabled())
-        if restoreWarm == nil { restoreWarm = isWarm(); if !isWarm() { setWarm(true) } }
-        // 許可が揃っていれば、許可の段は飛ばす
-        go(PermissionCheck.missingNow().isEmpty && micAuthorized ? OnboardingFlow.next(after: .permissions, improve: withImprove)! : .permissions)
+        go(.expectations)
         window?.center()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -161,6 +159,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
     func go(_ s: OnboardingStep) {
         step = s
+        if s != .expectations, restoreWarm == nil { restoreWarm = isWarm(); if !isWarm() { setWarm(true) } }
         log("onboarding_step", ["step": "\(s)"])
         keyDownAt = nil
         content.subviews.forEach { $0.removeFromSuperview() }
@@ -169,6 +168,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         improveButtons = nil; improveEnableButton = nil
         let v: NSView
         switch s {
+        case .expectations: v = expectationsView()
         case .permissions: v = permissionsView()
         case .mic: micTest = MicTest(); micPassed = false; v = micView()
         case .key: v = keyView()
@@ -264,7 +264,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
             } else {
                 pillBars?.heights = HUDLayout.barHeights(.recording(since: Date(), locked: false, app: nil), level: 0, t: 0)
             }
-        case .paste, .improve:
+        case .expectations, .paste, .improve:
             break
         }
     }
@@ -288,6 +288,9 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         backButton.isHidden = OnboardingFlow.previous(before: step, improve: withImprove) == nil
         laterButton.isHidden = step == .improve   // この段では右下の「あとで」が同じ役目
         switch step {
+        case .expectations:
+            nextButton.title = "はじめる"
+            nextButton.isEnabled = true
         case .permissions:
             nextButton.title = "次へ"
             nextButton.isEnabled = PermissionCheck.missingNow().isEmpty && micAuthorized
@@ -385,6 +388,18 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         s.alignment = .leading
         s.spacing = spacing
         return s
+    }
+
+    private func expectationsView() -> NSView {
+        vstack([
+            title(OnboardingFlow.title),
+            body(OnboardingFlow.introduction),
+            body("合成例（説明用に作った会話）", size: 11, color: .secondaryLabelColor),
+            body("Koe の入力：このプロリクのテストが落ちてるので、原因を見て直して", size: 14),
+            body("AI の返答：プルリクエストのテストが落ちている件ですね。ログを確認します…", size: 14),
+            body("「プロリク」と化けても、AI は「プルリク」と受け取っています", size: 12, color: .secondaryLabelColor),
+            body(OnboardingFlow.finalText, size: 12, color: .secondaryLabelColor),
+        ], spacing: 12)
     }
 
     private func permissionsView() -> NSView {
@@ -593,7 +608,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
     // MARK: 窓
 
     private func build() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 480),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 540),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         w.title = "Koe をはじめる"
         w.isReleasedWhenClosed = false
@@ -628,7 +643,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
 
         content.translatesAutoresizingMaskIntoConstraints = false
         content.widthAnchor.constraint(equalToConstant: 520).isActive = true
-        content.heightAnchor.constraint(equalToConstant: 280).isActive = true
+        content.heightAnchor.constraint(equalToConstant: 340).isActive = true
 
         let sep1 = NSBox(), sep2 = NSBox()
         sep1.boxType = .separator; sep2.boxType = .separator

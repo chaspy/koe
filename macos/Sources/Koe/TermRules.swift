@@ -63,6 +63,10 @@ enum TermRules {
         return key(String(plain.split(separator: ">", maxSplits: 1).first ?? ""))
     }
 
+    static func isCommonWord(_ word: String) -> Bool {
+        commonEnglish.contains(key(word)) || commonJapanese.contains(word)
+    }
+
     static func rejection(_ term: String, aliases: Set<String> = [], person: Bool = false,
                           existingMultiword: Bool = false) -> Rejection? {
         guard (2...20).contains(term.count) else { return .phrase }

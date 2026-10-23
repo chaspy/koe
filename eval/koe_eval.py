@@ -657,18 +657,42 @@ def cmd_trend(a):
         print(json.dumps(rows, ensure_ascii=False))
 
 
-def cmd_daily(a):
-    """日ごとの振り返り（入力・伝達の困り具合・速さ・辞書の育ち）を Markdown で出し、reports/daily-<日付>.md に保存する。
-    発話の本文は書かない（判定の理由メモだけ）"""
-    import statistics as st
-    from collections import Counter, defaultdict
-    now = datetime.now()
-    since = now - timedelta(days=a.days)
-    day = defaultdict(Counter)
-    lat = defaultdict(list)
-    vis = defaultdict(list)
-    added = defaultdict(list)
-    notes = defaultdict(list)
+def repeated_mishearings(records, now):
+    """7日間・発話ごとに1回。語はローカル報告だけで使う。旧データは推測しない。"""
+    from collections import defaultdict
+    pairs = defaultdict(dict)
+    since = now - timedelta(days=7)
+    for r in records:
+        t = _record_time(r).astimezone().replace(tzinfo=None)
+        if not since <= t <= now:
+            continue
+        for pair in r.get("mishearings", []):
+            if not isinstance(pair, dict):
+                continue
+            wrong, right = pair.get("wrong"), pair.get("right")
+            if not isinstance(wrong, str) or not isinstance(right, str) or not wrong or not right:
+                continue
+            terms = r.get("prompt_terms")
+            present = right in terms if isinstance(terms, list) else None
+            pairs[(wrong, right)][r["id"]] = present
+    result = []
+    for (wrong, right), occurrences in sorted(pairs.items()):
+        values = list(occurrences.values())
+        if len(values) < 3:
+            continue
+        kind = ("dictionary" if False in values else
+                "unknown" if None in values else "engine_limit")
+        result.append({"wrong": wrong, "right": right, "count": len(values), "kind": kind})
+    return result
+
+
+def _local_report_cell(value):
+    # Markdown の表を壊さず、リンク/HTMLとして解釈させない。
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace(
+        "|", "&#124;").replace("[", "&#91;").replace("]", "&#93;").replace("`", "&#96;").replace("\n", " ").replace("\r", " ")
+
+
+def _daily_additions(since, added, added_counts):
     path = HISTORY.parent / "events.jsonl"
     for line in (path.read_text().splitlines() if path.exists() else []):
         try:
@@ -680,10 +704,15 @@ def cmd_daily(a):
             continue
         d = t.strftime("%m/%d")
         o = e.get("outcome")
+        if o == "improve_judged":
+            added_counts[d] += e.get("terms_added", 0)
         if o == "improve" and "辞書に追加: " in (e.get("summary") or ""):
             w = e["summary"].split("辞書に追加: ", 1)[1]
             if w != "なし":
                 added[d] += [x for x in w.split("、") if x]
+
+
+def _daily_records(since, day, lat, vis, notes):
     for r in load_records():
         t = _record_time(r).astimezone()
         if t.replace(tzinfo=None) < since:
@@ -698,6 +727,9 @@ def cmd_daily(a):
         if r.get("autocorrected"):
             day[d]["autocorrect"] += 1
         c = r.get("communication")
+        if c in ("understood", "corrected") and type(r.get("asr_error")) is bool:
+            day[d]["asr_judged"] += 1
+            day[d]["asr_error"] += int(r["asr_error"])
         if c == "understood":
             day[d]["understood"] += 1
         elif c == "unclear":
@@ -706,6 +738,23 @@ def cmd_daily(a):
             k = r.get("communication_impact") or "redo"
             day[d][k] += 1
             notes[d].append(f"{k}: {r.get('communication_note') or ''}")
+
+
+def cmd_daily(a):
+    """日ごとの振り返り（入力・伝達の困り具合・速さ・辞書の育ち）を Markdown で出し、reports/daily-<日付>.md に保存する。
+    発話の本文は書かない（判定の理由メモだけ）"""
+    import statistics as st
+    from collections import Counter, defaultdict
+    now = datetime.now()
+    since = now - timedelta(days=a.days)
+    day = defaultdict(Counter)
+    lat = defaultdict(list)
+    vis = defaultdict(list)
+    added = defaultdict(list)
+    added_counts = Counter()
+    notes = defaultdict(list)
+    _daily_additions(since, added, added_counts)
+    _daily_records(since, day, lat, vis, notes)
     for d, v in _press_counts(since.astimezone())[0].items():
         day[d].update(v)
     # 届くまで: ターミナルに貼った発話だけ
@@ -725,8 +774,8 @@ def cmd_daily(a):
     def pct(k, n):
         return f"{k / n:.1%}" if n else "-"
     lines = [f"# Koe 日次の振り返り（{now:%Y-%m-%d %H:%M}、直近 {a.days} 日）", "",
-             "| 日付 | 押下 | ①入力された | ②判定 | 誤解したまま作業 | 言い直し・聞き返し | 一部落ち | 判定不能 | 離して→貼る 中央/p90 | 貼る→画面に出る 中央/p90 | 出ず | 貼る→届く 中央/p90 | 届かず | 自動置き換え | 辞書に追加 |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "| 日付 | 押下 | ①入力された | ②判定 | 誤解したまま作業 | 言い直し・聞き返し | 一部落ち | 判定不能 | 離して→貼る 中央/p90 | 貼る→画面に出る 中央/p90 | 出ず | 貼る→届く 中央/p90 | 届かず | 自動置き換え | 辞書に追加 | 聞き間違い | 伝わらなかった |",
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for d in sorted(day):
         v = day[d]
         presses = v["ok"] + v["fail"]
@@ -740,8 +789,10 @@ def cmd_daily(a):
         nvt = f"{v['not_visible']}/{v['not_visible'] + len(vl)}" if v["not_visible"] + len(vl) else "-"
         nd = sum(undelivered[d].values())
         ndt = f"{nd}/{nd + len(dl)}" if nd + len(dl) else "-"
+        misheard = f"{v['asr_error']}/{judged} ({pct(v['asr_error'], judged)})" if judged and v["asr_judged"] == judged else "-"
+        not_understood = v["misacted"] + v["redo"] + v["dropped"]
         lines.append(f"| {d} | {presses} | {pct(v['ok'], presses)} | {judged} | {v['misacted']} ({pct(v['misacted'], judged)}) | "
-                     f"{v['redo']} ({pct(v['redo'], judged)}) | {v['dropped']} | {v['unclear']} | {sp} | {vsp} | {nvt} | {dsp} | {ndt} | {v['autocorrect']} | {len(added[d])} |")
+                     f"{v['redo']} ({pct(v['redo'], judged)}) | {v['dropped']} | {v['unclear']} | {sp} | {vsp} | {nvt} | {dsp} | {ndt} | {v['autocorrect']} | {len(added[d]) + added_counts[d]} | {misheard} | {not_understood}/{judged} ({pct(not_understood, judged)}) |")
     today = now.strftime("%m/%d")
     lines += ["", "目安: ①入力された 95% 以上 / 誤解したまま作業 1% 未満 / 言い直し・聞き返し 5% 未満（直近 300 件で見る。日ごとの数字は揺れる）",
               "貼る→画面に出る: iTerm に貼った発話の、⌘V から貼った文の末尾が iTerm の画面に出るまで（Koe が画面を読んで測る）。"
@@ -755,16 +806,27 @@ def cmd_daily(a):
                   f"- 似た文はあった（手で直してから送った可能性） {u['edited']}",
                   f"- 発話はあったが一致しない {u['no_match']}",
                   "- ※ Claude Code 以外のペインに貼ったのか、送らずに消したのかは区別できない", ""]
+    lines += ["聞き間違い・伝わらなかったの分母は判定済み（判定不能を除く）。聞き間違いは旧データが混在する日も - と表示。", ""]
+    repeated = repeated_mishearings(load_records(), now)
+    lines += [f"反復ペア数（直近7日・3回以上）: {len(repeated)} / エンジン限界: {sum(p['kind'] == 'engine_limit' for p in repeated)}", ""]
+    print("\n".join(lines))  # 標準出力には数値集計だけ。以下の語・理由はローカルファイル専用。
     if notes.get(today):
         lines += [f"## 今日（{today}）伝わらなかったもの（理由メモ）", ""] + [f"- {x}" for x in notes[today]] + [""]
     if added.get(today):
         lines += [f"## 今日辞書に足した語（{len(added[today])}）", "", "、".join(added[today]), ""]
+    if repeated:
+        lines += ["## 反復する聞き間違い（直近7日・同一ペア3発話以上）", "",
+                  "| 誤り | 正しい語 | 回数 | 分類・対処 |", "|---|---|---|---|"]
+        kinds = {"dictionary": "プロンプトに無い回あり：辞書・用語選択を見直す",
+                 "engine_limit": "毎回プロンプトにあった：エンジン限界、完全一致の別名を検討",
+                 "unknown": "プロンプト記録不足：分類保留"}
+        for pair in repeated:
+            lines.append(f"| {_local_report_cell(pair['wrong'])} | {_local_report_cell(pair['right'])} | {pair['count']} | {kinds[pair['kind']]} |")
     text = "\n".join(lines)
-    print(text)
     out = HISTORY.parent / "reports" / f"daily-{now:%Y-%m-%d}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text + "\n")
-    print(f"\n-> {out}")
+    print("report_saved: 1")
 
 
 def cmd_packs(a):

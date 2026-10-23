@@ -1,0 +1,1 @@
+Koe is for talking to an AI such as Claude Code or ChatGPT. Small transcription mistakes usually do not need fixing: send them as they are and let the AI understand your intent. Koe is not yet suited to final text pasted straight into chat or documents; ask the AI to polish what you said instead.

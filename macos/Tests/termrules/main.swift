@@ -1,4 +1,4 @@
-// test-sources: TermRules.swift AliasLearning.swift ../../Tests/TestSupport.swift
+// test-sources: TermRules.swift AliasLearning.swift AliasReplace.swift ../../Tests/TestSupport.swift
 import Foundation
 
 for word in ["how", "HOW", "the", "people", "ハウ", "確認", "ありがとう"] {
