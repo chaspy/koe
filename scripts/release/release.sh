@@ -118,7 +118,9 @@ mkdir -p "$DIR"
 rm -rf "$OUT" && mkdir -p "$OUT"
 git_root worktree add -q --detach "$SRC" "$BASE"
 (cd "$SRC/macos" && "${NICE[@]}" make test && "${NICE[@]}" swift build -c release -j 4)
-(cd "$SRC/windows" && "${NICE[@]}" go test ./core/... && GOOS=windows "${NICE[@]}" go vet ./...)
+(cd "$SRC/windows" && CGO_ENABLED=1 "${NICE[@]}" go test ./core/... &&
+  GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC="${WINDOWS_CC:-x86_64-w64-mingw32-gcc}" \
+  CXX="${WINDOWS_CXX:-x86_64-w64-mingw32-g++}" "${NICE[@]}" go vet ./...)
 (cd "$SRC" && "${NICE[@]}" python3 -m unittest discover -s eval -p 'test_*.py')
 (cd "$SRC" && "${NICE[@]}" python3 -m unittest discover -s scripts -p 'test_*.py')
 (cd "$SRC" && "${NICE[@]}" python3 -m unittest discover -s scripts/release -p 'test_*.py')

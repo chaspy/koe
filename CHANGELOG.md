@@ -4,6 +4,15 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 Changes that are not released yet are in [`changelog.d/`](changelog.d/), one file per pull request; they are folded into a version section here when a release is made (`python3 scripts/changelog.py release <version>`).
 
+## 0.9.3 — 2026-10-23
+
+### macOS
+- Refactored: Unified volume and silence assessment in the shared C++ library (koe-audio-core), with unchanged results.
+- Fixed: 開始音とハンズフリー録音の破棄音を停止音と同じ音量にしました。開始音・ロック録音の開始音は、音源の長さと後ろ80msの区間を文字起こし前に無音化し、認識への混入を防ぎます。
+
+### Windows
+- No changes.
+
 ## 0.9.2 — 2026-10-21
 
 ### Repository

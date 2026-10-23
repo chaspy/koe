@@ -1,4 +1,4 @@
-// test-sources: AudioQuality.swift AudioCoreQuality.swift ../KoeAudioCore/koe_audio.cpp
+// test-sources: AudioQuality.swift ../KoeAudioCore/koe_audio.cpp
 // make test: Sources/Koe/AudioQuality.swift の単体テスト（声の大きさの指標と「声が小さい」の判定、#181）
 import Foundation
 import KoeAudioCore
@@ -48,30 +48,31 @@ check(AudioQuality.tooQuiet(["level_db": -50.0]) == nil, "no speech_s (older rec
 check(AudioQuality.tooQuiet([:]) == nil, "empty")
 check(AudioQuality.quietMessage(-50.4).contains("-50 dB"), "message shows the level: \(AudioQuality.quietMessage(-50.4))")
 
-// C++ 版（KoeAudioCore）は同じ合成波形で Swift 版と同じ値
-let cases: [(String, [Int16])] = [
-    ("−50 dBFS", recording(speechDB: -50, seconds: 2)), ("−25 dBFS", recording(speechDB: -25, seconds: 2)),
-    ("−10 dBFS", recording(speechDB: -10, seconds: 1.5)), ("−46 dBFS", recording(speechDB: -46, seconds: 2)),
-    ("short", recording(speechDB: -50, seconds: 0.2)), ("noise only", recording(speechDB: -120, seconds: 1)),
-    ("below floor", recording(speechDB: -60, seconds: 2)), ("too short", Array(repeating: 100, count: 1000)),
-    ("clipped", (0..<16000).map { $0 % 40 < 20 ? Int16(32700) : Int16(-32700) }),
-    ("silence", Array(repeating: 0, count: 16000)),
-]
-for (name, pcm) in cases {
-    let a = AudioQuality.measure(pcm), b = AudioCoreQuality.measureCore(pcm)
-    check(AudioCoreQuality.diff(a, b).isEmpty, "\(name): swift \(a) vs core \(b)")
-    check(a.isEmpty == b.isEmpty, "\(name): both empty or both measured")
+// Frozen outputs from the pre-unification Swift implementation, never generated from C++.
+struct Golden: Decodable {
+    let name: String
+    let background_windows: Int
+    let voice_windows: Int
+    let amplitude: Int
+    let background: Int
+    let tail_samples: Int
+    let quality: [String: Double]
+    let too_quiet: Bool
 }
-check(!AudioCoreQuality.measureCore(recording(speechDB: -25, seconds: 2)).isEmpty, "core measures a normal voice")
-var q = koe_quality(); q.valid = 1; q.level_db = -50; q.speech_s = 1
-check(koe_too_quiet(&q) == 1, "core: quiet")
-q.level_db = -25
-check(koe_too_quiet(&q) == 0, "core: not quiet")
-var logged: [[String: Any]] = []
-let viaSetting = AudioCoreQuality.measure(recording(speechDB: -25, seconds: 2)) { logged.append($0) }
-check(!viaSetting.isEmpty && logged.isEmpty, "measure: no event when both agree")
-check(AudioCoreQuality.diff(["level_db": -25.0], ["level_db": -24.0]) as? [String: Double] == ["level_db": 1.0], "diff is numbers only")
-check(AudioCoreQuality.diff([:], ["level_db": -24.0])["empty_mismatch"] as? Bool == true, "diff: one side empty")
-
+let goldenURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+    .appendingPathComponent("../../../testdata/audio-quality.json").standardizedFileURL
+let cases = try JSONDecoder().decode([Golden].self, from: Data(contentsOf: goldenURL))
+for test in cases {
+    let amplitudes = Array(repeating: test.background, count: test.background_windows)
+        + Array(repeating: test.amplitude, count: test.voice_windows)
+        + Array(repeating: test.background, count: test.background_windows)
+    var pcm = amplitudes.flatMap { amplitude in
+        (0..<480).map { Int16($0 % 2 == 0 ? amplitude : -amplitude) }
+    }
+    pcm += Array(repeating: 0, count: test.tail_samples)
+    let measured = AudioQuality.measure(pcm)
+    check(measured as? [String: Double] == test.quality, "golden metrics: \(test.name)")
+    check((AudioQuality.tooQuiet(measured) != nil) == test.too_quiet, "golden quietness: \(test.name)")
+}
 if failures > 0 { print("\(failures) failure(s)"); exit(1) }
-print("quality: ok")
+print("quality: ok (\(cases.count) Swift golden cases)")

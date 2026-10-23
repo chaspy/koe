@@ -184,3 +184,24 @@ zip を作れないときは、`%LOCALAPPDATA%\Koe` フォルダ（メニュー�
 候補のマイクは 1 つずつ最大 1 秒ずつ試し、開けないものや無音のままのものは飛ばします。元のマイクは開いたままで、次の録音はまた元のマイクから始まります。短い録音は切り替え先が見つかる前に終わることがあります。切り替え先が動き出す前の音は残りません。いったん採用した切り替え先は、その録音が終わるまで使います。マイクが 1 つしかないときは、そのまま録音を続けます。スピーカーフォンに切り替わると会議の相手の声も拾うことがあるので、ヘッドホンの使用をおすすめします。元に戻すには `fallbackMic` を消す（または `false` にする）してから、Koe を起動し直してください。
 
 `koe.log` には `mic_fallback kind=usb`（または `built_in` / `other`）と種別だけが残り、デバイス名や音声は書きません。履歴の記録にも `mic_fallback` として種別だけが入ります。`fallbackMicName` は診断情報では伏せられます。新しい通信は増えません。
+
+
+## Building with the shared audio core
+
+Audio-quality measurement uses the same C++ C API as macOS through cgo. Building
+now requires a native C++20 compiler and, for macOS/Linux → Windows cross-builds,
+mingw-w64 (`brew install mingw-w64` on macOS). Go-only / `CGO_ENABLED=0` builds are
+not supported. From `windows/`:
+
+```sh
+CGO_ENABLED=1 go test ./core/...
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+  CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ go build -o Koe.exe .
+GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+  CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ go vet ./...
+```
+
+`./build.sh` selects the cross-compilers for vet/build and keeps native compilers
+for tests. Override them with `WINDOWS_CC` / `WINDOWS_CXX` if needed. See
+[the build notes](../docs/notes/audio-core-builds.md) for behavior changes and the
+shared golden tests. Real Windows validation is required before distribution.

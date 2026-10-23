@@ -1,0 +1,319 @@
+[
+  {
+    "amplitude" : 0,
+    "background" : 0,
+    "background_windows" : 0,
+    "name" : "empty",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 0
+  },
+  {
+    "amplitude" : 0,
+    "background" : 0,
+    "background_windows" : 10,
+    "name" : "silence",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 2,
+    "background" : 2,
+    "background_windows" : 10,
+    "name" : "muted",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 20,
+    "background" : 20,
+    "background_windows" : 10,
+    "name" : "noise_only",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 104,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "soft",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -50,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 30.800000000000001,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : true,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 1843,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "normal",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -25,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 55.799999999999997,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 183,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "quiet_below",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -45.100000000000001,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 35.700000000000003,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : true,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 184,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "quiet_at",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -45,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 35.799999999999997,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 185,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "quiet_above",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -45,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 35.799999999999997,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 49,
+    "background" : 0,
+    "background_windows" : 10,
+    "name" : "floor_below",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 50,
+    "background" : 0,
+    "background_windows" : 10,
+    "name" : "floor_at",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 51,
+    "background" : 0,
+    "background_windows" : 10,
+    "name" : "floor_above",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -56.200000000000003,
+      "noise_db" : -90.299999999999997,
+      "snr_db" : 34.200000000000003,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : true,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 316,
+    "background" : 100,
+    "background_windows" : 10,
+    "name" : "noise_gate_at",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 317,
+    "background" : 100,
+    "background_windows" : 10,
+    "name" : "noise_gate_above",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -40.299999999999997,
+      "noise_db" : -50.299999999999997,
+      "snr_db" : 10,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 104,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "short_speech",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -50,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 30.800000000000001,
+      "speech_s" : 0.27000000000000002
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 9
+  },
+  {
+    "amplitude" : 104,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "minimum_speech",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -50,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 30.800000000000001,
+      "speech_s" : 0.29999999999999999
+    },
+    "tail_samples" : 0,
+    "too_quiet" : true,
+    "voice_windows" : 10
+  },
+  {
+    "amplitude" : 104,
+    "background" : 0,
+    "background_windows" : 1,
+    "name" : "short_recording",
+    "quality" : {
+
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 2
+  },
+  {
+    "amplitude" : 104,
+    "background" : 0,
+    "background_windows" : 1,
+    "name" : "partial_window",
+    "quality" : {
+      "brightness" : 3.9980000000000002,
+      "clip_ratio" : 0,
+      "level_db" : -50,
+      "noise_db" : -90.299999999999997,
+      "snr_db" : 40.299999999999997,
+      "speech_s" : 0.059999999999999998
+    },
+    "tail_samples" : 1,
+    "too_quiet" : false,
+    "voice_windows" : 2
+  },
+  {
+    "amplitude" : 31999,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "clip_below",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0,
+      "level_db" : -0.20000000000000001,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 80.599999999999994,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 32000,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "clip_at",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0.5,
+      "level_db" : -0.20000000000000001,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 80.599999999999994,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  },
+  {
+    "amplitude" : 32767,
+    "background" : 3,
+    "background_windows" : 10,
+    "name" : "clipped",
+    "quality" : {
+      "brightness" : 4,
+      "clip_ratio" : 0.5,
+      "level_db" : -0,
+      "noise_db" : -80.799999999999997,
+      "snr_db" : 80.799999999999997,
+      "speech_s" : 0.59999999999999998
+    },
+    "tail_samples" : 0,
+    "too_quiet" : false,
+    "voice_windows" : 20
+  }
+]

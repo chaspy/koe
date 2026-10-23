@@ -108,9 +108,6 @@ enum Settings {
         get { defaults.object(forKey: "duckMedia") as? Bool ?? false }
         set { defaults.set(newValue, forKey: "duckMedia") }
     }
-    // 音質の判定に C++ 版（KoeAudioCore）を使う（AudioCoreQuality.swift）。新しい機能なので既定オフ。
-    // 有効にする: defaults write io.github.chaspy.koe audioCore -bool true
-    static var audioCore: Bool { defaults.object(forKey: "audioCore") as? Bool ?? false }
     // ⌃⌥V とメニューで最後の文をもう一度貼る（PasteLast.swift）。新しい機能なので既定オフ。切り替えは次の起動から
     static var pasteLast: Bool { defaults.object(forKey: "pasteLast") as? Bool ?? false }
     // アプリ同梱の音（start / stop）か、macOS 標準の音の名前（Ping 等）
@@ -1096,6 +1093,7 @@ final class Recorder {
     final class Track {
         let source: MicInput
         var samples: [Int16] = []
+        var chimes: [ChimeSpan] = []
         var preRoll: [Int16] = []
         var lastPeakAt = Date.distantPast
         var level: Float = 0   // 直近の塊の RMS（録音中の表示用）
@@ -1248,8 +1246,10 @@ final class Recorder {
         if peak > mutedPeak { track.lastPeakAt = Date() }
         track.level = AudioLevel.rms(chunk)
         if recording {
+            let voiceChunk = ChimeSpan.silence(chunk, offset: track.samples.count, spans: track.chimes,
+                                               sampleRate: Recorder.sampleRate)
             track.samples.append(contentsOf: chunk)
-            if PressGesture.rms(chunk) > voiceThreshold { voiceAt = Date() }
+            if PressGesture.rms(voiceChunk) > voiceThreshold { voiceAt = Date() }
         } else {
             track.preRoll.append(contentsOf: chunk)
             let maxPre = Int(preRollSeconds * Recorder.sampleRate)
@@ -1270,6 +1270,7 @@ final class Recorder {
         if !startEngine() { return false }
         lock.lock()
         for t in tracks {
+            t.chimes.removeAll()
             t.samples = warm ? t.preRoll : []
             t.preRoll.removeAll()
         }
@@ -1278,6 +1279,16 @@ final class Recorder {
         lock.unlock()
         MediaDuck.recordingStarted()
         return true
+    }
+
+    // play と位置の記録の間に入力バッファを追加させない。鳴らせなければ除外もしない。
+    func playExcludingChime(duration: Double, play: () -> Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard play(), recording else { return }
+        for track in tracks {
+            track.chimes.append(ChimeSpan(start: track.samples.count, duration: duration))
+        }
     }
 
     func stop(_ done: @escaping (Capture) -> Void) {
@@ -1295,7 +1306,13 @@ final class Recorder {
         do {
             self.lock.lock()
             self.recording = false
-            let takes = self.tracks.map { ($0.source.name, $0.samples) }
+            // マイク停止の判定だけは元の信号を使う（通知音のみの録音を故障と誤認しない）。
+            let allSilent = self.tracks.allSatisfy { track in
+                track.samples.allSatisfy { abs(Int($0)) <= self.mutedPeak }
+            }
+            let takes = self.tracks.map {
+                ($0.source.name, ChimeSpan.silence($0.samples, spans: $0.chimes, sampleRate: Recorder.sampleRate))
+            }
             MediaDuck.recordingEnded()
             self.tracks.forEach { $0.samples.removeAll() }
             self.lock.unlock()
@@ -1310,7 +1327,6 @@ final class Recorder {
             let captured = chosen.1
             let peak = captured.reduce(0) { max($0, abs(Int($1))) }
             // どのマイクも完全な無音ならエンジンが固まっている可能性。次に備えて張り直す
-            let allSilent = takes.allSatisfy { $0.1.reduce(0) { max($0, abs(Int($1))) } <= self.mutedPeak }
             if allSilent && captured.count > Int(Recorder.sampleRate * 0.5) { self.restart(reason: "digital_silence") }
             let url = self.dir.appendingPathComponent("rec-\(UUID().uuidString).wav")
             self.writeWAV(trimmed.isEmpty ? captured : trimmed, to: url)
@@ -1318,7 +1334,7 @@ final class Recorder {
             Events.log("tracks", ["tracks": takes.map { "\($0.0): \(String(format: "%.1f", Double($0.1.count) / Recorder.sampleRate))s peak \($0.1.reduce(0) { max($0, abs(Int($1))) })" }.joined(separator: " / ")])
             var cap = Capture(url: url, seconds: Double(captured.count) / Recorder.sampleRate,
                               voicedSeconds: Double(trimmed.count) / Recorder.sampleRate, peak: peak, device: chosen.0)
-            cap.quality = Settings.audioCore ? AudioCoreQuality.measure(captured) { Events.log("audio_core_diff", $0) } : AudioQuality.measure(captured)
+            cap.quality = AudioQuality.measure(captured)
             // 比較用に、使わなかった側のマイクの録音も残す（同じ発話のマイク違い）
             if Settings.saveAllMics, let other = takes.first(where: { $0.0 != chosen.0 }), !other.1.isEmpty {
                 let altURL = self.dir.appendingPathComponent("rec-\(UUID().uuidString).alt.wav")
@@ -3052,8 +3068,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if recorder.start() {
             RepoContext.recordingStarted(app: u.record["app"] as? String ?? "", pid: NSWorkspace.shared.frontmostApplication?.processIdentifier)
-            // 開始音はマイクに入り込むので小さめに鳴らす
-            play(Settings.startSound, volume: 0.35)
+            play(Settings.startSound, excludingFromRecording: true)
             current = u
             // 押したときのウィンドウは、録音を始めた後に裏で取る（貼る瞬間に前面が変わっていたら戻す）
             if let f = front { FocusRestore.capture(pid: f.processIdentifier, bundleID: f.bundleIdentifier ?? "") { u.focus = $0 } }
@@ -3072,7 +3087,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         u.locked = true
         u.toggled = false
         lastShortTap = .distantPast
-        play("lock_start", volume: 0.5)
+        play("lock_start", volume: 0.5, excludingFromRecording: true)
         Events.log("lock_started", ["from": from])
         render()
     }
@@ -3084,7 +3099,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard why == .discard else { return end() }
         current = nil
         recorder.discard()
-        play(Settings.stopSound, volume: 0.35)
+        play(Settings.stopSound)
         showError("声が聞こえなかったので録音をやめました")
     }
 
@@ -3189,12 +3204,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func play(_ name: String, volume: Float = 1.0) {
+    private func play(_ name: String, volume: Float = 1.0, excludingFromRecording: Bool = false) {
         guard Settings.sounds else { return }
         let sound = Bundle.main.url(forResource: name, withExtension: "aiff").flatMap { NSSound(contentsOf: $0, byReference: true) }
             ?? NSSound(named: NSSound.Name(name))
-        sound?.volume = volume
-        sound?.play()
+        guard let sound else { return }
+        sound.volume = volume
+        if excludingFromRecording {
+            recorder.playExcludingChime(duration: sound.duration) { sound.play() }
+        } else {
+            sound.play()
+        }
     }
 
     // アクセシビリティの許可が無いと、送った ⌘V は黙って捨てられる（貼れたように見えて何も入らない）。

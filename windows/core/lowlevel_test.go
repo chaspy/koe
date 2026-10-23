@@ -1,53 +1,77 @@
 package core
 
 import (
-	"math"
+	"encoding/json"
+	"os"
+	"reflect"
 	"testing"
 )
 
-func TestRecordingLevel(t *testing.T) {
-	for _, tt := range []struct {
-		name      string
-		amplitude int16
-		quiet     bool
-	}{
-		{"silence", 0, false},
-		{"muted", 2, false},
-		{"quiet", 100, true},
-		{"below threshold", 184, true},
-		{"above threshold", 185, false},
-		{"normal", 1000, false},
-		{"full scale negative", -32768, false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			pcm := make([]int16, SampleRate)
-			for i := range pcm {
-				pcm[i] = tt.amplitude
+// These expectations were captured from the old Swift implementation, not C++.
+// The macOS test reads this exact file and builds the same integer waveform.
+type qualityGolden struct {
+	Name              string             `json:"name"`
+	BackgroundWindows int                `json:"background_windows"`
+	VoiceWindows      int                `json:"voice_windows"`
+	Amplitude         int16              `json:"amplitude"`
+	Background        int16              `json:"background"`
+	TailSamples       int                `json:"tail_samples"`
+	Quality           map[string]float64 `json:"quality"`
+	TooQuiet          bool               `json:"too_quiet"`
+}
+
+func (c qualityGolden) pcm() []int16 {
+	var pcm []int16
+	for window := 0; window < 2*c.BackgroundWindows+c.VoiceWindows; window++ {
+		amplitude := c.Background
+		if window >= c.BackgroundWindows && window < c.BackgroundWindows+c.VoiceWindows {
+			amplitude = c.Amplitude
+		}
+		for sample := 0; sample < 480; sample++ {
+			value := amplitude
+			if sample%2 != 0 {
+				value = -value
 			}
-			level, quiet := RecordingLevel(pcm)
-			if quiet != tt.quiet {
-				t.Fatalf("level=%f quiet=%v, want %v", level, quiet, tt.quiet)
-			}
-			want := 0.0
-			if Peak(pcm) > MutedPeak {
-				want = 20 * math.Log10(math.Abs(float64(tt.amplitude))/32768)
-			}
-			if math.Abs(level-want) > 1e-9 {
-				t.Fatalf("level=%f, want %f", level, want)
-			}
-		})
+			pcm = append(pcm, value)
+		}
 	}
-	if level, quiet := RecordingLevel(nil); level != 0 || quiet {
-		t.Fatalf("empty: %f %v", level, quiet)
+	return append(pcm, make([]int16, c.TailSamples)...)
+}
+
+func goldenValues(q AudioQuality) map[string]float64 {
+	if !q.Valid {
+		return map[string]float64{}
+	}
+	return map[string]float64{
+		"level_db": q.LevelDB, "noise_db": q.NoiseDB, "snr_db": q.SNRDB,
+		"speech_s": q.SpeechS, "clip_ratio": q.ClipRatio, "brightness": q.Brightness,
 	}
 }
 
-func TestRecordingLevelUsesAllSamples(t *testing.T) {
-	// Alternating polarity, silence, and a partial 30 ms window all contribute.
-	pcm := []int16{100, -100, 0, 0, 100}
-	level, quiet := RecordingLevel(pcm)
-	want := 20 * math.Log10(math.Sqrt(6000)/32768)
-	if !quiet || math.Abs(level-want) > 1e-9 {
-		t.Fatalf("level=%f quiet=%v, want %f true", level, quiet, want)
+func TestAudioQualitySwiftGolden(t *testing.T) {
+	var cases []qualityGolden
+	data, err := os.ReadFile("../../testdata/audio-quality.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) != 21 {
+		t.Fatalf("golden cases: %d", len(cases))
+	}
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			pcm := c.pcm()
+			q := MeasureAudioQuality(pcm)
+			values := goldenValues(q)
+			if !reflect.DeepEqual(values, c.Quality) || q.TooQuiet != c.TooQuiet {
+				t.Fatalf("quality=%v quiet=%v; want %v quiet=%v", values, q.TooQuiet, c.Quality, c.TooQuiet)
+			}
+			level, quiet := RecordingLevel(pcm)
+			if level != q.LevelDB || quiet != q.TooQuiet {
+				t.Fatal("level-only view differs from quality")
+			}
+		})
 	}
 }

@@ -1015,11 +1015,11 @@ func (a *App) process(u *utterance) {
 		a.rec.Reopen("digital_silence")
 		return
 	}
-	if len(trimmed) > 0 {
-		// level of the voiced part (same key as the mac's history); the hint is opt-in
-		levelDB, tooQuiet := core.RecordingLevel(trimmed)
-		rec["level_db"] = core.Round2(levelDB)
-		a.warnLowLevel(levelDB, tooQuiet)
+	// Use the complete recording, as on macOS, to estimate background and voiced windows.
+	quality := core.MeasureAudioQuality(captured)
+	if quality.Valid {
+		rec["level_db"] = quality.LevelDB
+		a.warnLowLevel(quality.LevelDB, quality.TooQuiet)
 	}
 	if len(trimmed) == 0 {
 		rec["outcome"] = "no_voice"

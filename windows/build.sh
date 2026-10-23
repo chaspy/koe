@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds windows/dist/Koe-windows-x64.zip on macOS / Linux (cross-compile).
 #   ./build.sh            # test, build, package
-# Needs: go, curl (or gh), unzip, zip. ffmpeg only if assets/*.wav are missing.
+# Needs: go, a native C++20 compiler, mingw-w64, curl (or gh), unzip, zip. ffmpeg only if assets/*.wav are missing.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -41,10 +41,16 @@ check_sha256() {
   fi
 }
 
-echo "== test (pure logic) =="
-go vet ./...
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go vet ./...
-go test ./core
+# Keep host compilers for native tests; only cross steps use MinGW.
+WINDOWS_CC="${WINDOWS_CC:-x86_64-w64-mingw32-gcc}"
+WINDOWS_CXX="${WINDOWS_CXX:-x86_64-w64-mingw32-g++}"
+command -v "$WINDOWS_CC" >/dev/null
+command -v "$WINDOWS_CXX" >/dev/null
+
+echo "== test (native cgo) =="
+CGO_ENABLED=1 go vet ./...
+CGO_ENABLED=1 go test ./core/...
+CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC="$WINDOWS_CC" CXX="$WINDOWS_CXX" go vet ./...
 
 echo "== sounds =="
 mkdir -p assets
@@ -110,7 +116,7 @@ echo "== build Koe.exe ($VERSION, $REV) =="
 mkdir -p "$STAGE"
 find "$STAGE" -mindepth 1 -delete
 mkdir -p "$STAGE/packs" "$STAGE/assets"
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath \
+CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC="$WINDOWS_CC" CXX="$WINDOWS_CXX" go build -trimpath \
   -ldflags "-H windowsgui -s -w -X main.version=$VERSION -X main.rev=$REV" -o "$STAGE/Koe.exe" .
 cp "$WDIR"/whisper-server.exe "$WDIR"/*.dll "$STAGE/"
 [ -f "$VDIR/whisper-server-vulkan.exe" ] && cp "$VDIR/whisper-server-vulkan.exe" "$STAGE/"
