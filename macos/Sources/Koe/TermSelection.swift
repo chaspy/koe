@@ -10,11 +10,13 @@ enum TermSelection {
         var result: [String: Int] = [:]
         for entry in entries {
             let aliases = entry.aliases.map { $0.hasPrefix("~") ? String($0.dropFirst()) : $0 }
-            let pastedKeys = ([entry.term] + aliases).map(TermRules.key).filter { $0.count >= 2 }
+            // Token boundaries only (#196): "HTML" is not a hit for "HTM", nor "bash"/"ssh" for "SH"
+            let pastedPatterns = ([entry.term] + aliases).map(TermRules.key).filter { $0.count >= 2 }.compactMap(AliasReplace.matcher)
             let rawPatterns = aliases.compactMap { AliasReplace.matcher(TermRules.key($0)) }
             let count = recent.reduce(0) { total, sample in
                 // Preserve the existing pasted score; each channel contributes at most one per utterance.
-                let pasted = pastedKeys.contains { sample.pasted.range(of: $0).location != NSNotFound } ? 1 : 0
+                let pastedRange = NSRange(location: 0, length: sample.pasted.length)
+                let pasted = pastedPatterns.contains { $0.firstMatch(in: sample.pasted as String, range: pastedRange) != nil } ? 1 : 0
                 let range = NSRange(sample.raw.startIndex..., in: sample.raw)
                 let raw = includeRaw && rawPatterns.contains { $0.firstMatch(in: sample.raw, range: range) != nil } ? 1 : 0
                 return total + pasted + raw
@@ -32,11 +34,16 @@ enum TermSelection {
         }.map { $0.element.term }
         let rest = (personal + packs).map(\.term).filter { (counts[$0] ?? 0) == 0 }
         let aliases = Set(all.flatMap(\.aliases).map(TermRules.aliasKey))
+        // A shorter term pulls the longer one down (HTM makes "HTML" come out as "HTM", #196), so the longer
+        // terms that start with it go in first; when space is short the longer one wins
+        let allTerms = all.map(\.term)
         var selected: [String] = [], length = 0
         for term in TermRules.preferred(used + rest, aliases: aliases) {
-            guard length + term.count <= limit else { continue }
-            selected.append(term)
-            length += term.count + 1
+            for t in AliasReplace.longer(than: term, in: allTerms) + [term] where !selected.contains(t) {
+                guard length + t.count <= limit else { continue }
+                selected.append(t)
+                length += t.count + 1
+            }
         }
         return selected
     }

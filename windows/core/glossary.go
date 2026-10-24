@@ -106,11 +106,12 @@ func AutocorrectSynced(text string, entries []Entry) (string, []string, bool) {
 	var applied []string
 	synced := false
 	t := text
+	terms := termsOf(entries)
 	for _, p := range corrections(entries) {
 		if !strings.Contains(t, p.head) {
 			continue
 		}
-		if out, n := p.replaceAll(t); n > 0 {
+		if out, n := p.replaceAll(t, LongerTerms(p.right, terms)); n > 0 {
 			applied = append(applied, p.head+"→"+p.right)
 			synced = synced || p.synced
 			t = out
@@ -154,14 +155,16 @@ func newCorrection(alias string, e Entry) (correction, bool) {
 }
 
 // replaceAll replaces every occurrence of head at word boundaries (and before
-// follow, if set) and returns the text and the count.
-func (p correction) replaceAll(t string) (string, int) {
+// follow, if set) and returns the text and the count. Where the text already
+// continues into one of the longer terms, it is left alone (#196).
+func (p correction) replaceAll(t string, longer []string) (string, int) {
 	var b strings.Builder
 	n := 0
 	i := 0
 	for i < len(t) {
 		if strings.HasPrefix(t[i:], p.head) && boundaryOK(t, i, i+len(p.head)) &&
-			(p.follow == nil || p.follow.MatchString(t[i+len(p.head):])) {
+			(p.follow == nil || p.follow.MatchString(t[i+len(p.head):])) &&
+			!continuesInto(p.right, p.head, t[i+len(p.head):], longer) {
 			b.WriteString(p.right)
 			i += len(p.head)
 			n++
@@ -190,41 +193,21 @@ func boundaryOK(t string, start, end int) bool {
 	return true
 }
 
-// UsageCounts counts in how many recent texts each entry appears (term or any
-// alias, case-insensitive, keys of 2+ chars).
+// UsageCounts counts in how many recent pasted texts each entry appears (term or
+// any alias, case-insensitive, keys of 2+ chars, on word boundaries). The app
+// uses CountTermUsage, which also counts aliases in the raw text.
 func UsageCounts(entries []Entry, recentTexts []string) map[string]int {
-	texts := make([]string, len(recentTexts))
+	samples := make([]UsageSample, len(recentTexts))
 	for i, t := range recentTexts {
-		texts[i] = strings.ToLower(t)
+		samples[i] = UsageSample{Pasted: t}
 	}
-	u := map[string]int{}
-	for _, e := range entries {
-		var keys []string
-		for _, k := range append([]string{e.Term}, e.Aliases...) {
-			k = strings.ToLower(strings.TrimPrefix(k, "~"))
-			if runeLen(k) >= 2 {
-				keys = append(keys, k)
-			}
-		}
-		n := 0
-		for _, t := range texts {
-			for _, k := range keys {
-				if strings.Contains(t, k) {
-					n++
-					break
-				}
-			}
-		}
-		if n > 0 {
-			u[e.Term] = n
-		}
-	}
-	return u
+	return CountTermUsage(entries, samples)
 }
 
 // WhisperTerms picks terms for whisper's initial prompt within `limit` chars:
 // recently used terms first (most used first), then unused personal terms,
-// then unused pack terms (file order).
+// then unused pack terms (file order). A term that a longer term starts with
+// (HTM / HTML) brings the longer one in first; when space is short the longer wins.
 func WhisperTerms(personal, packs []Entry, counts map[string]int, limit int) []string {
 	has := func(list []Entry, term string) bool {
 		for _, e := range list {
@@ -250,21 +233,8 @@ func WhisperTerms(personal, packs []Entry, counts map[string]int, limit int) []s
 		}
 	}
 	sort.SliceStable(used, func(i, j int) bool { return counts[used[i]] > counts[used[j]] })
-	var out []string
-	length := 0
-	seen := map[string]bool{}
-	for _, t := range append(used, rest...) {
-		if seen[t] {
-			continue
-		}
-		if length+runeLen(t) > limit {
-			continue
-		}
-		seen[t] = true
-		out = append(out, t)
-		length += runeLen(t) + 1
-	}
-	return out
+	// a shorter term pulls the longer one down (#196), so the longer ones go in first
+	return fillTerms(append(used, rest...), termsOf(all), limit)
 }
 
 // DefaultPrompt is the mac default whisper prompt (makes whisper add 、。？).

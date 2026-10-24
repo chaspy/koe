@@ -35,5 +35,32 @@ for _ in 0..<12 {
     history.append(sample)
 }
 check(before == 0 && after == 11, "causal replay coverage")
+// #196: prefix collisions between dictionaries and token-boundary counting
+let htm = TermSelection.Entry(term: "HTM", aliases: [])
+let html = TermSelection.Entry(term: "HTML", aliases: ["エイチティーエムエル"])
+let sh = TermSelection.Entry(term: "SH", aliases: ["エスエイチ"])
+let tokenCounts = TermSelection.counts([htm, html, sh], samples: [
+    .init(pasted: "HTMLを書く", raw: ""), .init(pasted: "bash と ssh で入る", raw: ""), .init(pasted: "HTM の略", raw: ""),
+])
+check(tokenCounts["HTM"] == 1, "HTML does not count as HTM: \(tokenCounts)")
+check(tokenCounts["HTML"] == 1, "HTML counts once")
+check(tokenCounts["SH"] == nil, "bash/ssh do not count as SH: \(tokenCounts)")
+check(TermSelection.counts([sh], samples: [.init(pasted: "SH で書く", raw: "")])["SH"] == 1, "standalone SH counts")
+let withLonger = TermSelection.select(personal: [], packs: [], organization: [htm, html], counts: ["HTM": 3], limit: 120)
+check(withLonger.contains("HTML") && withLonger.contains("HTM"), "prompt includes HTML when HTM is in: \(withLonger)")
+check(withLonger.firstIndex(of: "HTML")! < withLonger.firstIndex(of: "HTM")!, "longer term first: \(withLonger)")
+let tight = TermSelection.select(personal: [], packs: [], organization: [htm, html], counts: ["HTM": 3], limit: 5)
+check(tight == ["HTML"], "when space is short the longer term wins: \(tight)")
+check(AliasReplace.apply("HTMLを書く", wrong: "HTM", right: "HTMx", longer: ["HTML"]).text == "HTMLを書く", "an HTM alias does not touch HTML")
+check(AliasReplace.apply("エイチティーエムLを書く", wrong: "エイチティーエム", right: "HTM", longer: ["HTML"]).text == "エイチティーエムLを書く",
+      "no replacement where the text continues into the longer term")
+check(AliasReplace.apply("エイチティーエムを書く", wrong: "エイチティーエム", right: "HTM", longer: ["HTML"]).text == "HTMを書く",
+      "standalone HTM alias still fires")
+check(AliasReplace.longer(than: "HTM", in: ["HTML", "HTM", "XML", "htmx"]) == ["HTML"], "longer terms")
+check(AliasReplace.longer(than: "CI", in: ["CI/CD"]).isEmpty && AliasReplace.longer(than: "Claude", in: ["Claude Code"]).isEmpty,
+      "terms that continue after a space or symbol are separate words")
+check(AliasReplace.longer(than: "PR", in: ["Prometheus"]).isEmpty, "case differs")
+check(AliasReplace.longer(than: "プルリク", in: ["プルリクエスト"]) == ["プルリクエスト"], "katakana continues")
+
 if failures > 0 { exit(1) }
 print("termselection: ok; replay utterances=12 before=\(before) after=\(after)")

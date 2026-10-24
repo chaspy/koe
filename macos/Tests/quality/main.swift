@@ -74,5 +74,7 @@ for test in cases {
     check(measured as? [String: Double] == test.quality, "golden metrics: \(test.name)")
     check((AudioQuality.tooQuiet(measured) != nil) == test.too_quiet, "golden quietness: \(test.name)")
 }
+// 取り込んだ koe-audio-core の C API の版（00fe10f から。リンクした実装とヘッダが揃っている）
+check(koe_audio_api_version() == KOE_AUDIO_API_VERSION && KOE_AUDIO_API_VERSION == 1, "C API version")
 if failures > 0 { print("\(failures) failure(s)"); exit(1) }
 print("quality: ok (\(cases.count) Swift golden cases)")

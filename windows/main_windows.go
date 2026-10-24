@@ -85,6 +85,9 @@ type App struct {
 
 	improveOn      atomic.Bool // improvement loop on (config improveEnabled; the tray switches it)
 	improveRunning atomic.Bool // one improvement run at a time
+	// only touched by the one improvement run at a time (improveRunning)
+	improveResolved improveResolved
+	improveFailures core.ImproveFailures
 
 	mu        sync.Mutex
 	errMsg    string
@@ -247,7 +250,7 @@ func (a *App) startup() {
 		a.exportReceivers()
 	}()
 	if firstRun {
-		go messageBox("Koe", "Koe を起動しました。\n\n初回は音声認識モデル（約 190MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。\n\n文字起こしが遅いと感じたら、アイコンのメニュー「モデル（速さ⇔精度）」で base に軽くしてください（誤変換は増えます）。", 0x40)
+		go messageBox("Koe", "Koe は、AI に話しかけるための入力です。多少聞き間違えても AI が意味を汲み取るので、直さずにそのまま送って大丈夫です。\n\n初回は音声認識モデル（約 190MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。\n\n文字起こしが遅いと感じたら、アイコンのメニュー「モデル（速さ⇔精度）」で base に軽くしてください（誤変換は増えます）。", 0x40)
 	}
 	a.reportPreviousUpdate()
 	go a.updateLoop()
@@ -1041,8 +1044,11 @@ func (a *App) process(u *utterance) {
 	usageAge := a.usage.Age(time.Now())
 	tUsage := time.Now()
 	prompt := "" // Parakeet-ja takes no prompt; the terms still go to Autocorrect
+	// which dictionary terms were in the prompt (history only, #223)
+	rec["prompt_terms"] = []string{}
 	if !a.parakeet() {
 		terms := core.WhisperTerms(personal, packs, usage, core.WhisperPromptTermLimit)
+		rec["prompt_terms"] = terms
 		prev := a.previousText(u)
 		if u.locked {
 			prev = "" // a long talk on its own (mac: the same)
@@ -1363,18 +1369,15 @@ func (a *App) packs() []core.Pack {
 	return core.MarkSyncedPacks(core.ListPacks(filepath.Join(a.exeDir, "packs"), a.userPacksDir()), a.userPacksDir(), a.cfg.PackSources)
 }
 
-// computeUsage counts, for every glossary and pack term, how often it was
-// pasted recently (reads up to 600 history files; run off the transcription
-// path via a.usage).
+// computeUsage counts, for every glossary and pack term, how often it (or an
+// alias) was in the recent pasted and raw texts (reads up to 600 history files;
+// run off the transcription path via a.usage).
 func (a *App) computeUsage() map[string]int {
 	t0 := time.Now()
 	entries := append(core.ReadGlossaryFile(a.glossaryPath()), core.LoadPackEntries(a.packs(), a.cfg.EnabledPacks)...)
-	var texts []string
-	for _, p := range core.RecentPasted(a.historyDir(), 300) {
-		texts = append(texts, p.Text)
-	}
-	u := core.UsageCounts(entries, texts)
-	a.log.Printf("usage_counted terms=%d texts=%d ms=%d", len(entries), len(texts), time.Since(t0).Milliseconds())
+	samples := core.RecentUsageSamples(a.historyDir(), core.UsageSamples)
+	u := core.CountTermUsage(entries, samples)
+	a.log.Printf("usage_counted terms=%d texts=%d ms=%d", len(entries), len(samples), time.Since(t0).Milliseconds())
 	return u
 }
 

@@ -4,11 +4,13 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import re
 import socket
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -206,12 +208,23 @@ class DeliveredTest(unittest.TestCase):
                 koe_eval.HISTORY = orig
 
     def test_daily_prints_numbers_only(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        # 時計を当日の 12:00 と 23:50 に止める。実時間の now-30 分に置くと 0:30 前は前日の記録になり「今日」の段が出ない
+        for hour, minute in [(12, 0), (23, 50)]:
+            with self.subTest(clock=f"{hour:02d}:{minute:02d}"):
+                self._daily_prints_numbers_only(datetime.now().replace(hour=hour, minute=minute, second=0, microsecond=0))
+
+    def _daily_prints_numbers_only(self, clock):
+        class FixedClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock.astimezone(tz) if tz else clock
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(koe_eval, "datetime", FixedClock):
             root = Path(tmp)
             orig = koe_eval.HISTORY, koe_eval.CLAUDE_PROJECTS
             koe_eval.HISTORY, koe_eval.CLAUDE_PROJECTS = root / "history", root / "projects"
             try:
-                now = datetime.now().astimezone().replace(microsecond=0) - timedelta(minutes=30)
+                now = clock.astimezone() - timedelta(minutes=30)
                 texts = ["秘密の文その一です", "秘密の文その二です", "どこにも届かなかった文"]
                 (root / "projects/p").mkdir(parents=True)
                 rows = []
@@ -226,7 +239,9 @@ class DeliveredTest(unittest.TestCase):
                     if i < 2:
                         ts = (utc + timedelta(seconds=[0.2, 31][i])).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
                         rows.append({"type": "user", "message": {"content": text}, "timestamp": ts})
-                (root / "projects/p/s.jsonl").write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+                session = root / "projects/p/s.jsonl"
+                session.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n")
+                os.utime(session, (clock.timestamp(), clock.timestamp()))  # 読み込みは更新時刻で絞るので止めた時計に合わせる
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
                     koe_eval.cmd_daily(argparse.Namespace(days=1))

@@ -4,6 +4,28 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 Changes that are not released yet are in [`changelog.d/`](changelog.d/), one file per pull request; they are folded into a version section here when a release is made (`python3 scripts/changelog.py release <version>`).
 
+## 0.9.5 — 2026-10-25
+
+### Repository
+- Added: eval/voice_isolation_bench.py で、Apple の声の分離（AUSoundIsolation をオフラインで）が whisper の認識に効くかを公開データ（JSUT・DEMAND）で測れるようにしました。結果は docs/notes/2026-10-24-voice-isolation-whisper.md。
+- Added: eval/asr_bench.py に Moonshine tiny ja・Qwen3-ASR 0.6B・ReazonSpeech zipformer・Parakeet の Core ML 実行プロバイダーを追加し、結果を docs/notes/2026-10-19-asr-engines-on-mac.md に足しました。
+- Fixed: eval/asr_bench.py の whisper のエンジンが動かなかった（hints が無く AttributeError）。用語の音声のキャッシュを文ごとにしました（パックが変わっても別の文の音声と組まない）。
+- Added: eval/asr_bench.py に --noise（DEMAND のオフィス・カフェの雑音を SNR 20・15・10 dB で混ぜた Koe の既定条件）を追加し、結果を docs/notes/2026-10-19-asr-engines-on-mac.md に足しました。
+- Added: eval/asr_bench.py に WhisperKit（koe-ios のエンジン。turbo と 626 MB 版、Core ML）を追加し、結果を docs/notes/2026-10-19-asr-engines-on-mac.md に足しました。
+- Fixed: Windows のテスト TestReceiverNotes が開発者パックの語数を固定値で持っていて、パックに語を足すと落ちていた。パックから数えるようにしました。
+
+### macOS
+- Added: メニューバーの Koe のアイコンがノッチの裏に隠れても、⌃⌥K か Koe をもう一度開くことでメニューを開けるようにしました。隠れていると気づいたときは 1 日 1 回まで知らせます（録音中は出しません）。
+- Fixed: 辞書に短い語（HTM など）があると、長い語（HTML）が短い語に寄せて書き起こされることがあった。長い語を初期プロンプトに一緒に入れ、長い語の中では短い語への置き換えをしないようにしました。最近の発話の語の数え方も語の区切りで数えるようにしました。開発者パックに HTML を追加しました。
+- Added: 録音の数値から入力音声の不調（音の途切れ・小さい声・周りの音・マイクの切り替わり・貼り付けの失敗）を見つける検出器（内部のみ。まだ画面には出ません）。
+- Added: メニューに「診断する…」を追加。直近の録音の数値から入力音声の不調と直し方を示し、試した後の数回の録音で直ったかを確かめます。強い所見は 1 日 1 回まで知らせます（録音中は出しません）。
+- Added: 「診断する…」に「Claude Code で詳しく調べる」を追加。数値だけの koe-diagnose.json と README-for-agents.md をデスクトップに書き出し、頼み方をクリップボードに入れます（話した内容・音声・ウィンドウ名・機器の名前は入れません）。
+- Added: 使い方に「録音の不調のよくある原因」を追加し、「診断する…」から開けるようにしました。
+- Changed: 取り込んでいる koe-audio-core を 00fe10f に更新（C API の版 koe_audio_api_version() を追加。音量・無音の判定は変わりません）。
+
+### Windows
+- No changes.
+
 ## 0.9.4 — 2026-10-23
 
 ### macOS

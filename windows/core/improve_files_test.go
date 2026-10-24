@@ -65,8 +65,8 @@ func TestMarkImproveItems(t *testing.T) {
 		{"i": float64(1), "error": true, "read_ok": false, "impact": "misacted"},
 		// [2] has no judgement: still marked as scanned, without a label
 	}}
-	if judged, corrected := MarkImproveItems(paths, batch, ans); judged != 2 || corrected != 1 {
-		t.Fatal(judged, corrected)
+	if m := MarkImproveItems(paths, batch, ans, "2026-10-25T01:00:00Z"); m.Judged != 2 || m.Corrected != 1 || len(m.Saved) != 2 {
+		t.Fatal(m)
 	}
 	r0, r1, r2 := readJSON(t, paths[batch[0].ID]), readJSON(t, paths[batch[1].ID]), readJSON(t, paths[batch[2].ID])
 	if r0["communication"] != "understood" || r0["communication_note"] != "ok" || r0["glossary_scanned"] != true || r0["raw"] == nil {
@@ -82,6 +82,35 @@ func TestMarkImproveItems(t *testing.T) {
 	items, _ = LoadImproveItems(dir)
 	if n := len(ImproveBatch(items)); n != 4 {
 		t.Fatal(n)
+	}
+}
+
+// The whole judgement is kept (#223): misheard or not, read right or not, the time, and the pairs.
+func TestMarkImproveItemsKeepsJudgement(t *testing.T) {
+	dir := eightDays(t)
+	items, paths := LoadImproveItems(dir)
+	batch := ImproveBatch(items)[:3]
+	raw, _ := batch[1].Record["raw"].(string)
+	ans := ImproveAnswer{
+		Judgements: []map[string]any{
+			{"i": float64(0), "error": false},
+			{"i": float64(1), "error": true, "read_ok": false, "impact": "misacted"},
+		},
+		Terms: []map[string]any{{"i": float64(1), "wrong": raw, "right": "Terraform"}},
+	}
+	MarkImproveItems(paths, batch, ans, "2026-10-25T01:00:00Z")
+	r0, r1, r2 := readJSON(t, paths[batch[0].ID]), readJSON(t, paths[batch[1].ID]), readJSON(t, paths[batch[2].ID])
+	if r0["asr_error"] != false || r0["judged_at"] != "2026-10-25T01:00:00Z" || r0["read_ok"] != nil || r0["unknown"] != false {
+		t.Fatal(r0)
+	}
+	if r1["asr_error"] != true || r1["read_ok"] != false || r1["impact"] != "misacted" {
+		t.Fatal(r1)
+	}
+	if ms, _ := r1["mishearings"].([]any); len(ms) != 1 {
+		t.Fatal(r1["mishearings"])
+	}
+	if ms, ok := r2["mishearings"].([]any); !ok || len(ms) != 0 || r2["judged_at"] != nil {
+		t.Fatal(r2)
 	}
 }
 

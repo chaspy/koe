@@ -124,17 +124,17 @@ func TestMergeImproveTerms(t *testing.T) {
 		return map[string]any{"wrong": wrong, "right": right, "kind": "term", "explicit": explicit}
 	}
 	// once, not explicit: counted, not promoted
-	cand, promote := MergeImproveTerms(nil, []map[string]any{term("プロリク", "プルリク", false)})
+	cand, promote := MergeImproveTerms(nil, []map[string]any{term("プロリク", "プルリク", false)}, nil)
 	if cand["プルリク"].Count != 1 || len(promote) != 0 {
 		t.Fatal(cand, promote)
 	}
 	// twice: promoted, but only as "~" (a note, never replaced)
-	_, promote = MergeImproveTerms(cand, []map[string]any{term("プロリック", "プルリク", false)})
+	_, promote = MergeImproveTerms(cand, []map[string]any{term("プロリック", "プルリク", false)}, nil)
 	if got := strings.Join(promote["プルリク"], ","); got != "~プロリク,~プロリック" {
 		t.Fatal(got)
 	}
 	// explicit once: a sure replacement, except a common form (3 chars or less / no kana or latin)
-	_, promote = MergeImproveTerms(nil, []map[string]any{term("テラホーム", "Terraform", true), term("かぶる", "Kaburu", true)})
+	_, promote = MergeImproveTerms(nil, []map[string]any{term("テラホーム", "Terraform", true), term("かぶる", "Kaburu", true)}, nil)
 	if got := strings.Join(promote["Terraform"], ","); got != "テラホーム" {
 		t.Fatal(got)
 	}
@@ -149,7 +149,7 @@ func TestMergeImproveTerms(t *testing.T) {
 		term("これはとても長いまちがいの形です", "GitHub", true),
 		term("a、b", "GitHub", true),
 		{"wrong": "パン粉さん", "right": "panko", "kind": "person", "explicit": true},
-	})
+	}, nil)
 	if len(promote) != 0 {
 		t.Fatal(promote)
 	}

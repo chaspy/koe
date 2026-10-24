@@ -125,6 +125,7 @@ GraphQL	グラフキューエル／グラフクェル
 gRPC	ジーアールピーシー
 REST API	レストエーピーアイ
 API	エーピーアイ
+HTML	エイチティーエムエル
 SDK	エスディーケー
 CLI	シーエルアイ
 JSON

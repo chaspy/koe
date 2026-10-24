@@ -1,4 +1,4 @@
-/* Imported from koe-audio-core (commit fdd2814). Copyright (c) chaspy. */
+/* Imported from koe-audio-core (commit 00fe10f). Copyright (c) chaspy. */
 /* koe_audio.h - C API for koe's loudness / silence judgement.
  *
  * Ownership: the caller owns every buffer. The library only reads `pcm` during
@@ -14,6 +14,11 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define KOE_AUDIO_API_VERSION 1
+
+/* Returns the API version of the linked library. */
+int koe_audio_api_version(void);
 
 #define KOE_OK 0
 #define KOE_ERR_INVALID_ARG (-1) /* NULL pointer, bad sample rate */

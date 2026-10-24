@@ -11,10 +11,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,12 +75,17 @@ func (a *App) runImprove(batch []core.ImproveItem, paths map[string]string) {
 	if err == nil && len(ans.Judgements) == 0 {
 		err = errors.New("no judgements")
 	}
+	a.noteImproveResult(err)
 	if err != nil {
-		a.log.Printf("improve_failed items=%d err=%s", len(batch), shorten(err.Error(), 120))
 		return
 	}
-	judged, corrected := core.MarkImproveItems(paths, batch, ans)
-	cand, promote := core.MergeImproveTerms(core.ReadTermCandidates(a.improveCandidatesPath()), ans.Terms)
+	marked := core.MarkImproveItems(paths, batch, ans, time.Now().UTC().Format(time.RFC3339))
+	judged, corrected := marked.Judged, marked.Corrected
+	transcripts := map[int]string{}
+	for i, it := range batch {
+		transcripts[i], _ = it.Record["raw"].(string)
+	}
+	cand, promote := core.MergeImproveTerms(core.ReadTermCandidates(a.improveCandidatesPath()), ans.Terms, transcripts)
 	if err := core.WriteTermCandidates(a.improveCandidatesPath(), cand); err != nil {
 		a.log.Printf("improve_candidates_save_failed %v", err)
 	}
@@ -93,17 +100,17 @@ func (a *App) runImprove(batch []core.ImproveItem, paths map[string]string) {
 	}
 	a.log.Printf("improve items=%d judged=%d corrected=%d promoted=%d added=%d ms=%d",
 		len(batch), judged, corrected, len(promote), added, time.Since(started).Milliseconds())
+	// one summary per run, numbers only (macOS improve_judged)
+	c := core.ImproveJudgedCounts(marked.Saved, added)
+	a.log.Printf("improve_judged judged=%d asr_error=%d not_understood=%d unclear=%d terms_added=%d",
+		c["judged"], c["asr_error"], c["not_understood"], c["unclear"], c["terms_added"])
 }
 
 // askImprove runs ImproveCommand with the request on stdin and reads its answer.
 func (a *App) askImprove(req string) (core.ImproveAnswer, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), improveTimeout)
 	defer cancel()
-	// cmd /c finds claude.cmd (npm) and other commands on the user's PATH, like a terminal would
-	cmd := exec.CommandContext(ctx, "cmd", "/c", a.cfg.ImproveCommand)
-	hideWindow(cmd)
-	cmd.Stdin = strings.NewReader(req)
-	out, err := cmd.Output()
+	out, err := a.runImproveCommand(ctx, req)
 	if ctx.Err() != nil {
 		return core.ImproveAnswer{}, errors.New("timeout")
 	}
@@ -267,4 +274,112 @@ func (a *App) toggleSuggestNever() {
 		a.log.Printf("improve_declined via=menu reason=never")
 	}
 	a.renderImprove()
+}
+
+// ---- finding the command and telling repeated failures (#184, macOS #213 / #214) ----
+
+type improveResolved struct {
+	command string
+	match   core.ImproveCommandMatch
+}
+
+func (a *App) improveCommandDirs() []core.ImproveCommandDir {
+	return core.ImproveCommandDirs(os.Getenv("USERPROFILE"), os.Getenv("APPDATA"))
+}
+
+// resolveImprove finds the program of ImproveCommand (cached until the command
+// changes or it is not found). The log gets the location label, never the path.
+func (a *App) resolveImprove() (core.ImproveCommandMatch, string, error) {
+	program, rest, ok := core.ImproveCommandToken(a.cfg.ImproveCommand)
+	if !ok {
+		return core.ImproveCommandMatch{}, "", errImproveNotFound
+	}
+	if a.improveResolved.command != a.cfg.ImproveCommand {
+		exists := func(p string) bool { st, err := os.Stat(p); return err == nil && !st.IsDir() }
+		m, found := core.ResolveImproveProgram(program, a.improveCommandDirs(), exists, exec.LookPath)
+		if !found {
+			return core.ImproveCommandMatch{}, "", errImproveNotFound
+		}
+		a.improveResolved = improveResolved{a.cfg.ImproveCommand, m}
+		a.log.Printf("improve_cmd_resolved location=%s", m.Location)
+	}
+	return a.improveResolved.match, rest, nil
+}
+
+var errImproveNotFound = &improveExitError{core.ImproveNotFoundCode}
+
+type improveExitError struct{ code int }
+
+func (e *improveExitError) Error() string { return "exit " + strconv.Itoa(e.code) }
+
+// runImproveCommand runs the command by the full path of its program, with the
+// install folders on PATH. On "not recognized" it looks the program up again once.
+func (a *App) runImproveCommand(ctx context.Context, req string) ([]byte, error) {
+	for attempt := 0; ; attempt++ {
+		m, rest, err := a.resolveImprove()
+		if err != nil {
+			return nil, err
+		}
+		cmd := exec.CommandContext(ctx, "cmd")
+		hideWindow(cmd)
+		// written out as is: Go would escape the quotes around the path as \", which cmd does not read
+		cmd.SysProcAttr.CmdLine = core.ImproveCmdLine(m.Path, rest)
+		cmd.Env = append(os.Environ(), "PATH="+core.ImprovePath(a.improveCommandDirs(), os.Getenv("PATH")))
+		cmd.Stdin = strings.NewReader(req)
+		out, err := cmd.Output()
+		if improveExitCode(err) == core.ImproveNotFoundCode && attempt == 0 {
+			a.improveResolved = improveResolved{}
+			continue
+		}
+		return out, err
+	}
+}
+
+// improveExitCode: 0 for success, the command's exit code, or -1 for anything else (timeout, unreadable answer).
+func improveExitCode(err error) int {
+	var ee *exec.ExitError
+	var ie *improveExitError
+	switch {
+	case err == nil:
+		return 0
+	case errors.As(err, &ee):
+		return ee.ExitCode()
+	case errors.As(err, &ie):
+		return ie.code
+	}
+	return -1
+}
+
+func (a *App) improveFailuresPath() string { return filepath.Join(a.roamDir, "improve_failures.json") }
+
+// noteImproveResult counts the run, logs codes only, and after repeated failures
+// asks (at most once a day, never while recording) whether to try again.
+func (a *App) noteImproveResult(err error) {
+	code := improveExitCode(err)
+	if a.improveFailures.LastNotice.IsZero() {
+		if b, rerr := os.ReadFile(a.improveFailuresPath()); rerr == nil {
+			_ = json.Unmarshal(b, &a.improveFailures)
+		}
+	}
+	a.improveFailures.Record(code)
+	if code == 0 {
+		a.log.Printf("improve exit_code=0")
+		return
+	}
+	a.log.Printf("improve_failed exit_code=%d consecutive=%d", code, a.improveFailures.Consecutive)
+	busy := a.recording.Load() || a.processing.Load() > 0
+	if busy || !a.improveFailures.TakeNotice(time.Now()) {
+		return
+	}
+	if b, merr := json.Marshal(a.improveFailures); merr == nil {
+		_ = os.WriteFile(a.improveFailuresPath(), b, 0o600)
+	}
+	program, _, _ := core.ImproveCommandToken(a.cfg.ImproveCommand)
+	title, text := core.ImproveFailureText(filepath.Base(program), code)
+	go func() {
+		defer a.recoverLog("improve_failure_notice")
+		if messageBoxResult(title, text, core.MBYesNo|core.MBIconInfo|core.MBTopmost) == core.IDYes {
+			a.maybeImprove(true)
+		}
+	}()
 }

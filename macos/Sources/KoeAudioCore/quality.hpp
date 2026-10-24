@@ -1,5 +1,5 @@
-// Imported from koe-audio-core (commit fdd2814). Copyright (c) chaspy.
-// Port of macos/Sources/Koe/AudioQuality.swift (koe-dev).
+// Imported from koe-audio-core (commit 00fe10f). Copyright (c) chaspy.
+// Loudness and silence measurement for Koe (https://github.com/chaspy/koe).
 #pragma once
 
 #include <algorithm>

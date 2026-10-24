@@ -200,6 +200,9 @@ for 4,200 scored requests.
   - `apple-dictation`: the same helper with DictationTranscriber (preset `shortDictation`)
   - `parakeet-ja-sherpa-cpu`: Parakeet-ja through sherpa-onnx 1.13.8, through `sherpa_cli.py`, in a venv in the cache built from `asr_requirements.txt` with `--require-hashes`
 - **Downloads**: every model is pinned by revision and SHA-256, into the cache (`~/Library/Caches/koe-public-bench/asr-models`).
+- **More sherpa-onnx engines** (2026-10-24): `moonshine-tiny-ja-sherpa-cpu`, `qwen3-asr-0.6b-sherpa-cpu` (hotwords: the `hints` condition), `reazonspeech-zipformer-sherpa-cpu`, and `parakeet-ja-sherpa-coreml` (ONNX Runtime's Core ML provider), all through `sherpa_cli.py <kind> <model dir> 4 <provider>`. Moonshine's Japanese model is under a non-commercial licence; it is only measured here.
+- **Noise** (`--noise OOFFICE` or `PCAFETER`, `--snr 20 15 10`): Koe's default condition only (pack, and hints for engines that take them) on the same utterances and term sentences with DEMAND noise mixed in, as `voice_isolation_bench.py` does (its SHA-256-pinned cache). Saved as `<engine>@noise`, next to the clean results.
+- **WhisperKit** (`whisperkit-turbo`, `whisperkit-turbo-626mb`): WhisperKit 1.1.1 through `whisperkit_cli/` (SwiftPM, built into the cache; versions pinned in `Package.swift` / `Package.resolved`), with the large-v3 turbo Core ML models of `argmaxinc/whisperkit-coreml`, pinned file by file (SHA-256 and revision) in `whisperkit_models.json`. The first load compiles the Core ML model (a few minutes).
 - **Conditions**:
   - `none`: no prompt
   - `base`: Koe's base prompt
@@ -236,3 +239,19 @@ for 4,200 scored requests.
 従来の communication / communication_impact は維持します。新しい語の記録は履歴内だけで、
 既存の履歴保持期間が適用されます。日次報告は既存と同じローカル reports 内に保存します。
 Windows への対応は別途です。
+
+## Voice isolation and whisper (`voice_isolation_bench.py`, #197)
+
+Measures whether Apple's voice isolation helps or hurts whisper, on public data only.
+Results and limits: `docs/notes/2026-10-24-voice-isolation-whisper.md`.
+
+- **Speech**: the first 100 JSUT clips of `public_bench.py` (run it once first; this script reads the cache and downloads no speech), and the 60 term sentences of `asr_bench.py` spoken by the macOS voice (cached by sentence under `~/Library/Caches/koe-eval/voice-isolation/asr-terms`).
+- **Noise**: **DEMAND** (Thiemann, Ito, Vincent 2013, [CC BY 4.0](https://zenodo.org/records/1227121)), channel 1 of `OOFFICE` (office; `--noise OOFFICE PCAFETER` adds the cafeteria). Downloaded once by a SHA-256-checked script into `~/Library/Caches/koe-eval/voice-isolation/demand`; nothing is committed. Each clip gets a fixed piece of the noise (offset from the clip's key) mixed at 20, 15 and 10 dB SNR (whole-clip RMS), plus the clean clip.
+- **Processing**: `AUSoundIsolation` (Apple's voice-isolation effect unit, wet/dry 100 %, "sound to isolate" 1.0 = its defaults), applied **offline** by `sound_isolation_cli.swift` with AVAudioEngine manual rendering at 48 kHz, then back to 16 kHz PCM16 as Koe captures. No microphone or speaker is used. `AUVoiceProcessor` (the voice-processing I/O unit behind `setVoiceProcessingEnabled`) is tied to a live input and output device and cannot render files, so it is not measured.
+- **Whisper**: the turbo model of `asr_bench.py` (pinned revision and SHA-256), on its own whisper-server on a free port, with the developer pack prompt and Koe's autocorrect (what Koe sends by default).
+- **Metrics**: CER after `public_bench.normalize`, terms right (`asr_bench.fold` containment), and how many utterances have a run of exact zeros of 100 ms or more inside the voiced span (as Koe's `SelfDiagnosis.ZeroRuns`). For each condition, the paired difference on − off of the CER with a 95 % bootstrap interval (2,000 resamples, fixed seed). Only these numbers are printed and saved (`results.json` in the cache).
+
+```sh
+python3 eval/voice_isolation_bench.py
+python3 -m unittest eval/test_voice_isolation_bench.py
+```

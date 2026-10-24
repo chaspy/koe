@@ -638,9 +638,10 @@ enum Glossary {
                 sure(e.aliases).filter { $0.count >= 2 && $0 != e.term }.map { (wrong: $0, right: e.term, synced: file.synced) }
             }
         }.sorted { $0.wrong.count > $1.wrong.count }
+        let terms = Array(Set(([(entries: personal, synced: false)] + enabledPackFiles).flatMap { $0.entries.map(\.term) } + org.map(\.term)))
         var t = text
         for (wrong, right, fromSynced) in pairs {
-            let r = AliasReplace.apply(t, wrong: wrong, right: right)
+            let r = AliasReplace.apply(t, wrong: wrong, right: right, longer: AliasReplace.longer(than: right, in: terms))
             if r.hit {
                 applied.append("\(wrong.split(separator: ">").first ?? "")→\(right)")
                 synced = synced || fromSynced
@@ -908,6 +909,8 @@ struct Capture {
     let device: String         // 録ったマイク
     var quality: [String: Any] = [:]   // 音質の指標（AudioQuality.measure）
     var alt: (device: String, url: URL, quality: [String: Any])? = nil  // 使わなかった側のマイクの録音（比較用）
+    var zero = ZeroRuns.Result(runs: 0, ratio: 0)   // 声の区間の中のちょうど 0 の連続（自己診断 #211）
+    var fellBack = false                              // 主のマイクに声が無く、代わりのマイクで録った
 }
 
 // 録音元の共通インターフェース（既定のマイクは AVAudioEngine、指定したマイクは AVCaptureSession で開く）
@@ -1323,6 +1326,8 @@ final class Recorder {
             var cap = Capture(url: url, seconds: Double(captured.count) / Recorder.sampleRate,
                               voicedSeconds: Double(trimmed.count) / Recorder.sampleRate, peak: peak, device: chosen.0)
             cap.quality = AudioQuality.measure(captured)
+            cap.zero = ZeroRuns.measure(captured, sampleRate: Int(Recorder.sampleRate))
+            cap.fellBack = takes.count > 1 && chosen.0 != takes[0].0
             // 比較用に、使わなかった側のマイクの録音も残す（同じ発話のマイク違い）
             if Settings.saveAllMics, let other = takes.first(where: { $0.0 != chosen.0 }), !other.1.isEmpty {
                 let altURL = self.dir.appendingPathComponent("rec-\(UUID().uuidString).alt.wav")
@@ -2751,6 +2756,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Koe/running"))
 
+    // アイコンがノッチの裏に隠れてもメニューを開けるように（#194）
+    private func setUpMenuReach() {
+        MenuReach.shared.setUp(statusItem: statusItem, busy: { [weak self] in
+            guard let self else { return false }
+            return self.current != nil || self.transcribing > 0 || self.cleaning > 0
+        }, lastUsed: { [weak self] in self?.lastUsedAt })
+    }
+
+    // 動いている Koe をもう一度開いた（Finder・Spotlight・open -a Koe）ときは、メニューを開く（#194）
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        MenuReach.shared.onOpen?("reopen")
+        return false
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let identity = ServerLifecycle.Identity.read(getpid()) {
             do {
@@ -2795,8 +2814,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         PasteLast.shared.register()
         buildMenu()
         render()
+        setUpMenuReach()
         Glossary.refreshUsage()
         LearnedNotice.shared.start(statusItem: statusItem, busy: { [weak self] in
+            guard let self else { return false }
+            return self.current != nil || self.transcribing > 0 || self.cleaning > 0
+        }, lastUsed: { [weak self] in self?.lastUsedAt })
+        DiagnosisNotice.shared.start(statusItem: statusItem, busy: { [weak self] in
             guard let self else { return false }
             return self.current != nil || self.transcribing > 0 || self.cleaning > 0
         }, lastUsed: { [weak self] in self?.lastUsedAt })
@@ -3613,6 +3637,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         guard let cap = u.capture else { return }
         defer { if current == nil && transcribing == 0 { improver.runIfNeeded() } }
+        DiagnosisNotice.shared.note(DiagnosisLog.recording(quality: cap.quality, zero: cap.zero, device: cap.device,
+                                                           sampleRate: Int(Recorder.sampleRate), fellBack: cap.fellBack,
+                                                           outcome: u.record["outcome"] as? String ?? (pasted != nil ? "pasted" : "other")))
         if Settings.saveHistory {
             u.record["pasted"] = pasted ?? NSNull()
             let id = History.newID()
@@ -3803,6 +3830,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let guide = NSMenuItem(title: "はじめての案内を開く…", action: #selector(openOnboarding), keyEquivalent: "")
         guide.target = self
         menu.addItem(guide)
+        let selfDiag = NSMenuItem(title: "診断する…", action: #selector(openSelfDiagnosis), keyEquivalent: "")
+        selfDiag.target = self
+        menu.addItem(selfDiag)
         let diag = NSMenuItem(title: "診断情報を書き出す（不具合を送る用）", action: #selector(exportDiagnostics), keyEquivalent: "")
         diag.target = self
         menu.addItem(diag)
@@ -4189,6 +4219,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     static let helpURL = URL(string: "https://github.com/chaspy/koe/blob/main/docs/usage-ja.md")!
     @objc private func openHelp() { NSWorkspace.shared.open(AppDelegate.helpURL) }
+
+    @objc private func openSelfDiagnosis() { DiagnosisNotice.shared.showReport() }
 
     @objc private func exportDiagnostics() {
         DispatchQueue.global(qos: .userInitiated).async {

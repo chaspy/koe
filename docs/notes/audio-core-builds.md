@@ -1,7 +1,7 @@
 # Shared audio quality and cgo builds
 
 The C API in `macos/Sources/KoeAudioCore` is the single audio-quality implementation.
-The imported files retain their koe-audio-core origin, commit fdd2814. Go compiles
+The imported files retain their koe-audio-core origin, commit 00fe10f. Go compiles
 that same source via `windows/core/audio_quality_bridge.cpp`; it does not carry a
 second copy. Keeping the source in place avoids a SwiftPM target move and preserves
 upstream provenance. Upstream implementation changes must be made in koe-audio-core.

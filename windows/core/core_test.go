@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -136,7 +137,16 @@ func idx(l []string, s string) int {
 
 func TestReceiverNotes(t *testing.T) {
 	personal := []Entry{{Term: "マージ", Aliases: []string{"マジ>(して)"}}, {Term: "Herdr", Aliases: []string{"ハーダー", "~ハード"}}}
-	short, full := ReceiverNotes(personal, devPack(t), map[string]int{"Herdr": 3}, `~\.claude\koe-voice-glossary.full.md`)
+	pack := devPack(t)
+	short, full := ReceiverNotes(personal, pack, map[string]int{"Herdr": 3}, `~\.claude\koe-voice-glossary.full.md`)
+	// The count follows the shipped pack, so derive it from the same inputs instead of fixing a number:
+	// distinct terms (personal and pack merged) that have at least one alias
+	withAliases := map[string]bool{}
+	for _, e := range append(append([]Entry{}, personal...), pack...) {
+		if len(e.Aliases) > 0 {
+			withAliases[e.Term] = true
+		}
+	}
 	if !strings.HasPrefix(short, "# 音声入力（Koe）の誤変換メモ\n\n") {
 		t.Fatal(short)
 	}
@@ -146,7 +156,7 @@ func TestReceiverNotes(t *testing.T) {
 	if !strings.Contains(short, "- マージ ← マジ（直後が (して) のとき）、マジ（直後が (され|し|する|した|でき|済) のとき）、マージュ（文脈によっては「マジ」と化ける）") {
 		t.Fatal(short)
 	}
-	if !strings.Contains(short, "`~\\.claude\\koe-voice-glossary.full.md` を grep してから読み替える（106 語）") {
+	if !strings.Contains(short, "`~\\.claude\\koe-voice-glossary.full.md` を grep してから読み替える（"+strconv.Itoa(len(withAliases))+" 語）") {
 		t.Fatal(short)
 	}
 	if !strings.Contains(full, "## よく使う語（この表記が正しい）\n\nコンフリクト、リベース") {

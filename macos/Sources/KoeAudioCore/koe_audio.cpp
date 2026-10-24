@@ -1,4 +1,4 @@
-// Imported from koe-audio-core (commit fdd2814). Copyright (c) chaspy.
+// Imported from koe-audio-core (commit 00fe10f). Copyright (c) chaspy.
 #include "koe_audio.h"
 
 #include <exception>
@@ -31,6 +31,10 @@ int measure_c(const T *pcm, size_t len, int sample_rate, koe_quality *out) {
 } // namespace
 
 extern "C" {
+
+int koe_audio_api_version(void) {
+  return KOE_AUDIO_API_VERSION;
+}
 
 int koe_measure_i16(const int16_t *pcm, size_t len, int sample_rate, koe_quality *out) {
   return measure_c(pcm, len, sample_rate, out);

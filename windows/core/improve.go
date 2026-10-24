@@ -261,19 +261,24 @@ type TermCandidate struct {
 	Count    int      `json:"count"`
 	Wrongs   []string `json:"wrongs"`
 	Explicit bool     `json:"explicit,omitempty"`
+	// AliasCounts: in how many different utterances each wrong form was really seen (macOS aliasCounts)
+	AliasCounts map[string]int `json:"aliasCounts,omitempty"`
 }
 
 // MergeImproveTerms adds the answer's terms to the candidates and returns the
 // terms to promote into the glossary with their aliases. A term is promoted
 // once it was seen twice, or at once when the user named the right spelling
-// (explicit). Only explicit, non-common forms are sure replacements; the rest
-// get "~" (a note for the receiving AI, never replaced). People names are
-// macOS only (peopleSources), so kind "person" is skipped.
-func MergeImproveTerms(cand map[string]TermCandidate, terms []map[string]any) (map[string]TermCandidate, map[string][]string) {
+// (explicit). A form that may be an ordinary word never becomes a sure
+// replacement; any other form is sure when the user named the right spelling,
+// or once it was seen in two different utterances (transcripts by the answer's
+// i; macOS #227). The rest get "~" (a note for the receiving AI, never
+// replaced). People names are macOS only (peopleSources), so kind "person" is skipped.
+func MergeImproveTerms(cand map[string]TermCandidate, terms []map[string]any, transcripts map[int]string) (map[string]TermCandidate, map[string][]string) {
 	if cand == nil {
 		cand = map[string]TermCandidate{}
 	}
 	promote := map[string][]string{}
+	seen := map[string]bool{}
 	for _, t := range terms {
 		right, wrong, ok := improveTermPair(t)
 		if !ok {
@@ -285,6 +290,9 @@ func MergeImproveTerms(cand map[string]TermCandidate, terms []map[string]any) (m
 			c.Wrongs = append(c.Wrongs, wrong)
 		}
 		c.Explicit = c.Explicit || t["explicit"] == true
+		if i, ok := t["i"].(float64); ok {
+			c.AliasCounts = observeAliases(c.AliasCounts, right, c.Wrongs, transcripts[int(i)], int(i), seen)
+		}
 		cand[right] = c
 		if c.Count >= 2 || c.Explicit {
 			promote[right] = c.aliases()
@@ -311,11 +319,11 @@ func improveTermPair(t map[string]any) (right, wrong string, ok bool) {
 	return right, wrong, IsImproveTerm(right, false)
 }
 
-// aliases: only explicit, non-common forms are sure replacements; the rest get "~".
+// aliases: explicit or repeated (2 utterances), non-common forms are sure replacements; the rest get "~".
 func (c TermCandidate) aliases() []string {
 	var out []string
 	for _, w := range c.Wrongs {
-		if c.Explicit && !improveCommon(w) {
+		if (c.Explicit || c.AliasCounts[w] >= 2) && !improveAliasCommon(w) {
 			out = append(out, w)
 		} else {
 			out = append(out, "~"+w)
@@ -379,7 +387,7 @@ func mergeGlossaryLine(line, term string, wrongs []string) string {
 	if e := ParseGlossary(line); len(e) > 0 {
 		old = e[0].Aliases
 	}
-	return term + "\t" + strings.Join(uniqueSorted(append(old, wrongs...)), "／")
+	return term + "\t" + strings.Join(mergeAliases(old, wrongs), "／")
 }
 
 func uniqueSorted(xs []string) []string {

@@ -26,8 +26,26 @@ class AsrBenchTests(unittest.TestCase):
 
     def test_speech_engines_take_hints(self):
         self.assertTrue(a.SpeechAnalyzerEngine.hints and a.DictationEngine.hints)
-        self.assertFalse(a.ParakeetEngine.hints)
+        self.assertFalse(a.ParakeetEngine().hints)
         self.assertEqual((a.SpeechAnalyzerEngine.module, a.DictationEngine.module), ('speech', 'dictation'))
+
+    def test_sherpa_engines(self):
+        names = ['parakeet-ja-sherpa-cpu', 'parakeet-ja-sherpa-coreml', 'moonshine-tiny-ja-sherpa-cpu',
+                 'qwen3-asr-0.6b-sherpa-cpu', 'reazonspeech-zipformer-sherpa-cpu']
+        engines = {n: a.ENGINES[n]() for n in names}
+        for n, e in engines.items():
+            self.assertEqual(e.name, n)
+            self.assertRegex(e.sha256, '^[0-9a-f]{64}$')
+            self.assertFalse(e.prompts)
+        # only Qwen3-ASR takes hotwords; the Core ML variant differs only in the provider
+        self.assertEqual([n for n, e in engines.items() if e.hints], ['qwen3-asr-0.6b-sherpa-cpu'])
+        self.assertEqual(engines['parakeet-ja-sherpa-coreml'].provider, 'coreml')
+        self.assertEqual(engines['parakeet-ja-sherpa-cpu'].archive, engines['parakeet-ja-sherpa-coreml'].archive)
+        self.assertIn('non-commercial', engines['moonshine-tiny-ja-sherpa-cpu'].licence)
+
+    def test_every_engine_says_whether_it_takes_hints(self):
+        for name, make in a.ENGINES.items():
+            self.assertIn(make().hints, (True, False), name)
 
     def test_p90(self):
         self.assertEqual(a.p90([1]), 1)
@@ -51,6 +69,53 @@ class AsrBenchTests(unittest.TestCase):
         self.assertIn('10.0 (0)', text)
         failed = a.table([{'engine': 'y', 'error': 'RuntimeError', 'conditions': {}}])
         self.assertIn('y: not measured (RuntimeError)', failed)
+
+
+
+class WhisperKitTest(unittest.TestCase):
+    def test_engines_and_manifest(self):
+        import json
+        m = json.loads(a.WhisperKitEngine.manifest.read_text())
+        self.assertRegex(m['revision'], '^[0-9a-f]{40}$')
+        for name in ('whisperkit-turbo', 'whisperkit-turbo-626mb'):
+            e = a.ENGINES[name]()
+            self.assertTrue(e.prompts)
+            self.assertFalse(e.hints)
+            files = m['models'][e.model]
+            self.assertTrue(files)
+            for rel, sha in files.items():
+                self.assertRegex(sha, '^[0-9a-f]{64}$', rel)
+            self.assertIn('AudioEncoder.mlmodelc/model.mil', files)
+
+class NoisyVariantsTest(unittest.TestCase):
+    def test_pack_and_hints_per_snr_with_noise_mixed_in(self):
+        import array
+        import math
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        import voice_isolation_bench as vib
+
+        def tone(n, amp):
+            return array.array('h', (int(amp * math.sin(i * 0.3)) or 1 for i in range(n)))
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            twav = cache / 'abc.wav'
+            a.ab.write_wav(twav, tone(8000, 3000))
+            sets = {'<5 s': [(tone(8000, 3000), 'ref')]}
+            terms = ([('GitHub', 'GitHubの設定')], [twav])
+            entries = [('GitHub', [])]
+            with mock.patch.object(vib, 'fetch_noise', return_value=tone(40000, 500)):
+                hinted = a.noisy_variants(a.ENGINES['qwen3-asr-0.6b-sherpa-cpu'](), cache, sets, terms, entries, 'OOFFICE', [20, 10])
+                plain = a.noisy_variants(a.ENGINES['whisper-turbo-metal'](), cache, sets, terms, entries, 'OOFFICE', [15])
+            self.assertEqual([v[0] for v in hinted], ['pack@OOFFICE_20dB', 'hints@OOFFICE_20dB', 'pack@OOFFICE_10dB', 'hints@OOFFICE_10dB'])
+            name, noisy, wavs, prompt, pack = plain[0]
+            self.assertEqual(name, 'pack@OOFFICE_15dB')
+            self.assertEqual(prompt, a.pb.pack_prompt(entries))  # whisper keeps the pack prompt
+            self.assertEqual(hinted[0][3], '')                    # no prompt: autocorrect only
+            self.assertNotEqual(noisy['<5 s'][0][0], sets['<5 s'][0][0])  # noise was added
+            self.assertEqual(noisy['<5 s'][0][1], 'ref')
+            self.assertTrue(wavs[0].exists() and wavs[0] != twav)
 
 
 if __name__ == '__main__':

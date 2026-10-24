@@ -29,6 +29,7 @@ kept. Usage:
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -91,6 +92,7 @@ class WhisperServerEngine:
     """whisper.cpp's whisper-server with a ggml model (Koe's request fields)."""
 
     prompts = True
+    hints = False  # run_engine reads this for every engine (missing since #191: AttributeError)
 
     def __init__(self, name, model, extra=()):
         self.name, self.model, self.extra = name, model, list(extra)
@@ -235,36 +237,95 @@ class DictationEngine(SpeechAnalyzerEngine):
 PARAKEET_NAME = 'sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8'
 PARAKEET_URL = f'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{PARAKEET_NAME}.tar.bz2'
 PARAKEET_SHA = '4b0a800ef29f4f4c8667339bf6f60d5bfdc2852ddc9dc5741aea65b6f8d1306b'
+SHERPA_RELEASE = 'https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{}.tar.bz2'
 
 
-class ParakeetEngine(ProcessEngine):
-    """Parakeet-ja through sherpa-onnx on the CPU (4 threads), like Koe for Windows.
-    CTC head, greedy: no prompt or hotwords, autocorrect only."""
+class SherpaEngine(ProcessEngine):
+    """A sherpa-onnx offline model through sherpa_cli.py, 4 threads, greedy. The archive is
+    pinned by SHA-256 and unpacked into the cache. Engines without hotwords: autocorrect only."""
 
-    name, licence = 'parakeet-ja-sherpa-cpu', 'CC-BY-4.0 (model), Apache-2.0 (sherpa-onnx)'
-    model_mb = 0
+    def __init__(self, name, kind, archive, sha256, licence, weights, provider='cpu', hints=False):
+        self.name, self.kind, self.archive, self.sha256, self.licence = name, kind, archive, sha256, licence
+        self.weights, self.provider, self.hints, self.model_mb = weights, provider, hints, 0
 
     def command(self, cache):
-        model = cache / 'asr-models' / PARAKEET_NAME
-        if not (model / 'model.int8.onnx').exists():
-            archive = cache / 'asr-models' / f'{PARAKEET_NAME}.tar.bz2'
+        model = cache / 'asr-models' / self.archive
+        if not (model / self.weights[0]).exists():
+            archive = cache / 'asr-models' / f'{self.archive}.tar.bz2'
             archive.parent.mkdir(parents=True, exist_ok=True)
             if not archive.exists():
                 part = archive.with_suffix('.part')
-                with pb.NETWORK.open(PARAKEET_URL, timeout=600) as response, part.open('wb') as out:
+                with pb.NETWORK.open(SHERPA_RELEASE.format(self.archive), timeout=600) as response, part.open('wb') as out:
                     shutil.copyfileobj(response, out)
                 part.replace(archive)
-            if pb.digest(archive) != PARAKEET_SHA:
+            if pb.digest(archive) != self.sha256:
                 archive.unlink()
-                raise ValueError('parakeet: checksum mismatch')
+                raise ValueError(f'{self.name}: checksum mismatch')
             subprocess.run(['tar', 'xjf', str(archive), '-C', str(archive.parent)], check=True)
-        self.model_mb = (model / 'model.int8.onnx').stat().st_size // 1_000_000
+        self.model_mb = sum((model / w).stat().st_size for w in self.weights) // 1_000_000
         venv = cache / 'asr-venv'
         if not (venv / 'bin' / 'python').exists():
             subprocess.run([sys.executable, '-m', 'venv', str(venv)], check=True)
             subprocess.run([str(venv / 'bin' / 'pip'), 'install', '-q', '--require-hashes', '--only-binary', ':all:',
                             '-r', str(Path(__file__).with_name('asr_requirements.txt'))], check=True)
-        return [str(venv / 'bin' / 'python'), str(Path(__file__).with_name('sherpa_cli.py')), str(model), '4']
+        return [str(venv / 'bin' / 'python'), str(Path(__file__).with_name('sherpa_cli.py')),
+                self.kind, str(model), '4', self.provider]
+
+
+def ParakeetEngine(provider='cpu'):
+    """Parakeet-ja through sherpa-onnx (4 threads), like Koe for Windows. CTC head, greedy:
+    no prompt or hotwords, autocorrect only."""
+    return SherpaEngine('parakeet-ja-sherpa-' + provider, 'nemo_ctc', PARAKEET_NAME, PARAKEET_SHA,
+                        'CC-BY-4.0 (model), Apache-2.0 (sherpa-onnx)', ['model.int8.onnx'], provider)
+
+
+# #180 optional candidates. SHA-256: Moonshine and Qwen3 from the digests GitHub publishes for
+# the release assets; ReazonSpeech's asset has none, so it is the SHA-256 of the download used here.
+MOONSHINE = ('sherpa-onnx-moonshine-tiny-ja-quantized-2026-02-27',
+             '880305c9a6c33572ab269ff9731977ea42ca34c8cffcdd5d99558a9ea2b47cc2')
+QWEN3 = ('sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25',
+         '393f8a14e2f5fb96746aaab342997a40641001fbd5bf9592a080a8329178ee96')
+REAZON = ('sherpa-onnx-zipformer-ja-reazonspeech-2024-08-01', 'e0981d0d5d7b446d41010831b59091ebf57d2aa7b79980f67ca37af460b5842d')
+
+
+class WhisperKitEngine(ProcessEngine):
+    """WhisperKit (Core ML; the koe-ios engine) through whisperkit_cli/, a resident Swift helper.
+    The helper is built with SwiftPM into the cache (WhisperKit pinned in Package.swift and
+    Package.resolved); the model files are pinned file by file in whisperkit_models.json (SHA-256,
+    Hugging Face revision). The prompt goes in as prompt tokens, like whisper.cpp's initial prompt."""
+
+    prompts = True
+    licence = 'MIT (WhisperKit, model)'
+    manifest = Path(__file__).with_name('whisperkit_models.json')
+
+    def __init__(self, name, model):
+        self.name, self.model, self.model_mb = name, model, 0
+
+    def fetch(self, cache):
+        m = json.loads(self.manifest.read_text())
+        folder = cache / 'asr-models' / 'whisperkit' / self.model
+        for rel, sha in m['models'][self.model].items():
+            path = folder / rel
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                part = path.with_name(path.name + '.part')
+                url = f"{HF}/{m['repo']}/resolve/{m['revision']}/{self.model}/{rel}"
+                with pb.NETWORK.open(url, timeout=600) as response, part.open('wb') as out:
+                    shutil.copyfileobj(response, out)
+                part.replace(path)
+            if pb.digest(path) != sha:
+                path.unlink()
+                raise ValueError(f'{self.name}: {rel} checksum mismatch')
+        self.model_mb = sum((folder / rel).stat().st_size for rel in m['models'][self.model]) // 1_000_000
+        return folder
+
+    def command(self, cache):
+        folder = self.fetch(cache)
+        build = cache / 'whisperkit-build'
+        subprocess.run(['nice', '-n', '15', 'swift', 'build', '-c', 'release', '-j', '4', '--scratch-path', str(build),
+                        '--package-path', str(Path(__file__).with_name('whisperkit_cli'))],
+                       check=True, stdout=subprocess.DEVNULL)
+        return [str(build / 'release' / 'whisperkit_cli'), str(folder)]
 
 
 ENGINES = {
@@ -274,6 +335,19 @@ ENGINES = {
     'apple-speechanalyzer': SpeechAnalyzerEngine,
     'apple-dictation': DictationEngine,
     'parakeet-ja-sherpa-cpu': ParakeetEngine,
+    'parakeet-ja-sherpa-coreml': lambda: ParakeetEngine('coreml'),
+    'moonshine-tiny-ja-sherpa-cpu': lambda: SherpaEngine(
+        'moonshine-tiny-ja-sherpa-cpu', 'moonshine', *MOONSHINE,
+        'Moonshine Community License (non-commercial; model), Apache-2.0 (sherpa-onnx)',
+        ['encoder_model.ort', 'decoder_model_merged.ort']),
+    'qwen3-asr-0.6b-sherpa-cpu': lambda: SherpaEngine(
+        'qwen3-asr-0.6b-sherpa-cpu', 'qwen3', *QWEN3, 'Apache-2.0 (model, sherpa-onnx)',
+        ['conv_frontend.onnx', 'encoder.int8.onnx', 'decoder.int8.onnx'], hints=True),
+    'whisperkit-turbo': lambda: WhisperKitEngine('whisperkit-turbo', 'openai_whisper-large-v3-v20240930'),
+    'whisperkit-turbo-626mb': lambda: WhisperKitEngine('whisperkit-turbo-626mb', 'openai_whisper-large-v3-v20240930_626MB'),
+    'reazonspeech-zipformer-sherpa-cpu': lambda: SherpaEngine(
+        'reazonspeech-zipformer-sherpa-cpu', 'transducer', *REAZON, 'Apache-2.0 (model, sherpa-onnx)',
+        ['encoder-epoch-99-avg-1.int8.onnx', 'decoder-epoch-99-avg-1.onnx', 'joiner-epoch-99-avg-1.int8.onnx']),
 }
 
 
@@ -319,14 +393,15 @@ def term_items(entries):
 
 
 def synth(cache, items):
-    """Speak each sentence with the macOS voice into 16 kHz mono WAV (cached)."""
+    """Speak each sentence with the macOS voice into 16 kHz mono WAV (cached by sentence, so a
+    pack change that moves a term never pairs a sentence with another sentence's audio)."""
     out = cache / 'asr-terms'
     out.mkdir(parents=True, exist_ok=True)
     wavs = []
-    for i, (_, sentence) in enumerate(items):
-        wav = out / f'{i:03d}.wav'
+    for _, sentence in items:
+        wav = out / (hashlib.sha256(sentence.encode()).hexdigest()[:16] + '.wav')
         if not wav.exists():
-            aiff = out / f'{i:03d}.aiff'
+            aiff = wav.with_suffix('.aiff')
             subprocess.run(['say', '-v', VOICE, '-o', str(aiff), sentence], check=True)
             subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(aiff), '-ac', '1', '-ar', '16000',
                             '-c:a', 'pcm_s16le', str(wav)], check=True)
@@ -348,7 +423,74 @@ def p90(xs):
     return xs[max(0, int(len(xs) * 0.9 + 0.5) - 1)]
 
 
-def run_engine(engine, cache, executable, sets, terms, entries, min_gb):
+def clean_variants(engine, sets, terms, entries):
+    """The usual conditions: (name, utterance sets, term WAVs, prompt or hints, pack for autocorrect)."""
+    conds = (('none', '', []), ('base', BASE_PROMPT, []), ('pack', pb.pack_prompt(entries), entries))
+    if not engine.prompts:  # no prompt: only plain and autocorrect
+        conds = (('none', '', []), ('pack', '', entries))
+    if engine.hints:
+        conds += (('hints', hint_line(entries), entries),)
+    return [(name, sets, terms[1], prompt, pack) for name, prompt, pack in conds]
+
+
+def noisy_variants(engine, cache, sets, terms, entries, noise_name, snrs):
+    """Koe's default condition (pack; and hints for engines that take them) on the same utterances
+    and term sentences with DEMAND noise mixed in (voice_isolation_bench.mix, a fixed piece per clip)."""
+    import voice_isolation_bench as vib
+    noise = vib.fetch_noise(vib.CACHE, noise_name)  # the DEMAND cache of #197 (SHA-256-pinned)
+    out = []
+    for snr in snrs:
+        label = f'{noise_name}_{snr}dB'
+        noisy = {b: [(vib.mix(pcm, vib.noise_segment(noise, len(pcm), f'{b}{k}{label}'), snr), ref)
+                     for k, (pcm, ref) in enumerate(items)] for b, items in sets.items()}
+        folder = cache / 'asr-noise' / label
+        folder.mkdir(parents=True, exist_ok=True)
+        wavs = []
+        for twav in terms[1]:
+            pcm = vib.read_pcm(twav)
+            path = folder / twav.name
+            ab.write_wav(path, vib.mix(pcm, vib.noise_segment(noise, len(pcm), twav.name + label), snr))
+            wavs.append(path)
+        conds = [('pack', pb.pack_prompt(entries) if engine.prompts else '')]
+        if engine.hints:
+            conds.append(('hints', hint_line(entries)))
+        out += [(f'{name}@{label}', noisy, wavs, prompt, entries) for name, prompt in conds]
+    return out
+
+
+def measure(engine, wav, sets, term_items_, term_wavs, prompt, pack, min_gb, peak):
+    """One condition: CER and times by length bucket, then the term sentences."""
+    c = {'buckets': {}, 'err_raw': 0, 'err_norm': 0, 'len_raw': 0, 'len_norm': 0}
+    for label, items in sets.items():
+        times, berr, blen, empty = [], 0, 0, 0
+        for pcm, reference in items:
+            if available_gb() < min_gb:
+                raise MemoryError(f'available memory below {min_gb} GB')
+            ab.write_wav(wav, pcm)
+            text, secs = engine.transcribe(wav, prompt)
+            text = _autocorrect(text, pack) if pack else text
+            times.append(secs)
+            c['err_raw'] += edit_distance(raw_chars(text), raw_chars(reference))
+            c['len_raw'] += len(raw_chars(reference))
+            e = edit_distance(pb.normalize(text), pb.normalize(reference))
+            c['err_norm'] += e
+            c['len_norm'] += len(pb.normalize(reference))
+            berr, blen, empty = berr + e, blen + len(pb.normalize(reference)), empty + (not text.strip())
+            peak = max(peak, engine.rss_mb())
+        c['buckets'][label] = {'n': len(times), 'median': statistics.median(times), 'p90': p90(times),
+                               'cer': berr / blen, 'empty': empty}
+    hits, ttimes = 0, []
+    for (term, _), twav in zip(term_items_, term_wavs):
+        text, secs = engine.transcribe(twav, prompt)
+        text = _autocorrect(text, pack) if pack else text
+        hits += fold(term) in fold(text)
+        ttimes.append(secs)
+    c['terms'] = {'n': len(ttimes), 'right': hits, 'median': statistics.median(ttimes)}
+    return c, peak
+
+
+def run_engine(engine, cache, executable, sets, terms, entries, min_gb, variants=None):
+    """variants: from clean_variants (default) or noisy_variants."""
     engine.start(cache, executable)
     rows = {'engine': engine.name, 'model_mb': engine.model_mb, 'licence': engine.licence, 'conditions': {}}
     try:
@@ -357,40 +499,9 @@ def run_engine(engine, cache, executable, sets, terms, entries, min_gb):
             wav = Path(tmp) / 'u.wav'
             ab.write_wav(wav, sets[ab.SINGLE[0][0]][0][0])
             engine.transcribe(wav, BASE_PROMPT if engine.prompts else '')  # warm-up, excluded
-            conds = (('none', '', []), ('base', BASE_PROMPT, []), ('pack', pb.pack_prompt(entries), entries))
-            if not engine.prompts:  # no prompt: only plain and autocorrect
-                conds = (('none', '', []), ('pack', '', entries))
-            if engine.hints:
-                conds += (('hints', hint_line(entries), entries),)
-            for cond, prompt, pack in conds:
-                c = {'buckets': {}, 'err_raw': 0, 'err_norm': 0, 'len_raw': 0, 'len_norm': 0}
-                for label, items in sets.items():
-                    times, berr, blen, empty = [], 0, 0, 0
-                    for pcm, reference in items:
-                        if available_gb() < min_gb:
-                            raise MemoryError(f'available memory below {min_gb} GB')
-                        ab.write_wav(wav, pcm)
-                        text, secs = engine.transcribe(wav, prompt)
-                        text = _autocorrect(text, pack) if pack else text
-                        times.append(secs)
-                        c['err_raw'] += edit_distance(raw_chars(text), raw_chars(reference))
-                        c['len_raw'] += len(raw_chars(reference))
-                        e = edit_distance(pb.normalize(text), pb.normalize(reference))
-                        c['err_norm'] += e
-                        c['len_norm'] += len(pb.normalize(reference))
-                        berr, blen, empty = berr + e, blen + len(pb.normalize(reference)), empty + (not text.strip())
-                        peak = max(peak, engine.rss_mb())
-                    c['buckets'][label] = {'n': len(times), 'median': statistics.median(times), 'p90': p90(times),
-                                           'cer': berr / blen, 'empty': empty}
-                    print(f'{engine.name} {cond} {label}: done', file=sys.stderr, flush=True)
-                hits, ttimes = 0, []
-                for (term, _), twav in zip(terms[0], terms[1]):
-                    text, secs = engine.transcribe(twav, prompt)
-                    text = _autocorrect(text, pack) if pack else text
-                    hits += fold(term) in fold(text)
-                    ttimes.append(secs)
-                c['terms'] = {'n': len(ttimes), 'right': hits, 'median': statistics.median(ttimes)}
-                rows['conditions'][cond] = c
+            for cond, cset, twavs, prompt, pack in variants or clean_variants(engine, sets, terms, entries):
+                rows['conditions'][cond], peak = measure(engine, wav, cset, terms[0], twavs, prompt, pack, min_gb, peak)
+                print(f'{engine.name} {cond}: done', file=sys.stderr, flush=True)
         rows['peak_rss_mb'] = peak
     finally:
         engine.stop()
@@ -426,12 +537,21 @@ def table(results):
     return '\n'.join(lines)
 
 
+def result_order(r, order):
+    """Engines in ENGINES order, each engine's noisy run right after its clean one."""
+    base = r['engine'].split('@')[0]
+    return (order.index(base) if base in order else len(order), '@' in r['engine'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--cache', type=Path, default=pb.CACHE)
     parser.add_argument('--server', type=Path, default=Path.home() / '.local/src/whisper.cpp/build-static/bin/whisper-server')
     parser.add_argument('--engines', nargs='+', default=list(ENGINES), choices=list(ENGINES))
     parser.add_argument('--min-available-gb', type=float, default=6.0, help='stop when free+inactive memory drops below this')
+    parser.add_argument('--noise', choices=('OOFFICE', 'PCAFETER'),
+                        help='measure only Koe\'s default condition with this DEMAND noise mixed in (saved as <engine>@noise)')
+    parser.add_argument('--snr', type=int, nargs='+', default=[20, 15, 10])
     args = parser.parse_args()
     if not args.server.is_file() or not shutil.which('ffmpeg'):
         parser.error('whisper-server and ffmpeg are required')
@@ -449,18 +569,24 @@ def main():
         terms = (items, synth(args.cache, items))
         # earlier runs of other engines are kept (engines can be measured in turns, e.g. when memory is short)
         saved = args.cache / 'asr-results.json'
-        results = [r for r in (json.loads(saved.read_text()) if saved.exists() else []) if r['engine'] not in args.engines]
+        suffix = '@noise' if args.noise else ''
+        results = [r for r in (json.loads(saved.read_text()) if saved.exists() else [])
+                   if r['engine'] not in [n + suffix for n in args.engines]]
         for name in args.engines:
             try:
-                results.append(run_engine(ENGINES[name](), args.cache, args.server, sets, terms, entries, args.min_available_gb))
+                engine = ENGINES[name]()
+                variants = noisy_variants(engine, args.cache, sets, terms, entries, args.noise, args.snr) if args.noise else None
+                row = run_engine(engine, args.cache, args.server, sets, terms, entries, args.min_available_gb, variants)
+                row['engine'] += suffix
+                results.append(row)
             except MemoryError:
                 raise
             except Exception as error:  # one engine failing does not stop the others; only the type is kept
                 print(f'{name}: failed ({type(error).__name__})', file=sys.stderr, flush=True)
-                results.append({'engine': name, 'error': type(error).__name__, 'conditions': {}})
+                results.append({'engine': name + suffix, 'error': type(error).__name__, 'conditions': {}})
             saved.write_text(json.dumps(results, indent=2))
         order = list(ENGINES)
-        results.sort(key=lambda r: order.index(r['engine']) if r['engine'] in order else len(order))
+        results.sort(key=lambda r: result_order(r, order))
         print(table([r for r in results if r['conditions']] + [r for r in results if not r['conditions']]))
         print(f'elapsed_seconds={time.monotonic() - started:.1f}')
         print(f'server_sha256={pb.digest(args.server)}')

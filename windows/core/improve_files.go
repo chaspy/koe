@@ -62,30 +62,60 @@ func readRecord(path string) (map[string]any, bool) {
 	return r, json.Unmarshal(b, &r) == nil
 }
 
+// ImproveMarked is what MarkImproveItems did: how many were judged and corrected, and
+// the judgements that were saved (for ImproveJudgedCounts).
+type ImproveMarked struct {
+	Judged, Corrected int
+	Saved             []map[string]any
+}
+
 // MarkImproveItems writes the judgements of an answer into the records of the
-// batch (by position i) and marks every record as scanned, so it is not sent
-// again. It returns how many were judged and how many of those were corrected.
-func MarkImproveItems(paths map[string]string, batch []ImproveItem, a ImproveAnswer) (judged, corrected int) {
+// batch (by position i), with the whole judgement (ImproveJudgementFields, judged
+// at `at`) and the mishearings found in each utterance, and marks every record as
+// scanned, so it is not sent again. Each record is replaced atomically.
+func MarkImproveItems(paths map[string]string, batch []ImproveItem, a ImproveAnswer, at string) ImproveMarked {
 	byIndex := judgementsByIndex(a.Judgements)
+	pairs := ImproveMishearings(batch, a.Terms)
+	var m ImproveMarked
 	for i, it := range batch {
 		rec := map[string]any{}
 		for k, v := range it.Record {
 			rec[k] = v
 		}
 		if label := applyJudgement(rec, byIndex[i]); label != "" {
-			judged++
-			if label == "corrected" {
-				corrected++
+			delete(rec, "asr_error")
+			for k, v := range ImproveJudgementFields(byIndex[i], at) {
+				rec[k] = v
 			}
+			m.Judged++
+			if label == "corrected" {
+				m.Corrected++
+			}
+			m.Saved = append(m.Saved, byIndex[i])
 		}
+		found := pairs[i]
+		if found == nil {
+			found = []map[string]string{} // [] rather than null: "looked, none found"
+		}
+		rec["mishearings"] = found
 		rec["glossary_scanned"] = true
 		if path, ok := paths[it.ID]; ok {
-			if b, err := json.MarshalIndent(rec, "", "  "); err == nil {
-				_ = os.WriteFile(path, b, 0o600)
-			}
+			_ = writeJSONAtomic(path, rec)
 		}
 	}
-	return judged, corrected
+	return m
+}
+
+func writeJSONAtomic(path string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func judgementsByIndex(js []map[string]any) map[int]map[string]any {

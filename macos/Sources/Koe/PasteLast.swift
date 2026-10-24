@@ -28,7 +28,9 @@ final class PasteLast: NSObject {
     func register() {
         guard Settings.pasteLast, ref == nil else { return }
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+        // ほかのホットキー（MenuReach の ⌃⌥K）は受け取らずに次へ回す
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            guard PasteLast.hotKeyID(of: event) == 1 else { return OSStatus(eventNotHandledErr) }
             DispatchQueue.main.async { PasteLast.shared.onPaste?("hotkey") }
             return noErr
         }, 1, &spec, nil, nil)
@@ -36,6 +38,14 @@ final class PasteLast: NSObject {
         let st = RegisterEventHotKey(UInt32(kVK_ANSI_V), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &ref)
         registered = st == noErr
         if !registered { Events.log("paste_last_hotkey_unavailable", ["status": Int(st)]) }
+    }
+
+    static func hotKeyID(of event: EventRef?) -> UInt32? {
+        guard let event else { return nil }
+        var id = EventHotKeyID()
+        let st = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                   nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+        return st == noErr ? id.id : nil
     }
 
     lazy var item: NSMenuItem = {
