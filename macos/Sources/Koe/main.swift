@@ -1098,6 +1098,7 @@ final class Recorder {
     private var tracks: [Track] = []
     private var primaryDeviceID: AudioDeviceID?
     private var recording = false
+    private var interruptedSamples: [Int16] = []
     private var lastBufferAt = Date.distantPast
     private var restartPending = false
     private(set) var warm = false
@@ -1105,6 +1106,7 @@ final class Recorder {
     private var voiceAt: Date?
     var lastVoiceAt: Date? { lock.lock(); defer { lock.unlock() }; return voiceAt }
     var onRestart: ((String) -> Void)?
+    var onSaveFailure: (() -> Void)?
     var onSourceChange: ((String) -> Void)?
 
     private var dir: URL { WhisperServer.logURL.deletingLastPathComponent() }
@@ -1149,12 +1151,17 @@ final class Recorder {
 
     func reopen() {
         stopEngine()
-        if warm { _ = startEngine() }
+        if warm || isRecording { _ = startEngine() }
     }
 
     func setWarm(_ on: Bool) {
         warm = on
         if on { _ = startEngine() } else if !isRecording { stopEngine() }
+    }
+
+    var capturedSeconds: Double {
+        lock.lock(); defer { lock.unlock() }
+        return Double(interruptedSamples.count + (tracks.map { $0.samples.count }.max() ?? 0)) / Self.sampleRate
     }
 
     private var isRecording: Bool { lock.lock(); defer { lock.unlock() }; return recording }
@@ -1210,6 +1217,10 @@ final class Recorder {
     private func stopEngine() {
         lock.lock()
         let old = tracks
+        if recording {
+            let takes = old.map { ChimeSpan.silence($0.samples, spans: $0.chimes, sampleRate: Self.sampleRate) }
+            interruptedSamples += RecordingSafety.choose(takes) { !self.trimSilence($0).isEmpty }
+        }
         tracks = []
         lock.unlock()
         old.forEach { $0.source.stop() }
@@ -1233,6 +1244,7 @@ final class Recorder {
     private func append(_ chunk: [Int16], peak: Int, to track: Track) {
         lock.lock()
         defer { lock.unlock() }
+        guard tracks.contains(where: { $0 === track }) else { return }
         if track === tracks.first { lastBufferAt = Date() }
         if peak > mutedPeak { track.lastPeakAt = Date() }
         track.level = AudioLevel.rms(chunk)
@@ -1255,6 +1267,7 @@ final class Recorder {
     func start() -> Bool {
         // 前の録音の録り足し中に押された: 録り足しを切り上げて前の録音を先に確定する（以前はここで前の録音を消していた）
         if let p = pendingStop { pendingStop = nil; finalize(p.done) }
+        guard !isRecording else { return true }
         // 主のマイクから 1 秒以上音が来ていなければエンジンが止まっているので張り直す
         lock.lock(); let stale = running && Date().timeIntervalSince(lastBufferAt) > 1.0; lock.unlock()
         if stale { restart(reason: "stalled") }
@@ -1265,6 +1278,7 @@ final class Recorder {
             t.samples = warm ? t.preRoll : []
             t.preRoll.removeAll()
         }
+        interruptedSamples.removeAll()
         recording = true
         voiceAt = nil
         lock.unlock()
@@ -1298,12 +1312,14 @@ final class Recorder {
             self.lock.lock()
             self.recording = false
             // マイク停止の判定だけは元の信号を使う（通知音のみの録音を故障と誤認しない）。
-            let allSilent = self.tracks.allSatisfy { track in
+            let allSilent = self.interruptedSamples.allSatisfy { abs(Int($0)) <= self.mutedPeak } && self.tracks.allSatisfy { track in
                 track.samples.allSatisfy { abs(Int($0)) <= self.mutedPeak }
             }
             let takes = self.tracks.map {
                 ($0.source.name, ChimeSpan.silence($0.samples, spans: $0.chimes, sampleRate: Recorder.sampleRate))
             }
+            let prefix = self.interruptedSamples
+            self.interruptedSamples.removeAll()
             MediaDuck.recordingEnded()
             self.tracks.forEach { $0.samples.removeAll() }
             self.lock.unlock()
@@ -1315,12 +1331,12 @@ final class Recorder {
                 let alt = self.trimSilence(takes[1].1)
                 if !alt.isEmpty { chosen = takes[1]; trimmed = alt }
             }
-            let captured = chosen.1
+            let captured = prefix + chosen.1
+            trimmed = self.trimSilence(captured)
             let peak = captured.reduce(0) { max($0, abs(Int($1))) }
             // どのマイクも完全な無音ならエンジンが固まっている可能性。次に備えて張り直す
             if allSilent && captured.count > Int(Recorder.sampleRate * 0.5) { self.restart(reason: "digital_silence") }
             let url = self.dir.appendingPathComponent("rec-\(UUID().uuidString).wav")
-            self.writeWAV(trimmed.isEmpty ? captured : trimmed, to: url)
             // 各マイクから届いた量（比較用の録音が保存されないときの切り分け用）
             Events.log("tracks", ["tracks": takes.map { "\($0.0): \(String(format: "%.1f", Double($0.1.count) / Recorder.sampleRate))s peak \($0.1.reduce(0) { max($0, abs(Int($1))) })" }.joined(separator: " / ")])
             var cap = Capture(url: url, seconds: Double(captured.count) / Recorder.sampleRate,
@@ -1334,20 +1350,18 @@ final class Recorder {
                 self.writeWAV(other.1, to: altURL)
                 cap.alt = (other.0, altURL, AudioQuality.measure(other.1))
             }
-            done(cap)
+            persistCapture(cap, pcm: captured, done: done)
         }
     }
 
     // 取り消した録音を残すとき: 録り足しを待たずにすぐ確定する
-    func stopNow(_ done: @escaping (Capture) -> Void) { finalize(done) }
+    func stopNow(_ done: @escaping (Capture) -> Void) {
+        pendingStop = nil
+        finalize(done)
+    }
 
-    func discard() {
-        MediaDuck.recordingEnded()
-        lock.lock()
-        recording = false
-        tracks.forEach { $0.samples.removeAll() }
-        lock.unlock()
-        if !warm { stopEngine() }
+    func flushPendingStop() {
+        if let p = pendingStop { pendingStop = nil; finalize(p.done) }
     }
 
     private func trimSilence(_ pcm: [Int16]) -> [Int16] {
@@ -1366,18 +1380,26 @@ final class Recorder {
         return Array(pcm[s..<e])
     }
 
-    private func writeWAV(_ pcm: [Int16], to url: URL) {
-        var d = Data()
-        func u32(_ v: UInt32) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 4)) }
-        func u16(_ v: UInt16) { var x = v.littleEndian; d.append(Data(bytes: &x, count: 2)) }
-        let dataSize = UInt32(pcm.count * 2)
-        d.append("RIFF".data(using: .ascii)!); u32(36 + dataSize)
-        d.append("WAVE".data(using: .ascii)!)
-        d.append("fmt ".data(using: .ascii)!); u32(16); u16(1); u16(1)
-        u32(UInt32(Recorder.sampleRate)); u32(UInt32(Recorder.sampleRate) * 2); u16(2); u16(16)
-        d.append("data".data(using: .ascii)!); u32(dataSize)
-        pcm.withUnsafeBufferPointer { d.append(Data(buffer: $0)) }
-        try? d.write(to: url)
+    // Keep PCM alive until the write succeeds. A transient I/O failure cannot consume it.
+    private func persistCapture(_ cap: Capture, pcm: [Int16], done: @escaping (Capture) -> Void) {
+        guard writeWAV(pcm, to: cap.url) else {
+            Events.log("audio_save_failed", ["reason": "io_error", "audio_seconds": cap.seconds])
+            onSaveFailure?()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                self.persistCapture(cap, pcm: pcm, done: done)
+            }
+            return
+        }
+        done(cap)
+    }
+
+    @discardableResult
+    private func writeWAV(_ pcm: [Int16], to url: URL) -> Bool {
+        let d = RecordingArchive.wavData(pcm, sampleRate: Int(Self.sampleRate))
+        do {
+            try d.write(to: url, options: .atomic)
+            return true
+        } catch { return false }
     }
 }
 
@@ -1534,20 +1556,14 @@ enum History {
         }.suffix(n).map { $0 }
     }
 
-    static func save(id: String, wav: URL, record: [String: Any], alt: URL? = nil) {
-        let day = dir.appendingPathComponent(String(id.prefix(10)), isDirectory: true)
-        try? FileManager.default.createDirectory(at: day, withIntermediateDirectories: true)
-        var rec = record
-        if let alt {
-            try? FileManager.default.moveItem(at: alt, to: day.appendingPathComponent("\(id).alt.wav"))
-            rec["alt_audio"] = "\(id).alt.wav"
-        }
-        rec["id"] = id
-        rec["audio"] = "\(id).wav"
-        rec["reference"] = NSNull()
-        try? FileManager.default.moveItem(at: wav, to: day.appendingPathComponent("\(id).wav"))
-        if let data = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: day.appendingPathComponent("\(id).json"))
+    @discardableResult
+    static func save(id: String, wav: URL, record: [String: Any], alt: URL? = nil) -> Bool {
+        do {
+            try RecordingArchive.save(root: dir, id: id, wav: wav, record: record, alt: alt)
+            return true
+        } catch {
+            Events.log("history_save_failed", ["reason": "io_error"])
+            return false
         }
     }
 
@@ -1558,7 +1574,7 @@ enum History {
               var rec = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         rec.merge(fields) { _, b in b }
         if let out = try? JSONSerialization.data(withJSONObject: rec, options: [.prettyPrinted, .sortedKeys]) {
-            try? out.write(to: url)
+            try? out.write(to: url, options: .atomic)
         }
     }
 }
@@ -2852,7 +2868,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logLaunch()
         requestPermissions()
         installMonitors()
-        recorder.onRestart = { reason in Events.log("mic_restarted", ["reason": reason]) }
+        recorder.onSaveFailure = { [weak self] in self?.showError("音声を保存できません。空き容量を確認してください。保存を再試行しています", sticky: true) }
+        recorder.onRestart = { [weak self] reason in
+            Events.log("mic_restarted", ["reason": reason, "audio_seconds": self?.recorder.capturedSeconds ?? 0])
+        }
         recorder.onSourceChange = { name in
             Events.log("mic_switched", ["device": name, "notice": self.recorder.notice?.rawValue ?? ""])
             self.render()
@@ -2927,6 +2946,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         recordQuit()
+        if let u = current {
+            current = nil
+            preserveOrDiscard(u, reason: "application_quit")
+        }
+        recorder.flushPendingStop()
         MediaDuck.restoreNow()
         server.stop()
         writeState("stopped")
@@ -3054,7 +3078,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .flagsChanged:
             if e.keyCode == key, let mask = deviceModifierMask[key] {
                 let pressed = e.modifierFlags.rawValue & mask != 0
-                if pressed && !hotkeyDown {
+                if RecordingSafety.startsNewPress(pressed: pressed, wasDown: hotkeyDown) {
                     hotkeyDown = true
                     lastPressAt = Date()
                     // ロック録音中にもう一度押したら、離したときに終える
@@ -3064,10 +3088,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     hotkeyReleased(e)
                 }
                 else if pressed && hotkeyDown {
-                    // 離したイベントを取りこぼしていた。前の録音を確定してから録り直す
-                    Events.log("missed_release")
-                    end()
-                    begin()
+                    // 重複通知だけでは離したと判断しない。録音と pressedAt を保持する。
+                    Events.log("duplicate_press", ["audio_seconds": recorder.capturedSeconds])
                 } else {
                     // 押したイベントを取りこぼしていた（Koe には録音が残らない）
                     Events.log("missed_press")
@@ -3080,7 +3102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
             // ⌘+クリック・⌘+スクロールはショートカット操作。黙って取り消す
             // ⌘+クリックは押してすぐのクリック。話している途中（1 秒以上）のクリックでは取り消さない（話した分が消えていた）
-            if hotkeyDown, let u = current, Date().timeIntervalSince(u.pressedAt) < 1.0 { cancel(reason: "mouse", silent: true) }
+            if hotkeyDown, let u = current, RecordingSafety.cancelForMouse(held: Date().timeIntervalSince(u.pressedAt), seconds: recorder.capturedSeconds) { cancel(reason: "mouse", silent: true) }
         default: break
         }
     }
@@ -3152,13 +3174,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         render()
     }
 
-    // 手を離して録っていたのを自分で止める。声が来ていなければ黙って捨て、話した後なら終えて貼る
+    // 自動停止も音声を保護する。押している間は止めない。
     private func stopHandsFree(_ u: Utterance, _ why: PressGesture.Watch) {
-        guard current === u, u.toggled else { return }
+        guard current === u, RecordingSafety.watchAllowed(keyDown: hotkeyDown, toggled: u.toggled) else { return }
         Events.log("hands_free_stopped", ["reason": why.rawValue, "seconds": round(Date().timeIntervalSince(u.pressedAt))])
-        guard why == .discard else { return end() }
+        guard why == .discard else { return end(reason: "hands_free_" + why.rawValue) }
         current = nil
-        recorder.discard()
+        preserveOrDiscard(u, reason: "hands_free_no_voice")
         play(Settings.stopSound)
         showError("声が聞こえなかったので録音をやめました")
     }
@@ -3171,22 +3193,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         end()
     }
 
+    private func preserveOrDiscard(_ u: Utterance, reason: String) {
+        let held = Date().timeIntervalSince(u.pressedAt)
+        let seconds = recorder.capturedSeconds
+        Events.log("recording_ended", ["reason": reason, "hold_seconds": held, "audio_seconds": seconds])
+        recorder.stopNow { cap in
+            if RecordingSafety.mustKeep(seconds: cap.seconds, held: held, saveHistory: Settings.saveHistory) ||
+                RetryList.keepCancelled(enabled: Retranscriber.enabled, held: held, reason: reason, saveHistory: Settings.saveHistory) {
+                Retranscriber.saveCancelled(u, cap, reason: reason, held: held)
+                self.retranscriber.refresh()
+            } else {
+                try? FileManager.default.removeItem(at: cap.url)
+                if let alt = cap.alt?.url { try? FileManager.default.removeItem(at: alt) }
+            }
+        }
+    }
+
     private func cancel(reason: String, silent: Bool = false) {
         guard let u = current, !u.locked, !u.toggled else { return }
         current = nil
         let held = Date().timeIntervalSince(u.pressedAt)
-        // 話した分は履歴に残し、「最近の文字起こし」からもう一度文字起こしできるようにする
-        if RetryList.keepCancelled(enabled: Retranscriber.enabled, held: held, reason: reason, saveHistory: Settings.saveHistory) {
-            recorder.stopNow { Retranscriber.saveCancelled(u, $0, reason: reason, held: held) }
-        } else {
-            recorder.discard()
-        }
+        preserveOrDiscard(u, reason: reason)
         Events.log("cancelled", ["reason": reason, "hold_seconds": round(held * 100) / 100])
         // 1 秒以上押してから取り消された＝話している最中に他のキーに触れた可能性が高いので知らせる
         if held >= 1.0 && !silent { fail("他のキーに触れたので録音を取り消しました") }
     }
 
-    private func end() {
+    private func saveBeforeTranscription(_ u: Utterance, _ cap: Capture) {
+        guard Settings.saveHistory else { return }
+        u.record["outcome"] = "pending"
+        let id = History.newID()
+        if History.save(id: id, wav: cap.url, record: u.record, alt: cap.alt?.url) {
+            u.historyID = id
+        } else {
+            fail("録音の履歴保存に失敗しました。一時音声は保持しています")
+        }
+    }
+
+    private func end(reason: String = "release") {
         guard let u = current else { return }
         let held = Date().timeIntervalSince(u.pressedAt)
         switch u.toggled || u.locked ? .paste : PressGesture.firstRelease(mode: Settings.pressMode, held: held, minHold: Settings.minHoldSeconds,
@@ -3198,7 +3242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Events.log("toggle_started", ["mode": Settings.pressMode.rawValue])
             if PressGesture.autoStops(Settings.pressMode) {
                 handsFree.start(pressedAt: u.pressedAt, lastVoiceAt: { self.recorder.lastVoiceAt },
-                                active: { self.current === u && u.toggled }, act: { self.stopHandsFree(u, $0) })
+                                active: { self.current === u && u.toggled }, keyDown: { self.hotkeyDown }, act: { self.stopHandsFree(u, $0) })
             }
             render()
             return
@@ -3209,7 +3253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .tooShort:
             current = nil
             lastShortTap = Date()
-            recorder.discard()
+            preserveOrDiscard(u, reason: "too_short")
             Events.log("too_short", ["hold_seconds": round(held * 100) / 100])
             return
         case .paste: break
@@ -3223,16 +3267,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if getloadavg(&load, 3) > 0 { u.record["load1"] = round(load[0] * 10) / 10 }
         u.record["improve_running"] = improver.running
         transcribing += 1
+        Events.log("recording_ending", ["reason": reason, "hold_seconds": held, "audio_seconds": recorder.capturedSeconds])
         recorder.stop { cap in
             if let r = u.releasedAt { u.record["stop_ms"] = Int(Date().timeIntervalSince(r) * 1000) }
             // 終了音は録り足し（語尾の切れ対策）が終わってから鳴らす。録音に入れないため
             self.play(u.locked ? "lock_stop" : Settings.stopSound)
+            Events.log("recording_ended", ["reason": reason, "hold_seconds": held, "audio_seconds": cap.seconds])
             u.capture = cap
-            u.record["audio_seconds"] = round(cap.seconds * 100) / 100
+            u.record["audio_seconds"] = cap.seconds
             u.record["voiced_seconds"] = round(cap.voicedSeconds * 100) / 100
             u.record["peak"] = cap.peak
             u.record["device"] = cap.device
             if !cap.quality.isEmpty { u.record["quality"] = cap.quality }
+            self.saveBeforeTranscription(u, cap)
             // 声が小さく録れている（入力音量が低い）と、語が途切れたり聞き取られなかったりする。10 分に 1 回まで知らせる
             // 声を検出できなかった録音では、下の no_voice の知らせをこの案内に置き換える（上書きで消えないように）
             let quiet = AudioQuality.tooQuiet(cap.quality)
@@ -3379,8 +3426,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         u.record["whisper_model"] = (Settings.model as NSString).lastPathComponent
         u.record["whisper_prompt"] = prompt
         ImprovementJudgement.recordPrompt(prompt, in: &u.record)
-        // 窓は送る音声（無音を削った後）の長さに合わせる。繰り返しのやり直しは 30 秒の枠全体
-        let actx = loopRetry || fullWindow ? 0 : AudioWindow.ctx(setting: Settings.audioCtx, seconds: cap.voicedSeconds > 0 ? cap.voicedSeconds : cap.seconds)
+        // 窓は保存した音声全体の長さに合わせる。繰り返しのやり直しは 30 秒の枠全体
+        let actx = loopRetry || fullWindow ? 0 : AudioWindow.ctx(setting: Settings.audioCtx, seconds: cap.seconds)
         u.record[loopRetry || fullWindow ? "whisper_audio_ctx_retry" : "whisper_audio_ctx"] = actx
         server.transcribe(wav: cap.url, prompt: prompt, keepLines: u.locked || Settings.keepLines, seconds: cap.seconds,
                           audioCtx: actx, temperatureInc: loopRetry ? "0.2" : nil) { result in
@@ -3505,6 +3552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pb.clearContents()
         pb.setString(text, forType: .string)
         u.record["locked"] = true
+        u.record["outcome"] = "lock_saved"
         u.record["saved_to"] = url.path
         Events.log("lock_saved", ["seconds": u.record["audio_seconds"] ?? 0, "chars": text.count])
         finish(u, pasted: nil)
@@ -3640,11 +3688,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DiagnosisNotice.shared.note(DiagnosisLog.recording(quality: cap.quality, zero: cap.zero, device: cap.device,
                                                            sampleRate: Int(Recorder.sampleRate), fellBack: cap.fellBack,
                                                            outcome: u.record["outcome"] as? String ?? (pasted != nil ? "pasted" : "other")))
-        if Settings.saveHistory {
-            u.record["pasted"] = pasted ?? NSNull()
+        u.record["pasted"] = pasted ?? NSNull()
+        if u.record["outcome"] as? String == "pending" { u.record["outcome"] = pasted != nil ? "pasted" : "error" }
+        if let id = u.historyID {
+            History.merge(id: id, u.record)
+            try? FileManager.default.removeItem(at: cap.url)
+            if let a = cap.alt?.url { try? FileManager.default.removeItem(at: a) }
+        } else if Settings.saveHistory {
             let id = History.newID()
-            u.historyID = id
-            History.save(id: id, wav: cap.url, record: u.record, alt: cap.alt?.url)
+            if History.save(id: id, wav: cap.url, record: u.record, alt: cap.alt?.url) { u.historyID = id }
         } else {
             try? FileManager.default.removeItem(at: cap.url)
             if let a = cap.alt?.url { try? FileManager.default.removeItem(at: a) }

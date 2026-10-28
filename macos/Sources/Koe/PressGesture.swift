@@ -47,7 +47,8 @@ enum PressGesture {
     enum Watch: String { case keep, discard, silence, tooLong = "too_long" }
 
     // elapsed は押してからの秒数、sinceVoice は最後に声が来てからの秒数（まだ声が無ければ nil）
-    static func watch(elapsed: Double, sinceVoice: Double?) -> Watch {
+    static func watch(elapsed: Double, sinceVoice: Double?, keyDown: Bool = false) -> Watch {
+        guard !keyDown else { return .keep }
         if elapsed >= maxSeconds { return .tooLong }
         guard let s = sinceVoice else { return elapsed >= noVoiceLimit ? .discard : .keep }
         return s >= silenceLimit ? .silence : .keep
@@ -68,14 +69,14 @@ final class HandsFreeWatch {
 
     // active が false になったら（録音が終わった・ロックに切り替えた）見るのをやめる
     func start(pressedAt: Date, lastVoiceAt: @escaping () -> Date?, active: @escaping () -> Bool,
-               act: @escaping (PressGesture.Watch) -> Void) {
+               keyDown: @escaping () -> Bool = { false }, act: @escaping (PressGesture.Watch) -> Void) {
         stop()
         // .common に入れる: メニューを開いている間（イベント追跡のモード）も止めずに見る
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             guard active() else { self?.stop(); return }
             let now = Date()
             let w = PressGesture.watch(elapsed: now.timeIntervalSince(pressedAt),
-                                       sinceVoice: lastVoiceAt().map { now.timeIntervalSince($0) })
+                                       sinceVoice: lastVoiceAt().map { now.timeIntervalSince($0) }, keyDown: keyDown())
             guard w != .keep else { return }
             self?.stop()
             act(w)

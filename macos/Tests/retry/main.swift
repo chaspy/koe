@@ -21,9 +21,9 @@ func rec(_ ago: TimeInterval, _ outcome: String, _ extra: [String: Any] = [:]) -
 // 取り消した録音を残すか
 check(RetryList.keepCancelled(enabled: true, held: 1.0, reason: "key 12", saveHistory: true), "1 秒話して取り消したら残す")
 check(!RetryList.keepCancelled(enabled: true, held: 0.9, reason: "key 12", saveHistory: true), "1 秒未満は押し間違い")
-check(!RetryList.keepCancelled(enabled: true, held: 3, reason: "mouse", saveHistory: true), "マウスの取り消しは残さない")
-check(!RetryList.keepCancelled(enabled: true, held: 3, reason: "key 12", saveHistory: false), "履歴を残さない設定なら残さない")
-check(!RetryList.keepCancelled(enabled: false, held: 3, reason: "key 12", saveHistory: true), "機能がオフ（既定）なら今までどおり捨てる")
+check(RetryList.keepCancelled(enabled: true, held: 3, reason: "mouse", saveHistory: true), "2 秒超のマウス取り消しも残す")
+check(!RetryList.keepCancelled(enabled: true, held: 3, reason: "key 12", saveHistory: false), "2 秒超でも履歴保存オフなら残さない")
+check(RetryList.keepCancelled(enabled: false, held: 3, reason: "key 12", saveHistory: true), "2 秒超は機能設定に関係なく残す")
 
 // 一覧
 let gone = id(60)
@@ -43,7 +43,7 @@ let records: [[String: Any]] = [
     ["outcome": "pasted"],
 ]
 let items = RetryList.items(records, now: now) { day, audio in !audio.hasPrefix(gone) && day == String(audio.prefix(10)) || audio.hasPrefix(id(8 * 86400)) }
-check(items.map(\.outcome) == ["cancelled", "error"], "選ぶ結果: \(items.map(\.outcome))")
+check(items.map(\.outcome) == ["cancelled", "error", "no_voice", "mic_silent", "hallucination"], "選ぶ結果: \(items.map(\.outcome))")
 check(items.first?.id == id(30) && items.first?.day == String(id(30).prefix(10)), "新しい順・日のフォルダ")
 check(items.first?.seconds == 12.3, "長さ")
 // 多いときは limit 件まで

@@ -4,6 +4,8 @@
 
 Pull requests to this repository (chaspy/koe) are welcome. Koe is developed in a separate repository and each release is published here as one commit, so a pull request here is not merged as is: a maintainer brings the change into the development repository, it ships in the next release, and the pull request is closed then.
 
+Paste the result of the local CI (`scripts/ci.sh`) into the pull request description. GitHub Actions only runs as a check before a release.
+
 ## Term packs (`packs/`)
 
 Term packs are glossaries for a field, shipped with the app and turned on from the menu (用語パック). They help in three places:

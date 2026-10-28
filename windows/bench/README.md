@@ -1,6 +1,6 @@
 # Windows speed bench
 
-`.github/workflows/windows-bench.yml` (run it by hand: Actions → windows-bench → Run workflow, or `gh workflow run windows-bench.yml`) starts whisper-server v1.9.2 on a Windows runner with Koe's arguments and posts these files to `/inference` the way Koe does. The table goes to the job summary.
+`.github/workflows/windows-bench.yml` (removed under the local-CI policy; restore it with `git checkout 5b63447 -- .github/workflows/windows-bench.yml`, then run it by hand: Actions → windows-bench → Run workflow, or `gh workflow run windows-bench.yml`) starts whisper-server v1.9.2 on a Windows runner with Koe's arguments and posts these files to `/inference` the way Koe does. The table goes to the job summary.
 
 - `audio/*.wav` — synthetic speech made with macOS `say -v Kyoko`, 16 kHz mono (no real recordings). `10s.wav` is also a known repetition case: small with `audio_ctx=384` and no temperature fallback loops on 「金曜日間、」.
 - `sentences.tsv` — the text each file says (used for the match ratio).

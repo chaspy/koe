@@ -4,9 +4,11 @@ import Foundation
 // ここは一覧の選び方と見せ方だけ。AppKit を使わない（make test で確かめる）。
 // 録音は履歴（history/YYYY-MM-DD/<id>.wav）にあるものだけ使う。残す期間は履歴の決まり（Retention）どおりで、ここでは延ばさない
 enum RetryList {
-    // 一覧に出す結果と、その見せ方。「声を検出できなかった」（no_voice）は出さない:
-    // 手元の履歴ではほぼ全部が音の小さい 1 秒前後の押し間違いで、やり直しても文にならない（一覧が埋まって本当に要るものが埋もれる）
+    // 無音判定でも 2 秒超なら救済対象。未完了・ロック録音も再試行できる。
     static let labels: [String: String] = [
+        "pending": "未完了の録音",
+        "no_voice": "声を検出できなかった録音",
+        "mic_silent": "入力が途切れた録音",
         "cancelled": "取り消した録音",
         "hallucination": "聞き取れなかった録音",
         "error": "文字起こしに失敗した録音",
@@ -30,22 +32,22 @@ enum RetryList {
         return f
     }()
 
-    // 取り消した録音を履歴に残すか。この機能がオン（設定 retranscribe。既定オフ）で、履歴を残す設定で、
-    // 1 秒以上話していて（それより短いのは押し間違い）、マウスでの取り消し（クリックしながら押した）でないときだけ
+    // 履歴保存がオンなら、2 秒超は機能設定やキャンセル理由を問わず保護する。
     static func keepCancelled(enabled: Bool, held: Double, reason: String, saveHistory: Bool) -> Bool {
-        enabled && saveHistory && held >= 1.0 && reason != "mouse"
+        saveHistory && (held > 2 || (enabled && held >= 1.0 && reason != "mouse"))
     }
 
-    // 履歴の記録から、もう一度文字起こしできるものを新しい順に。録音が消えたもの・1 秒未満・やり直して入ったもの・ロック録音は出さない
+    // 履歴の記録から、もう一度文字起こしできるものを新しい順に。録音が消えたもの・1 秒未満・やり直して入ったものは出さない
     static func items(_ records: [[String: Any]], now: Date, audioExists: (String, String) -> Bool) -> [Item] {
         let from = now.addingTimeInterval(-days * 86400)
         var out: [Item] = []
         for r in records {
             guard let id = r["id"] as? String, let t = idFormat.date(from: id), t >= from, t <= now,
                   let o = r["outcome"] as? String, labels[o] != nil,
-                  r["retranscribed_at"] == nil, r["locked"] as? Bool != true,
+                  r["retranscribed_at"] == nil,
                   let seconds = r["audio_seconds"] as? Double, seconds >= minSeconds,
                   let audio = r["audio"] as? String, audioExists(String(id.prefix(10)), audio) else { continue }
+            if ["no_voice", "mic_silent"].contains(o) && seconds <= 2 { continue }
             out.append(Item(id: id, outcome: o, seconds: seconds, time: t))
         }
         return Array(out.sorted { $0.id > $1.id }.prefix(limit))

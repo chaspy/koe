@@ -17,9 +17,8 @@ final class Retranscriber {
 
     init(server: WhisperServer) { self.server = server }
 
-    // 新しい機能なので既定オフ（defaults write io.github.chaspy.koe retranscribe -bool true でオン）。
-    // オフの間は今までどおり: 取り消した録音は捨て、メニューにも段を出さない
-    static var enabled: Bool { Settings.defaults.bool(forKey: "retranscribe") }
+    // Recovery of existing history is always available; new saves respect saveHistory.
+    static var enabled: Bool { true }
 
     // 取り消した録音を履歴に残す（残す期間は履歴の決まりどおり）。まだ文字起こししていないので文は無い
     static func saveCancelled(_ u: Utterance, _ cap: Capture, reason: String, held: Double) {
@@ -28,13 +27,16 @@ final class Retranscriber {
         u.record["dropped"] = true
         u.record["cancel_reason"] = reason
         u.record["hold_seconds"] = round(held * 100) / 100
-        u.record["audio_seconds"] = round(cap.seconds * 100) / 100
+        u.record["audio_seconds"] = cap.seconds
         u.record["voiced_seconds"] = round(cap.voicedSeconds * 100) / 100
         u.record["peak"] = cap.peak
         u.record["device"] = cap.device
         if !cap.quality.isEmpty { u.record["quality"] = cap.quality }
         u.record["pasted"] = NSNull()
-        History.save(id: History.newID(), wav: cap.url, record: u.record, alt: cap.alt?.url)
+        if History.save(id: History.newID(), wav: cap.url, record: u.record, alt: cap.alt?.url) {
+            try? FileManager.default.removeItem(at: cap.url)
+            if let alt = cap.alt?.url { try? FileManager.default.removeItem(at: alt) }
+        }
     }
 
     // 一覧を裏で作り直す。メニュー（本体）を開いたときと、やり直しが終わったときに呼ぶ
@@ -55,7 +57,7 @@ final class Retranscriber {
                     let slim = RetryList.slim(r)
                     // 書いている途中・書き足される前かもしれないので、更新から 1 分たっていないものは覚えず次も読み直す。読めなかったものも覚えない
                     let mod = (try? fm.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date ?? now
-                    if now.timeIntervalSince(mod) >= 60 { keep[key] = slim } else { fresh.append(slim) }
+                    if now.timeIntervalSince(mod) >= 60 && slim["outcome"] as? String != "pending" { keep[key] = slim } else { fresh.append(slim) }
                 }
             }
             self.seen = keep   // 期間を過ぎた日は忘れる

@@ -8,6 +8,10 @@ name: whisper-vulkan
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   actions: read # job start times for the cost line

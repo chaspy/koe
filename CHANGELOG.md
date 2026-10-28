@@ -4,6 +4,18 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 Changes that are not released yet are in [`changelog.d/`](changelog.d/), one file per pull request; they are folded into a version section here when a release is made (`python3 scripts/changelog.py release <version>`).
 
+## 0.9.6 — 2026-10-28
+
+### Repository
+- Changed: scripts/ci.sh でローカルの CI（macOS のテストとリリースビルド、Windows の go vet・go test とクロスビルド、Python のテスト、changelog・kagami・pr_risk）を 1 本で回せるようにしました。GitHub Actions はリリース前の確認だけにし、計測用の windows-bench ワークフローを削除しました（windows/bench の README に復元の手順）。
+- Added: eval/paste_bench.py は、離してから貼り付けるまでの whisper の時間を、合成音声（say）で長さ別に測ります。標準ライブラリだけで、Koe が入った別の Mac でもファイル 1 つで回せ、出力は数値だけです。高負荷（--stress）と自前の server（--own）でも測れます。
+
+### macOS
+- Fixed: 録音中のマイク切り替えや重複したキー通知で音声が失われる問題を修正しました。「履歴を保存する」がオンの場合、2 秒を超える録音を保護し、文字起こし前に保存します。取り消し・無音判定・処理中断でも「最近の文字起こし」から再試行できます。
+
+### Windows
+- No changes.
+
 ## 0.9.5 — 2026-10-25
 
 ### Repository

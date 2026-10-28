@@ -250,7 +250,7 @@ func (a *App) startup() {
 		a.exportReceivers()
 	}()
 	if firstRun {
-		go messageBox("Koe", "Koe は、AI に話しかけるための入力です。多少聞き間違えても AI が意味を汲み取るので、直さずにそのまま送って大丈夫です。\n\n初回は音声認識モデル（約 190MB）をダウンロードします。進み具合はタスクバー右下（^ の中）の Koe アイコンにマウスを乗せると表示されます。\n\n準備ができたら、右 Alt を押している間だけ話してください。離すと文字起こしして貼り付けます。\n\n文字起こしが遅いと感じたら、アイコンのメニュー「モデル（速さ⇔精度）」で base に軽くしてください（誤変換は増えます）。", 0x40)
+		go messageBox("Koe", core.FirstRunMessage(fileSize(a.modelPathFor(a.modelFile())) > 0), 0x40)
 	}
 	a.reportPreviousUpdate()
 	go a.updateLoop()

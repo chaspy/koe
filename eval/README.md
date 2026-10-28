@@ -255,3 +255,44 @@ Results and limits: `docs/notes/2026-10-24-voice-isolation-whisper.md`.
 python3 eval/voice_isolation_bench.py
 python3 -m unittest eval/test_voice_isolation_bench.py
 ```
+
+## Release → paste latency on any Mac (`paste_bench.py`)
+
+Times the whisper request Koe makes after the key is released, with the same
+synthesized audio (`say`, Japanese voice Kyoko when present; `audio_sha` shows
+whether two Macs used identical audio) at 3, 8, 15 and 25 s. Standard library
+only, so it runs on another Mac with Koe installed by copying this one file:
+
+```sh
+nice -n 15 python3 paste_bench.py              # borrow the running Koe's whisper-server
+nice -n 15 python3 paste_bench.py --own        # own server; takes ~/.config/madoguchi/locks/whisper
+nice -n 15 python3 paste_bench.py --stress 8   # also with 8 busy CPU processes
+```
+
+On a Mac without this checkout (for example a work MacBook), one line with an
+authenticated `gh`; nothing is saved to disk:
+
+```sh
+gh api repos/chaspy/koe-dev/contents/eval/paste_bench.py -H 'Accept: application/vnd.github.raw' | nice -n 15 python3 - --stress 8
+```
+
+Copy the whole output back. It looks like this (Mac Studio M1 Max, Koe 0.9.5,
+load1 about 700 at the time):
+
+```
+# Koe paste latency bench
+model=Mac13,1 chip=Apple M1 Max cores=10 perf_cores=8 mem_gb=32 macos=26.2 koe=0.9.5
+voice=Kyoko audio_sha=dfc4f16c765f reps=2 server=koe
+
+## as is  load1 686.6-704.5
+| audio (s) | whisper median (ms) | whisper p90 (ms) | total est. median (ms) |
+|---:|---:|---:|---:|
+| 3 | 617 | 714 | 962 |
+| 8 | 624 | 639 | 969 |
+| 15 | 733 | 746 | 1078 |
+| 25 | 961 | 963 | 1306 |
+```
+
+Output is numbers only (machine model, chip, Koe version, load1, median / p90
+per length); transcripts are discarded. `total est.` adds Koe's fixed stages:
+the 0.25 s recorded after release and ~0.1 s for the paste.
