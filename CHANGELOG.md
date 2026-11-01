@@ -4,6 +4,17 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 Changes that are not released yet are in [`changelog.d/`](changelog.d/), one file per pull request; they are folded into a version section here when a release is made (`python3 scripts/changelog.py release <version>`).
 
+## 0.9.7 — 2026-11-01
+
+### macOS
+- Fixed: the update prompt now shows "今すぐ更新" as the highlighted button (neither button answers Return or Esc), and the release line is shown in full instead of being cut at 100 characters.
+- Fixed: 開発者パックで「Issue」が「異臭」、「起票」が「気表／記表」、「Cloudflare」が「クラウドフレア」などと聞き間違えられたまま貼られていました。これらを自動で直し、「CDN」の「CTN」も直します（「一周」は普通の言葉なので置き換えず、AI へのメモにだけ書きます）。
+- Fixed: 改善ループが聞き間違いを多く見つけても、辞書にはほとんど足していませんでした。漢字だけの語（起票）や短い・漢字の化けた形（異臭・気表・CTN）を普通の言葉とみなして黙って捨てていたためです。同じ聞き間違いが直近 7 日に 2 回のループ、または 3 発話以上で出たら、確度が中でも辞書に足します（ラテン文字・カタカナの形は置き換え、漢字の形は受け取る AI へのメモ）。一般語の一覧にある語は今までどおり足しません。
+- Added: 改善ループが出した語の提案と行き先（足した・保留・落とした＋理由）を Koe のデータフォルダの improve_proposals.jsonl（直近 7 日分）に残し、日次の振り返りに提案・追加・落とした数（理由別）と「辞書にまだ無い繰り返す聞き間違い」を出します。events には数だけを書きます。
+
+### Windows
+- No changes.
+
 ## 0.9.6 — 2026-10-28
 
 ### Repository

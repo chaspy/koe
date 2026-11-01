@@ -52,6 +52,7 @@ class MisheardRatesTest(unittest.TestCase):
             root = Path(tmp)
             (root / "events.jsonl").write_text(json.dumps({
                 "t": now.astimezone().isoformat(), "outcome": "improve_judged", "terms_added": 2}) + "\n")
+            (root / "improve_proposals.jsonl").write_text("\n".join(json.dumps(e) for e in self.proposals(now)) + "\n{broken\n")
             with patch.object(koe_eval, "datetime", FixtureDateTime), \
                  patch.object(koe_eval, "HISTORY", root / "history"), \
                  patch.object(koe_eval, "load_records", return_value=records), \
@@ -61,6 +62,31 @@ class MisheardRatesTest(unittest.TestCase):
                     koe_eval.cmd_daily(argparse.Namespace(days=1))
                 local = next((root / "reports").glob("*.md")).read_text()
                 return out.getvalue(), local
+
+    @staticmethod
+    def proposals(now):
+        def e(run, i, wrong, right, fate, reason=None, days=0):
+            d = {"run": run, "i": i, "wrong": wrong, "right": right, "fate": fate,
+                 "t": (now - timedelta(days=days)).astimezone().isoformat()}
+            if reason:
+                d["reason"] = reason
+            return d
+        return [e("r1", 0, "ProposalWrong", "ProposalRight", "dropped", "commonWord"),
+                e("r2", 3, "ProposalWrong", "ProposalRight", "dropped", "commonWord", days=2),
+                e("r1", 1, "Once", "OnceRight", "pending"),
+                e("r1", 2, "AddedWrong", "AddedRight", "added"), e("r2", 0, "AddedWrong", "AddedRight", "added"),
+                e("r0", 0, "OldWrong", "OldRight", "dropped", "phrase", days=9),
+                e("r0", 1, "OldWrong", "OldRight", "dropped", "phrase", days=9)]
+
+    def test_proposals_counts_and_missing_pairs(self):
+        stdout, local = self.report()
+        self.assertIn("提案 5 / 辞書に追加 2 / 保留 1 / 落とした 2（一般語に見えた 2） / 辞書にまだ無い繰り返す聞き間違い: 1", stdout)
+        for value in ["ProposalWrong", "ProposalRight", "OnceRight", "AddedRight"]:
+            self.assertNotIn(value, stdout)
+        self.assertIn("| ProposalWrong | ProposalRight | 2 | 2 |", local)
+        self.assertNotIn("AddedRight", local)
+        self.assertNotIn("OnceRight", local)
+        self.assertNotIn("OldRight", local)
 
     def test_rates_and_local_only_pairs(self):
         stdout, local = self.report()

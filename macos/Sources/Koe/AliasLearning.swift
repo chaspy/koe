@@ -58,17 +58,26 @@ enum AliasLearning {
     }
 
     static func stored(_ aliases: [String], sure: Bool, anchored: Bool, person: Bool,
-                       ordinaryWordNotes: Bool, observations: [String: Int] = [:], englishWords: Set<String>? = nil) -> [String] {
+                       ordinaryWordNotes: Bool, observations: [String: Int] = [:], englishWords: Set<String>? = nil,
+                       repeated: Bool = false) -> [String] {
         var result: [String] = []
         for alias in aliases {
             let plain = alias.hasPrefix("~") ? String(alias.dropFirst()) : alias
             let asciiWord = plain.unicodeScalars.allSatisfy { $0.isASCII && CharacterSet.letters.contains($0) }
-            let common = isCommon(plain) || (asciiWord && (englishWords?.contains(plain.lowercased()) ?? true))
+            let listed = TermRules.isCommonWord(plain) || (asciiWord && (englishWords?.contains(plain.lowercased()) ?? true))
+            var common = isCommon(plain) || listed
+            // #252: a pair proposed again and again is a real mishearing even when its shape looks ordinary
+            // (異臭・気表 are kanji only, CTN is short). Keep it: a latin form is replaced, anything else is a note.
+            var note = false
+            if repeated && !person && common && !listed {
+                common = false
+                note = !asciiWord
+            }
             // Option (a): new ordinary-word aliases are opt-in and always memo-only.
             if !person && common && !ordinaryWordNotes { continue }
-            let repeated = !person && (observations[plain] ?? 0) >= 2
-            let replace = (sure || anchored || repeated) && !common && (!person || plain.contains(">"))
-            let value = replace && (!alias.hasPrefix("~") || repeated) ? plain : "~" + plain
+            let seen = !person && ((observations[plain] ?? 0) >= 2 || repeated)
+            let replace = (sure || anchored || seen) && !common && !note && (!person || plain.contains(">"))
+            let value = replace && (!alias.hasPrefix("~") || seen) ? plain : "~" + plain
             if !result.contains(value) { result.append(value) }
         }
         return result

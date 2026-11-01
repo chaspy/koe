@@ -1934,8 +1934,22 @@ final class Improver {
         let existingTerms = Set(existing.map { TermRules.key($0.term) })
         let knownTerms = Set(existing.map(\.term))
         var seenObservations = Set<String>()
+        // 提案と行き先の記録（#252）。同じ組が直近 7 日に繰り返し出ていれば、形が普通の言葉に見えても足す
+        let proposalsURL = koeDir.appendingPathComponent("improve_proposals.jsonl")
+        let now = Date(), run = ISO8601DateFormatter().string(from: now)
+        let pastProposals = ImproveProposals.parse((try? String(contentsOf: proposalsURL, encoding: .utf8)) ?? "", now: now)
+        let thisRun = terms.map { ImproveProposals.entry(run: run, at: run, index: $0["i"] as? Int, wrong: $0["wrong"] as? String ?? "",
+            right: $0["right"] as? String ?? "", kind: nil, confidence: nil, fate: .pending, reason: nil) }
+        var proposals: [[String: Any]] = []
         for var t in terms {
             let utteranceIndex = t["i"] as? Int
+            let proposedWrong = t["wrong"] as? String ?? "", proposedRight = t["right"] as? String ?? ""
+            let rep = ImproveProposals.repeated(pastProposals + thisRun, wrong: proposedWrong, right: proposedRight)
+            func record(_ fate: ImproveProposals.Fate, _ reason: ImproveProposals.Reason? = nil) {
+                proposals.append(ImproveProposals.entry(run: run, at: run, index: utteranceIndex, wrong: proposedWrong,
+                    right: (t["right"] as? String ?? proposedRight).trimmingCharacters(in: .whitespaces),
+                    kind: t["kind"] as? String, confidence: t["confidence"] as? String, fate: fate, reason: reason))
+            }
             // 近い読みの形は People.judge の守りを通したものだけ使う（人の名前でない語に付いてきたものは捨てる）
             let raw = t.removeValue(forKey: "variants") as? [String] ?? []
             // 人の名前・呼び名（名簿にある名前を kind: "term" で返したものも）は、文字起こしと前後から確かなときだけ足す（People.judge）
@@ -1950,7 +1964,7 @@ final class Improver {
                                            transcript: i.flatMap { transcripts[$0] } ?? "", context: i.flatMap { contexts[$0] } ?? "",
                                            variants: raw),
                                      people: people, knownCalled: knownCalled)
-                guard case .add(let a) = d else { continue }
+                guard case .add(let a) = d else { record(.dropped, .person); continue }
                 t = ["wrong": a.alias, "right": a.term, "kind": "person", "explicit": t["explicit"] as? Bool == true, "variants": a.variants]
                 if let who = a.who {
                     learned.append((who, a.called))
@@ -1960,13 +1974,15 @@ final class Improver {
             guard let right = (t["right"] as? String)?.trimmingCharacters(in: .whitespaces), (2...30).contains(right.count),
                   let wrong = (t["wrong"] as? String)?.trimmingCharacters(in: .whitespaces), !wrong.isEmpty, wrong != right,
                   // 語ではなく文・注記になっているもの（「(聞き取り不能)」「〜、〜のやつ」）は辞書に入れない
-                  wrong.count <= (Settings.defaults.bool(forKey: "termAliasLearning") ? 30 : 15), !wrong.contains("、"), !right.contains("("), !right.contains("（"),
-                  TermRules.rejection(right, aliases: aliasKeys, person: t["kind"] as? String == "person",
-                      existingMultiword: AliasLearning.existingMultiword(right, knownTerms: knownTerms,
-                          enabled: Settings.defaults.bool(forKey: "termAliasLearning"))) == nil else { continue }
-            // Do not introduce an alias that would turn an existing correct term into a chain.
-            guard TermRules.aliasAllowed(wrong, existingTerms: existingTerms,
-                                         person: t["kind"] as? String == "person") else { continue }
+                  wrong.count <= (Settings.defaults.bool(forKey: "termAliasLearning") ? 30 : 15), !wrong.contains("、"), !right.contains("("), !right.contains("（")
+            else { record(.dropped, .shape); continue }
+            // 一般語・句・別名の連鎖、または既存の正しい表記を別名にする連鎖（Do not turn an existing correct term into a chain.）
+            let why = TermRules.rejection(right, aliases: aliasKeys, person: t["kind"] as? String == "person",
+                    existingMultiword: AliasLearning.existingMultiword(right, knownTerms: knownTerms,
+                        enabled: Settings.defaults.bool(forKey: "termAliasLearning")), repeated: rep).map(ImproveProposals.reason)
+                ?? (TermRules.aliasAllowed(wrong, existingTerms: existingTerms, person: t["kind"] as? String == "person") ? nil : .existingTerm)
+            guard why == nil else { record(.dropped, why); continue }
+            record(.pending)
             ImprovementJudgement.reportPair(index: utteranceIndex, transcripts: transcripts, wrong: wrong, right: right, report: onPair)
             var c = cand[right] ?? ["count": 0, "wrongs": [String]()]
             // 人の名前・呼び名は個人の辞書にだけ使い、共有パックへの提案には回さない印
@@ -1994,14 +2010,16 @@ final class Improver {
             let anchored = c["person"] as? Bool == true && wrongs.allSatisfy { $0.contains(">") }
             // 人の名前の、敬称の条件が無い別名は置き換えない（受け取る AI へのメモだけ）
             let person = c["person"] as? Bool == true
-            if (c["count"] as? Int ?? 0) >= 2 || sure || anchored {
+            if (c["count"] as? Int ?? 0) >= 2 || sure || anchored || rep {
                 promote[right] = AliasLearning.stored(wrongs, sure: sure, anchored: anchored, person: person,
                     ordinaryWordNotes: Settings.defaults.bool(forKey: "ordinaryWordNotes"), observations: observations,
-                    englishWords: AliasVocabulary.englishWords)
+                    englishWords: AliasVocabulary.englishWords, repeated: rep)
             }
         }
         if let data = try? JSONSerialization.data(withJSONObject: cand, options: [.prettyPrinted, .sortedKeys]) { try? data.write(to: candURL) }
         PeopleStore.remember(called: learned, wrongs: learnedWrongs)
+        var written = Set<String>()
+        defer { saveProposals(proposals, past: pastProposals, to: proposalsURL, written: written, promote: promote) }
         guard !promote.isEmpty else { return [] }
         // 個人の辞書を更新（既にある語は別名を足す。上限 300 語。whisper に渡すのは最近使った語だけなので、辞書は大きくてよい）
         let path = (Settings.glossaryPath as NSString).expandingTildeInPath
@@ -2013,14 +2031,24 @@ final class Improver {
                 let e = Glossary.parse(lines[i]).first
                 let merged = AliasLearning.merged(existing: e?.aliases ?? [], learned: wrongs)
                 lines[i] = term + "\t" + merged.joined(separator: "／")
+                written.insert(term)
             } else if Glossary.personal.count + added.count < 300 {
                 lines.insert(term + "\t" + wrongs.joined(separator: "／"), at: min(1, lines.count))
                 added.append(term)
+                written.insert(term)
             }
         }
         try? lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
         Glossary.exportForReceivers()
         return added
+    }
+
+    private func saveProposals(_ proposals: [[String: Any]], past: [[String: Any]], to url: URL, written: Set<String>,
+                               promote: [String: [String]]) {
+        let settled = ImproveProposals.settle(proposals, written: written, emptied: Set(promote.filter { $0.value.isEmpty }.keys))
+        // 直近 7 日分（読んだ分）とこの回の分だけを書き戻す
+        try? ImproveProposals.serialize(past + settled).write(to: url, atomically: true, encoding: .utf8)
+        if !settled.isEmpty { Events.log("improve_proposals", ImproveProposals.counts(settled)) }
     }
 
     static let prompt = """

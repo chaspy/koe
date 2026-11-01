@@ -323,7 +323,7 @@ func (a *App) prepareUpdatePrompt(r core.Release) {
 		if md, err := core.FetchChangelog(context.Background(), core.RawBase, a.cfg.UpdateRepo, r.Tag, "Koe-windows/"+version); err != nil {
 			a.log.Printf("update_summary_failed %v", err)
 		} else {
-			line, no = core.ChangelogSummary(md, r.Version, "Windows", 100)
+			line, no = core.ChangelogSummary(md, r.Version, "Windows", 400) // MessageBox wraps the whole text; cut only absurdly long lines (#250)
 		}
 		p.mu.Lock()
 		p.version, p.line, p.noChanges = r.Version, line, no

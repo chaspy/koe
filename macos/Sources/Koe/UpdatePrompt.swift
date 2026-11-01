@@ -15,22 +15,25 @@ enum UpdatePrompt {
     static let snooze: TimeInterval = 24 * 3600
 
     // 確認の画面。手で打っている最中に出ても Enter / Esc で更新が走らないように:
-    // 既定（Return）は「あとで」、「今すぐ更新」はキーを持たない（クリックだけ）、Esc で押されるボタンも作らない。
+    // どのボタンも Return / Esc を持たない（クリックだけ）。「今すぐ更新」を強調色で塗って主のボタンに見せる（#250）。
     // フォーカスは奪わない（呼ぶ側は activate せず orderFrontRegardless で前に出すだけ）
     static func makeAlert(version: String, line: String?, requiresRegrant: Bool = false, icon: NSImage? = nil, target: AnyObject, now: Selector, later: Selector) -> NSAlert {
         let a = NSAlert()
         if let icon { a.icon = icon }
         a.messageText = "新しい版 v\(version) があります"
         a.informativeText = (requiresRegrant ? regrantNotice + "\n\n" : "") + (line.map { $0 + "\n\n" } ?? "") + "今すぐ更新すると、Koe が数秒止まって起動し直します。あとでにすると、24 時間後か次の起動でもう一度お知らせします。"
-        let l = a.addButton(withTitle: "あとで")       // 最初のボタン＝既定
-        l.keyEquivalent = "\r"
-        l.target = target
-        l.action = later
+        // 最初のボタンが右端（主の位置）に並ぶ。NSAlert が付ける Return は外す
         let n = a.addButton(withTitle: "今すぐ更新")
         n.keyEquivalent = ""
         n.keyEquivalentModifierMask = []
+        n.bezelColor = .controlAccentColor
+        if #available(macOS 26.0, *) { n.tintProminence = .primary }
         n.target = target
         n.action = now
+        let l = a.addButton(withTitle: "あとで")
+        l.keyEquivalent = ""
+        l.target = target
+        l.action = later
         a.window.level = .floating
         return a
     }
@@ -63,9 +66,10 @@ enum UpdatePrompt {
         return true
     }
 
+    // 画面の本文は折り返して全部出るので、切るのは異常に長い行だけ（#250: 100 字で切ると文の途中で終わっていた）。
     // CHANGELOG.md の「## <version>」の節から、platform（"macOS" / "Windows"）の小見出しの最初の項目を 1 行にして返す。
     // macOS の Re-grant: は節全体から拾い、通常の要約とは別に省略せず表示する。
-    static func summary(changelog: String, version: String, platform: String, maxLength: Int = 100) -> Summary {
+    static func summary(changelog: String, version: String, platform: String, maxLength: Int = 400) -> Summary {
         var inVersion = false, inPlatform = false
         var result = Summary()
         var foundFirst = false

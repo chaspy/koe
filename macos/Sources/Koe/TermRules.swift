@@ -67,8 +67,10 @@ enum TermRules {
         commonEnglish.contains(key(word)) || commonJapanese.contains(word)
     }
 
+    // repeated: the same mishearing pair came back across runs (#252). A kanji-only term (起票) is then
+    // kept unless it is in the common list; every other rule still applies.
     static func rejection(_ term: String, aliases: Set<String> = [], person: Bool = false,
-                          existingMultiword: Bool = false) -> Rejection? {
+                          existingMultiword: Bool = false, repeated: Bool = false) -> Rejection? {
         guard (2...20).contains(term.count) else { return .phrase }
         if person { return nil } // Names retain the separate People.judge safeguards.
         let normalized = key(term)
@@ -85,7 +87,7 @@ enum TermRules {
         let hasKanaOrLatin = term.unicodeScalars.contains {
             (0x30A0...0x30FF).contains($0.value) || ($0.isASCII && CharacterSet.alphanumerics.contains($0))
         }
-        return hasKanaOrLatin ? nil : .commonWord
+        return hasKanaOrLatin || repeated ? nil : .commonWord
     }
 
     static func aliasAllowed(_ alias: String, existingTerms: Set<String>, person: Bool) -> Bool {

@@ -686,6 +686,46 @@ def repeated_mishearings(records, now):
     return result
 
 
+PROPOSAL_REASONS = {"shape": "文・注記", "phrase": "句・語尾", "commonWord": "一般語に見えた", "aliasChain": "別の語の別名",
+                    "existingTerm": "既にある正しい表記", "person": "人の名前の守り", "ordinaryAlias": "化けた形が普通の言葉に見えた"}
+
+
+def load_proposals():
+    """改善ループの提案と行き先（improve_proposals.jsonl、#252）。壊れた行は飛ばす。"""
+    path = HISTORY.parent / "improve_proposals.jsonl"
+    out = []
+    for line in (path.read_text().splitlines() if path.exists() else []):
+        try:
+            e = json.loads(line)
+            e["_t"] = datetime.fromisoformat(e["t"].replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError):
+            continue
+        if isinstance(e.get("wrong"), str) and isinstance(e.get("right"), str):
+            out.append(e)
+    return out
+
+
+def proposal_summary(entries, now, top=10):
+    """直近7日の提案の数（行き先・落とした理由ごと）と、まだ辞書に入っていない繰り返す組（2 回のループ、または 3 発話以上）。"""
+    from collections import Counter, defaultdict
+    since = now - timedelta(days=7)
+    recent = [e for e in entries if since <= e["_t"] <= now]
+    counts = Counter(e.get("fate") for e in recent)
+    reasons = Counter(e.get("reason") for e in recent if e.get("fate") == "dropped")
+    runs, utterances, added = defaultdict(set), defaultdict(set), set()
+    for e in recent:
+        key = (e["wrong"], e["right"])
+        runs[key].add(e.get("run"))
+        utterances[key].add((e.get("run"), e.get("i")))
+        if e.get("fate") == "added":
+            added.add(key)
+    missing = [{"wrong": w, "right": r, "runs": len(runs[(w, r)]), "count": len(utterances[(w, r)])}
+               for (w, r) in runs if (w, r) not in added and (len(runs[(w, r)]) >= 2 or len(utterances[(w, r)]) >= 3)]
+    missing.sort(key=lambda p: (-p["count"], -p["runs"], p["right"], p["wrong"]))
+    return {"proposed": len(recent), "added": counts["added"], "pending": counts["pending"],
+            "dropped": counts["dropped"], "reasons": dict(reasons), "missing": missing[:top]}
+
+
 def _local_report_cell(value):
     # Markdown の表を壊さず、リンク/HTMLとして解釈させない。
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace(
@@ -809,6 +849,11 @@ def cmd_daily(a):
     lines += ["聞き間違い・伝わらなかったの分母は判定済み（判定不能を除く）。聞き間違いは旧データが混在する日も - と表示。", ""]
     repeated = repeated_mishearings(load_records(), now)
     lines += [f"反復ペア数（直近7日・3回以上）: {len(repeated)} / エンジン限界: {sum(p['kind'] == 'engine_limit' for p in repeated)}", ""]
+    props = proposal_summary(load_proposals(), now)
+    why = "、".join(f"{PROPOSAL_REASONS.get(k, k)} {v}" for k, v in sorted(props["reasons"].items(), key=lambda kv: -kv[1]))
+    lines += [f"改善ループの提案（直近7日）: 提案 {props['proposed']} / 辞書に追加 {props['added']} / 保留 {props['pending']} / "
+              f"落とした {props['dropped']}" + (f"（{why}）" if why else "") +
+              f" / 辞書にまだ無い繰り返す聞き間違い: {len(props['missing'])}", ""]
     print("\n".join(lines))  # 標準出力には数値集計だけ。以下の語・理由はローカルファイル専用。
     if notes.get(today):
         lines += [f"## 今日（{today}）伝わらなかったもの（理由メモ）", ""] + [f"- {x}" for x in notes[today]] + [""]
@@ -822,6 +867,11 @@ def cmd_daily(a):
                  "unknown": "プロンプト記録不足：分類保留"}
         for pair in repeated:
             lines.append(f"| {_local_report_cell(pair['wrong'])} | {_local_report_cell(pair['right'])} | {pair['count']} | {kinds[pair['kind']]} |")
+    if props["missing"]:
+        lines += ["", "## 辞書にまだ無い、繰り返す聞き間違い（直近7日・上位）", "",
+                  "| 誤り | 正しい語 | 発話 | ループ |", "|---|---|---|---|"]
+        for p in props["missing"]:
+            lines.append(f"| {_local_report_cell(p['wrong'])} | {_local_report_cell(p['right'])} | {p['count']} | {p['runs']} |")
     text = "\n".join(lines)
     out = HISTORY.parent / "reports" / f"daily-{now:%Y-%m-%d}.md"
     out.parent.mkdir(parents=True, exist_ok=True)

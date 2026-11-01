@@ -39,7 +39,7 @@ let md = """
 - Older.
 """
 let mac = s.summary(changelog: md, version: "0.5.0", platform: "macOS")
-check(mac.line?.hasPrefix("Fixed: after every update macOS silently dropped Koe's Accessibility permission (AXIsProcess") == true && !mac.line!.contains("**") && !mac.line!.contains("`") && mac.line!.hasSuffix("…") && mac.line!.count == 100 && !mac.noChanges, "macOS summary: \(mac)")
+check(mac.line?.hasPrefix("Fixed: after every update macOS silently dropped Koe's Accessibility permission (AXIsProcess") == true && !mac.line!.contains("**") && !mac.line!.contains("`") && !mac.line!.hasSuffix("…") && !mac.noChanges, "macOS summary: \(mac)")
 let win = s.summary(changelog: md, version: "0.5.0", platform: "Windows")
 check(win.line == nil && win.noChanges, "Windows: no changes \(win)")
 check(s.summary(changelog: md, version: "0.4.2", platform: "macOS").line == "Older.", "older section")
@@ -63,7 +63,7 @@ check(!s.summary(changelog: winMarker, version: "1.0.0", platform: "macOS").requ
 let contradictory = markerOnly.replacingOccurrences(of: "- Re-grant:", with: "- No changes.\n- Re-grant:")
 check(!s.summary(changelog: contradictory, version: "1.0.0", platform: "macOS").noChanges, "regrant overrides no changes")
 
-// 確認の画面: Enter / Esc で「今すぐ更新」が押されない（既定は「あとで」）
+// 確認の画面: Enter / Esc でどのボタンも押されない。「今すぐ更新」が強調色
 final class Recorder: NSObject {
     var pressed: [String] = []
     @objc func now() { pressed.append("now") }
@@ -79,9 +79,11 @@ check(warning.informativeText.hasPrefix(UpdatePrompt.regrantNotice + "\n\n"), "c
 check(warning.informativeText.contains("「−」") && warning.informativeText.contains("「+」"), "warning includes repair steps")
 check(!alert.informativeText.contains(UpdatePrompt.regrantNotice), "unmarked alert unchanged")
 let buttons = alert.buttons
-check(buttons.first?.title == "あとで" && buttons.first?.keyEquivalent == "\r", "default (Return) button is あとで: \(buttons.map { ($0.title, $0.keyEquivalent) })")
+check(buttons.allSatisfy { $0.keyEquivalent.isEmpty }, "no button answers Return: \(buttons.map { ($0.title, $0.keyEquivalent) })")
 let nowButton = buttons.first { $0.title == "今すぐ更新" }
 check(nowButton != nil && nowButton!.keyEquivalent.isEmpty, "今すぐ更新 has no key equivalent")
+check(nowButton?.bezelColor == .controlAccentColor && buttons.first === nowButton, "今すぐ更新 is the highlighted (accent) button in the primary position")
+check(buttons.first { $0.title == "あとで" }?.bezelColor == nil, "あとで is a plain button")
 check(!buttons.contains { $0.keyEquivalent == "\u{1b}" }, "no button answers Esc")
 check(alert.informativeText.hasPrefix("Fixed something."), "summary line shown first")
 func key(_ chars: String, _ code: UInt16) -> NSEvent {
@@ -95,7 +97,7 @@ for (name, ev) in [("Return", key("\r", 36)), ("Enter (keypad)", key("\u{3}", 76
 }
 rec.pressed = []
 for b in buttons { _ = b.performKeyEquivalent(with: key("\r", 36)) }
-check(rec.pressed == ["later"], "Return answers あとで: \(rec.pressed)")
+check(rec.pressed.isEmpty, "Return presses nothing: \(rec.pressed)")
 
 // #157: orderFrontRegardless() だけで出すと nib の素の部品（"<Do not show this message again>"、空の 3 つ目のボタン）が見えていた。
 // present() で出すと、見えるボタンは「あとで」「今すぐ更新」の 2 つだけ

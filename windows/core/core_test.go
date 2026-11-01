@@ -52,6 +52,12 @@ func TestAutocorrect(t *testing.T) {
 		{"プロリクエストを出す", "プルリクエストを出す"},
 		{"リポジテルを見て", "リポジトリを見て"},
 		{"Cloud Codeで", "Claude Codeで"},
+		// #251
+		{"異臭を気表して", "Issueを起票して"},
+		{"記表しておいて", "起票しておいて"},
+		{"一周回って", "一周回って"},
+		{"クラウドフレアのCTN", "CloudflareのCDN"},
+		{"クラウドフレイヤーとクラウドフェア", "CloudflareとCloudflare"},
 		// katakana spellings of latin names
 		{"ギットアブに上げる", "GitHubに上げる"},
 		{"ギットハブアクションズで回す", "GitHub Actionsで回す"},
