@@ -284,12 +284,18 @@ func (r *Recorder) Start() error {
 
 // Stop keeps recording TailSeconds more, then returns the captured samples.
 func (r *Recorder) Stop() []int16 {
+	return r.stopAfter(time.Duration(core.TailSeconds * float64(time.Second)))
+}
+
+func (r *Recorder) StopNow() []int16 { return r.stopAfter(0) }
+
+func (r *Recorder) stopAfter(tail time.Duration) []int16 {
 	r.lifecycle.Lock()
 	defer r.lifecycle.Unlock()
 	// The tail is captured while holding lifecycle on purpose: a Start() from
 	// a quick re-press waits at most TailSeconds, and in warm mode that audio
 	// lands in its pre-roll, so nothing is lost.
-	time.Sleep(time.Duration(core.TailSeconds * float64(time.Second)))
+	time.Sleep(tail)
 	r.finishFallback()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -300,20 +306,6 @@ func (r *Recorder) Stop() []int16 {
 		r.closeLocked()
 	}
 	return s
-}
-
-// Discard drops the current recording.
-func (r *Recorder) Discard() {
-	r.lifecycle.Lock()
-	defer r.lifecycle.Unlock()
-	r.finishFallback()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.recording = false
-	r.samples = nil
-	if !r.warm {
-		r.closeLocked()
-	}
 }
 
 // Reopen closes and reopens the device (e.g. after digital silence).

@@ -4,6 +4,14 @@ Versions follow the rule in [CONTRIBUTING.md](CONTRIBUTING.md#versioning). Each 
 
 Changes that are not released yet are in [`changelog.d/`](changelog.d/), one file per pull request; they are folded into a version section here when a release is made (`python3 scripts/changelog.py release <version>`).
 
+## 0.9.8 — 2026-11-02
+
+### macOS
+- Added: menu item "新しい版を自動で入れる（使っていない時間に）" (off by default). When on, Koe installs a new version once it has not been used for 10 minutes and is not recording, transcribing or pasting, with the same signature check as the manual update; it checks again right before replacing itself, tells you after restarting, does not retry a version whose signature could not be confirmed, and leaves versions that need Accessibility re-granted to the usual prompt.
+
+### Windows
+- No changes.
+
 ## 0.9.7 — 2026-11-01
 
 ### macOS

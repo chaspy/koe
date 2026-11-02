@@ -219,7 +219,8 @@ func TestWriteDayFileRecreatesFolder(t *testing.T) {
 	// ERROR_ACCESS_DENIED for a moment). The write is replaced, so this runs
 	// the same on every OS.
 	beforeDayWrite = nil
-	defer func() { dayWriteFile = os.WriteFile }()
+	originalWrite := dayWriteFile
+	defer func() { dayWriteFile = originalWrite }()
 	denied := func(name string) error {
 		return &fs.PathError{Op: "open", Path: name, Err: fs.ErrPermission}
 	}

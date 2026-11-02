@@ -1,0 +1,4 @@
+# Third-party packages the Python tests need (scripts/ci.sh installs them into
+# ~/.cache/koe-ci/venv, never into the system or the repo). Python 3.13 on Apple silicon.
+numpy==2.1.3 \
+    --hash=sha256:dc258a761a16daa791081d026f0ed4399b582712e6fc887a95af09df10c5ca57

@@ -43,6 +43,7 @@ type utterance struct {
 	chars      int  // characters of the text before CRLF (logs count like mac)
 	pcm        []int16
 	micKind    core.MicKind // alternate microphone used after a hardware-mute fallback ("" = none)
+	archived   bool
 	record     map[string]any
 }
 
@@ -78,7 +79,11 @@ type App struct {
 	updating   atomic.Bool
 	tail       sync.WaitGroup
 	queue      chan *utterance
-	cur        *utterance // event loop only
+	cur        *utterance // protected by eventMu
+	eventMu    sync.Mutex
+	exiting    bool
+	stopping   chan struct{}
+	unsaved    map[*utterance][]byte // protected by mu; retry at shutdown
 	recording  atomic.Bool
 	locked     atomic.Bool // the current recording is a lock recording
 	processing atomic.Int32
@@ -121,7 +126,7 @@ func main() {
 		messageBox("Koe", "Koe はすでに起動しています（タスクバー右下の通知領域にアイコンがあります）。", 0x40)
 		return
 	}
-	a := &App{download: -1, prevByApp: map[string]pastedText{}, queue: make(chan *utterance, 16)}
+	a := &App{download: -1, prevByApp: map[string]pastedText{}, queue: make(chan *utterance, 16), stopping: make(chan struct{})}
 	exe, _ := os.Executable()
 	a.exeDir = filepath.Dir(exe)
 	a.roamDir = filepath.Join(os.Getenv("APPDATA"), "Koe")
@@ -159,6 +164,15 @@ func (a *App) onReady() {
 
 func (a *App) onExit() {
 	a.log.Printf("exit")
+	a.eventMu.Lock()
+	a.exiting = true
+	close(a.stopping)
+	if a.cur != nil {
+		a.discard("application_quit", time.Since(a.cur.pressedAt))
+	}
+	a.eventMu.Unlock()
+	a.tail.Wait() // all completed captures are archived before stopping the server
+	a.retryUnsaved()
 	stopKeyboardHook(a.hookID)
 	stopKeyboardHook(a.menuID)
 	if a.server != nil {
@@ -794,77 +808,86 @@ func (a *App) changeGPU() {
 func (a *App) eventLoop(keys <-chan keyEvent) {
 	defer a.recoverLog("eventLoop")
 	for ev := range keys {
-		if vk := a.hotkeyVK.Load(); vk != a.hold.HotkeyVK {
-			a.stopForSettingChange(ev.at)
-			a.holding.Store(false)
-			a.hold.SetHotkey(vk)
-			a.log.Printf("hotkey_applied vk=0x%X", vk)
-		}
-		if tg := a.toggle.Load(); tg != a.hold.Toggle {
-			a.stopForSettingChange(ev.at)
-			a.holding.Store(false)
-			a.hold.SetToggle(tg)
-			a.log.Printf("press_mode_applied toggle=%v", tg)
-		}
-		if ev.injected {
-			continue
-		}
-		// AltGr layouts send a fake LCtrl (scan 0x21D) with Right Alt
-		if ev.vk == vkLControl && ev.scan == 0x21D {
-			continue
-		}
-		if ev.down {
-			wasHolding := a.hold.Holding()
-			switch a.hold.Down(ev.vk, ev.at) {
-			case core.ActStart:
-				a.log.Printf("key_down hotkey vk=0x%X", ev.vk)
-				a.begin(ev)
-			case core.ActNone:
-				if ev.vk == a.hold.HotkeyVK && a.hold.Latched() {
-					a.holding.Store(true) // stop tap: do not paste while the key is down
-				}
-			case core.ActCancel:
-				if wasHolding {
-					a.log.Printf("other_key_while_holding vk=0x%X -> cancel", ev.vk)
-					a.cancel(ev.at)
-				}
+		a.handleKeyEvent(ev)
+	}
+}
+
+func (a *App) handleKeyEvent(ev keyEvent) {
+	a.eventMu.Lock()
+	defer a.eventMu.Unlock()
+	if a.exiting {
+		return
+	}
+	if vk := a.hotkeyVK.Load(); vk != a.hold.HotkeyVK {
+		a.stopForSettingChange(ev.at)
+		a.holding.Store(false)
+		a.hold.SetHotkey(vk)
+		a.log.Printf("hotkey_applied vk=0x%X", vk)
+	}
+	if tg := a.toggle.Load(); tg != a.hold.Toggle {
+		a.stopForSettingChange(ev.at)
+		a.holding.Store(false)
+		a.hold.SetToggle(tg)
+		a.log.Printf("press_mode_applied toggle=%v", tg)
+	}
+	if ev.injected {
+		return
+	}
+	// AltGr layouts send a fake LCtrl (scan 0x21D) with Right Alt
+	if ev.vk == vkLControl && ev.scan == 0x21D {
+		return
+	}
+	if ev.down {
+		wasHolding := a.hold.Holding()
+		switch a.hold.Down(ev.vk, ev.at) {
+		case core.ActStart:
+			a.log.Printf("key_down hotkey vk=0x%X", ev.vk)
+			a.begin(ev)
+		case core.ActNone:
+			if ev.vk == a.hold.HotkeyVK && a.hold.Latched() {
+				a.holding.Store(true) // stop tap: do not paste while the key is down
 			}
-		} else {
-			act, held := a.hold.Up(ev.vk, ev.at)
+		case core.ActCancel:
+			if wasHolding {
+				a.log.Printf("other_key_while_holding vk=0x%X -> cancel", ev.vk)
+				a.cancel(ev.at)
+			}
+		}
+	} else {
+		act, held := a.hold.Up(ev.vk, ev.at)
+		if ev.vk == a.hold.HotkeyVK {
+			a.log.Printf("key_up hotkey held=%.2fs action=%s", held.Seconds(), act)
+		}
+		switch act {
+		case core.ActShort:
+			a.holding.Store(false)
+			a.discard("too_short", held)
+		case core.ActLatch:
+			a.holding.Store(false)
+			if a.cur == nil {
+				// recording did not start (not ready / mic error): the next tap starts again
+				a.hold.Reset()
+				break
+			}
+			a.log.Printf("toggle_latched (recording until the next tap)")
+			a.render()
+		case core.ActLock:
+			a.holding.Store(false)
+			if a.cur == nil {
+				a.hold.Reset()
+				break
+			}
+			a.cur.locked = true
+			a.locked.Store(true)
+			a.log.Printf("lock_recording (recording until the next press)")
+			a.playSound("start")
+			a.render()
+		case core.ActFinish:
+			a.holding.Store(false)
+			a.end(ev.at, held, "release")
+		case core.ActNone:
 			if ev.vk == a.hold.HotkeyVK {
-				a.log.Printf("key_up hotkey held=%.2fs action=%s", held.Seconds(), act)
-			}
-			switch act {
-			case core.ActShort:
 				a.holding.Store(false)
-				a.discard("too_short", held)
-			case core.ActLatch:
-				a.holding.Store(false)
-				if a.cur == nil {
-					// recording did not start (not ready / mic error): the next tap starts again
-					a.hold.Reset()
-					break
-				}
-				a.log.Printf("toggle_latched (recording until the next tap)")
-				a.render()
-			case core.ActLock:
-				a.holding.Store(false)
-				if a.cur == nil {
-					a.hold.Reset()
-					break
-				}
-				a.cur.locked = true
-				a.locked.Store(true)
-				a.log.Printf("lock_recording (recording until the next press)")
-				a.playSound("start")
-				a.render()
-			case core.ActFinish:
-				a.holding.Store(false)
-				a.end(ev.at, held)
-			case core.ActNone:
-				if ev.vk == a.hold.HotkeyVK {
-					a.holding.Store(false)
-				}
 			}
 		}
 	}
@@ -879,10 +902,10 @@ func (a *App) stopForSettingChange(at time.Time) {
 	}
 	if a.hold.Latched() {
 		a.log.Printf("setting_changed_while_latched -> finish")
-		a.end(at, at.Sub(a.cur.pressedAt))
+		a.end(at, at.Sub(a.cur.pressedAt), "setting_changed")
 		return
 	}
-	a.cancel(at)
+	a.discard("setting_changed", at.Sub(a.cur.pressedAt))
 }
 
 func (a *App) begin(ev keyEvent) {
@@ -919,35 +942,48 @@ func (a *App) begin(ev keyEvent) {
 }
 
 func (a *App) cancel(at time.Time) {
-	u := a.cur
-	a.cur = nil
-	if u == nil {
+	if a.cur == nil {
 		return
 	}
-	a.rec.Discard()
-	a.recording.Store(false)
-	a.locked.Store(false)
-	held := at.Sub(u.pressedAt)
-	a.log.Printf("cancelled held=%.2fs", held.Seconds())
+	held := at.Sub(a.cur.pressedAt)
+	a.discard("cancelled", held)
 	if held >= time.Second {
 		a.fail("他のキーに触れたので録音を取り消しました")
 	}
-	a.render()
 }
 
+// Every end owns the captured PCM until it has been durably saved.
 func (a *App) discard(reason string, held time.Duration) {
 	u := a.cur
 	a.cur = nil
 	if u == nil {
 		return
 	}
-	a.rec.Discard()
+	u.held = held
+	u.pcm = a.rec.StopNow()
 	a.recording.Store(false)
-	a.log.Printf("%s held=%.2fs (ignored)", reason, held.Seconds())
+	a.locked.Store(false)
+	a.recordEnd(u, reason)
+	if core.MustKeepRecording(core.Seconds(u.pcm), held.Seconds(), a.cfg.SaveHistory) {
+		u.record["outcome"] = "cancelled"
+		a.save(u, core.EncodeWAV(u.pcm), nil)
+	}
 	a.render()
 }
 
-func (a *App) end(at time.Time, held time.Duration) {
+func (a *App) recordEnd(u *utterance, reason string) {
+	seconds := core.Seconds(u.pcm)
+	u.record["end_reason"] = reason
+	u.record["audio_seconds"] = seconds
+	u.record["hold_seconds"] = u.held.Seconds()
+	u.record["app"] = u.app
+	a.log.Printf("recording_ended reason=%s audio_seconds=%.3f hold_seconds=%.3f", reason, seconds, u.held.Seconds())
+	if err := core.WriteRecordingEnd(filepath.Join(a.localDir, "events.jsonl"), reason, seconds, u.held.Seconds()); err != nil {
+		a.log.Printf("recording_event_failed")
+	}
+}
+
+func (a *App) end(at time.Time, held time.Duration, reason string) {
 	u := a.cur
 	a.cur = nil
 	if u == nil {
@@ -960,14 +996,21 @@ func (a *App) end(at time.Time, held time.Duration) {
 	a.tail.Add(1)
 	go func() {
 		defer a.recoverLog("stop")
+		defer a.tail.Done()
 		u.pcm = a.rec.Stop()
 		u.micKind = a.rec.FallbackKind()
 		a.recording.Store(false)
-		a.tail.Done()
+		a.recordEnd(u, reason)
+		u.record["outcome"] = "pending"
+		a.save(u, core.EncodeWAV(u.pcm), nil)
 		u.record["stop_ms"] = time.Since(u.releasedAt).Milliseconds()
 		a.playSound("stop")
 		a.render()
-		a.queue <- u
+		select {
+		case a.queue <- u:
+		case <-a.stopping:
+			a.processing.Add(-1)
+		}
 	}()
 }
 
@@ -1004,11 +1047,7 @@ func (a *App) process(u *utterance) {
 	rec["packs"] = a.cfg.EnabledPacks
 	a.log.Printf("record_stop audio=%.2fs voiced=%.2fs peak=%d hold=%.2fs", seconds, voiced, peak, u.held.Seconds())
 
-	wavPCM := trimmed
-	if len(wavPCM) == 0 {
-		wavPCM = captured
-	}
-	wav := core.EncodeWAV(wavPCM)
+	wav := core.EncodeWAV(captured)
 	tWAV := time.Now()
 
 	if seconds >= 0.5 && peak <= core.MutedPeak {
@@ -1071,7 +1110,7 @@ func (a *App) process(u *utterance) {
 	a.log.Printf("prepare_ms total=%.1f trim=%.1f wav=%.1f glossary=%.1f packs=%.1f usage=%.1f prompt=%.1f usage_age=%s",
 		ms(t0, tPrompt), ms(t0, tTrim), ms(tTrim, tWAV), ms(tPrep, tGlossary), ms(tGlossary, tPacks), ms(tPacks, tUsage), ms(tUsage, tPrompt), age)
 
-	text, ok := a.transcribe(u, wav, prompt, voiced, personal, packs)
+	text, ok := a.transcribe(u, wav, prompt, seconds, personal, packs)
 	if !ok {
 		a.save(u, wav, nil)
 		return
@@ -1357,9 +1396,37 @@ func (a *App) save(u *utterance, wav []byte, pasted *string) {
 	} else {
 		u.record["pasted"] = nil
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	id := core.NewHistoryID(u.pressedAt)
+	if u.archived {
+		wav = nil // outcome updates must never rewrite the sole saved WAV
+		u.record["audio"] = id + ".wav"
+	}
 	if err := core.SaveHistory(a.historyDir(), id, wav, u.record); err != nil {
-		a.log.Printf("history_save_failed %v", err)
+		a.log.Printf("history_save_failed")
+		if a.unsaved == nil {
+			a.unsaved = make(map[*utterance][]byte)
+		}
+		a.unsaved[u] = wav
+		return
+	}
+	u.archived = true
+	delete(a.unsaved, u)
+}
+
+// Failed archives retain their original audio in memory until shutdown retry.
+func (a *App) retryUnsaved() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for u, wav := range a.unsaved {
+		if wav == nil {
+			continue
+		} // an existing pending archive is already recoverable
+		record := map[string]any{"outcome": "pending", "audio_seconds": core.Seconds(u.pcm)}
+		if err := core.SaveHistory(a.historyDir(), core.NewHistoryID(u.pressedAt), wav, record); err != nil {
+			a.log.Printf("history_retry_failed")
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -53,7 +54,7 @@ func SaveHistory(dir, id string, wav []byte, record map[string]any) error {
 // parallel (no t.Parallel).
 var (
 	beforeDayWrite func(day string)
-	dayWriteFile   = os.WriteFile
+	dayWriteFile   = atomicDayWrite
 )
 
 // dayWriteRetryWait is the wait before the second try.
@@ -136,4 +137,32 @@ func RecentPasted(dir string, n int) []Pasted {
 		out = out[len(out)-n:]
 	}
 	return out
+}
+
+// Write through a sibling temporary file so a failed update leaves the old record intact.
+func atomicDayWrite(path string, data []byte, perm os.FileMode) (err error) {
+	f, err := os.CreateTemp(filepath.Dir(path), ".history-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	defer func() {
+		if removeErr := os.Remove(name); removeErr != nil && !os.IsNotExist(removeErr) {
+			err = errors.Join(err, removeErr)
+		}
+	}()
+	if err = f.Chmod(perm); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(name, path)
 }

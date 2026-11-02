@@ -2621,50 +2621,37 @@ enum Updater {
         }.resume()
     }
 
-    // dmg を落として中の Koe.app を取り出し、Koe が終わってから今の場所に入れ替えて起動し直す
-    static func install(_ r: Release, progress: @escaping (String) -> Void, failed: @escaping (String) -> Void) {
+    // dmg を落として中の Koe.app を取り出し（UpdateInstall）、Koe が終わってから今の場所に入れ替えて起動し直す。
+    // confirm: 入れ替える直前に main で呼ぶ。false なら入れ替えずにやめて deferred を呼ぶ（自動更新で、直前に録音が始まったとき）
+    static func install(_ r: Release, progress: @escaping (String) -> Void, confirm: (() -> Bool)? = nil,
+                        deferred: @escaping () -> Void = {}, failed: @escaping (String, UpdateInstall.Failure?) -> Void) {
         progress("v\(r.version) をダウンロード中…")
         URLSession.shared.downloadTask(with: r.dmg) { tmp, _, error in
-            guard let tmp else { return DispatchQueue.main.async { failed("ダウンロードに失敗: \(error?.localizedDescription ?? "")") } }
-            let work = FileManager.default.temporaryDirectory.appendingPathComponent("koe-update-\(UUID().uuidString)")
-            try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
-            let dmg = work.appendingPathComponent("Koe.dmg")
-            try? FileManager.default.moveItem(at: tmp, to: dmg)
-            let mount = work.appendingPathComponent("mnt")
-            func run(_ args: [String]) -> Int32 {
-                let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/env"); p.arguments = args
-                p.standardOutput = Pipe(); p.standardError = Pipe()
-                do { try p.run() } catch { return -1 }
-                p.waitUntilExit(); return p.terminationStatus
+            guard let tmp else { return DispatchQueue.main.async { failed("ダウンロードに失敗: \(error?.localizedDescription ?? "")", nil) } }
+            let staged: UpdateInstall.Staged
+            switch UpdateInstall.stage(downloaded: tmp) {
+            case .success(let s): staged = s
+            case .failure(let f):
+                if case .verify(let bad) = f {
+                    Events.log("update_verify_failed", ["to": r.version, "reason": bad.reason, "status": Int(bad.status)])
+                }
+                return DispatchQueue.main.async { failed(f.message, f) }
             }
-            guard run(["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mount.path, dmg.path]) == 0 else {
-                return DispatchQueue.main.async { failed("dmg を開けませんでした") }
+            // 確かめてから入れ替えを始めて終わるまでを main の 1 回で行う（その間に録音は始まらない）
+            DispatchQueue.main.async {
+                if let confirm, !confirm() {
+                    UpdateInstall.discard(staged)
+                    return deferred()
+                }
+                do {
+                    try UpdateInstall.startReplace(staged, target: Bundle.main.bundleURL.path, pid: ProcessInfo.processInfo.processIdentifier)
+                } catch {
+                    UpdateInstall.discard(staged)
+                    return failed(UpdateInstall.Failure.launch.message, .launch)
+                }
+                Events.log("update_installing", ["from": current, "to": r.version])
+                NSApp.terminate(nil)
             }
-            let staged = work.appendingPathComponent("Koe.app")
-            let ok = run(["ditto", mount.appendingPathComponent("Koe.app").path, staged.path]) == 0
-            _ = run(["hdiutil", "detach", "-quiet", mount.path])
-            guard ok else { return DispatchQueue.main.async { failed("新しい版を取り出せませんでした") } }
-            // Replace the app only with a bundle signed by Koe's Developer ID (UpdateVerify.swift)
-            if let bad = UpdateVerify.check(appAt: staged) {
-                try? FileManager.default.removeItem(at: work)
-                Events.log("update_verify_failed", ["to": r.version, "reason": bad.reason, "status": Int(bad.status)])
-                return DispatchQueue.main.async { failed("新しい版の署名を確かめられなかったので、入れ替えませんでした（\(bad.message)）") }
-            }
-            let target = Bundle.main.bundleURL.path
-            let pid = ProcessInfo.processInfo.processIdentifier
-            // Values are passed as arguments ($1 pid, $2 target, $3 staged app, $4 work dir), not put into the script
-            let script = """
-            while kill -0 "$1" 2>/dev/null; do sleep 0.3; done
-            rm -rf "$2" && ditto "$3" "$2"
-            open "$2"
-            rm -rf "$4"
-            """
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/sh")
-            p.arguments = ["-c", script, "sh", String(pid), target, staged.path, work.path]
-            do { try p.run() } catch { return DispatchQueue.main.async { failed("入れ替えを始められませんでした") } }
-            Events.log("update_installing", ["from": current, "to": r.version])
-            DispatchQueue.main.async { NSApp.terminate(nil) }
         }.resume()
     }
 }
@@ -2724,6 +2711,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var updateSnoozedUntil: Date?         // 「あとで」から 24 時間（この起動中だけ）
     private var updateSummary: (version: String, summary: UpdatePrompt.Summary)?
     private var updatePromptTimer: Timer?
+    private var autoUpdateItem: NSMenuItem!
+    private var autoUpdating = false
+    private var autoUpdateRetryAt: Date?
+    private var autoUpdateLogged: String?
+    private var updateFoundAt: (version: String, at: Date)?
     private var updateAlert: NSAlert?
     private var packMenu: NSMenu!
     private var recentMenu: NSMenu!
@@ -2858,6 +2850,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         PasteLast.shared.register()
         buildMenu()
         render()
+        noticeAutoUpdated()
         setUpMenuReach()
         Glossary.refreshUsage()
         LearnedNotice.shared.start(statusItem: statusItem, busy: { [weak self] in
@@ -3932,6 +3925,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let checkItem = NSMenuItem(title: "更新を確認", action: #selector(checkUpdateNow), keyEquivalent: "")
         checkItem.target = self
         menu.addItem(checkItem)
+        autoUpdateItem = NSMenuItem(title: "新しい版を自動で入れる（使っていない時間に）", action: #selector(toggleAutoUpdate), keyEquivalent: "")
+        autoUpdateItem.target = self
+        menu.addItem(autoUpdateItem)
         let quit = NSMenuItem(title: "終了", action: #selector(quitFromMenuAction(_:)), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -4408,6 +4404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         improveNowItem?.title = improver.running ? "改善中…" : "今すぐ改善する" + (improver.lastRun.map { "（前回: \($0.prefix(40))）" } ?? "")
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         autoRestartItem?.state = FileManager.default.fileExists(atPath: AutoRestart.plistURL.path) ? .on : .off
+        autoUpdateItem?.state = Settings.defaults.bool(forKey: AutoUpdate.key) ? .on : .off
         for it in hotkeyMenu?.items ?? [] { it.state = it.tag == Int(Settings.hotkeyKeyCode) ? .on : .off }
         for it in pressModeMenu?.items ?? [] { it.state = it.tag == ([.auto: 2, .toggle: 1][Settings.pressMode] ?? 0) ? .on : .off }
         renderIndicatorMenu()
@@ -4453,6 +4450,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     self.updateItem.title = "新しい版 v\(r.version) があります（クリックで更新）"
                     self.updateItem.isHidden = false
                     Events.log("update_available", ["version": r.version])
+                    if self.updateFoundAt?.version != r.version { self.updateFoundAt = (r.version, Date()) }
                     self.prepareUpdatePrompt(r)
                 } else if manual {
                     self.showError("最新です（v\(Updater.current)）")
@@ -4477,6 +4475,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func maybePromptUpdate() {
         guard updateAlert == nil, let r = availableUpdate, let sum = updateSummary, sum.version == r.version else { return }
         let busy = current != nil || transcribing > 0 || cleaning > 0
+        if Settings.defaults.bool(forKey: AutoUpdate.key) {
+            let s = sum.summary
+            let d = AutoUpdate.decide(now: Date(), enabled: true, available: r.version,
+                                      summaryKnown: s.line != nil || s.noChanges || s.requiresRegrant,
+                                      requiresRegrant: s.requiresRegrant, noChanges: s.noChanges, busy: busy, lastUsed: lastUsedAt,
+                                      failedVersion: Settings.defaults.string(forKey: AutoUpdate.failedKey), retryAt: autoUpdateRetryAt)
+            switch d {
+            case .install: return performAutoUpdate(r)
+            case .manual(let why):
+                // 自動では入れない版。今までどおり落ち着いたときに聞く（下へ）
+                if autoUpdateLogged != r.version + why {
+                    autoUpdateLogged = r.version + why
+                    Events.log("auto_update_manual", ["to": r.version, "reason": why])
+                }
+            default: return
+            }
+        }
         guard UpdatePrompt.shouldPrompt(now: Date(), available: r.version, busy: busy, lastUsed: lastUsedAt,
                                         snoozedUntil: updateSnoozedUntil, noChanges: sum.summary.noChanges) else { return }
         // 同じ版は 24 時間（この起動中）もう聞かない。答えなくても同じ
@@ -4493,6 +4508,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                        now: #selector(updatePromptNow), later: #selector(updatePromptLater))
         updateAlert = a
         UpdatePrompt.present(a)
+    }
+
+    @objc private func toggleAutoUpdate() {
+        let on = !Settings.defaults.bool(forKey: AutoUpdate.key)
+        Settings.defaults.set(on, forKey: AutoUpdate.key)
+        Events.log("auto_update_setting", ["on": on])
+        render()
+    }
+
+    // 自動更新: 落とす → 署名を確かめる → 入れ替える直前にもう一度使っていないかを見る → 入れ替えて起動し直す
+    private func performAutoUpdate(_ r: Updater.Release) {
+        guard !autoUpdating else { return }
+        autoUpdating = true
+        let started = Date()
+        let foundAt = updateFoundAt?.version == r.version ? updateFoundAt?.at ?? started : started
+        Events.log("auto_update_start", ["to": r.version, "waited_s": Int(started.timeIntervalSince(foundAt))])
+        Updater.install(r, progress: { _ in }, confirm: { [weak self] in
+            guard let self else { return false }
+            let busy = self.current != nil || self.transcribing > 0 || self.cleaning > 0
+            guard AutoUpdate.canReplace(busy: busy, lastUsed: self.lastUsedAt, startedAt: started) else { return false }
+            Settings.defaults.set(r.version, forKey: AutoUpdate.installedKey)
+            Events.log("auto_update_replace", ["to": r.version, "waited_s": Int(Date().timeIntervalSince(foundAt))])
+            return true
+        }, deferred: { [weak self] in
+            self?.autoUpdating = false
+            Events.log("auto_update_deferred", ["to": r.version, "reason": "busy"])
+        }, failed: { [weak self] _, f in
+            guard let self else { return }
+            self.autoUpdating = false
+            Events.log("auto_update_failed", ["to": r.version, "reason": f?.reason ?? "download"])
+            if case .verify = f {
+                Settings.defaults.set(r.version, forKey: AutoUpdate.failedKey)
+                self.showError(AutoUpdate.verifyFailedNotice(r.version), sticky: true)
+            } else {
+                self.autoUpdateRetryAt = Date().addingTimeInterval(AutoUpdate.retryAfterFailure)
+            }
+        })
+    }
+
+    // 自動更新で起動し直したあとに 1 回だけ小さく知らせる
+    private func noticeAutoUpdated() {
+        guard let v = Settings.defaults.string(forKey: AutoUpdate.installedKey) else { return }
+        Settings.defaults.removeObject(forKey: AutoUpdate.installedKey)
+        guard let msg = AutoUpdate.notice(installed: v, current: Updater.current) else {
+            return Events.log("auto_update_done", ["to": v, "result": "version_mismatch"])
+        }
+        Events.log("auto_update_done", ["to": v, "result": "ok"])
+        showError(msg, sticky: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 600) { if self.errorMessage == msg { self.errorMessage = nil } }
     }
 
     @objc private func updatePromptNow() {
@@ -4528,7 +4592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard current == nil, transcribing == 0 else { return showError("話し終わってから、もう一度押してください") }
         updateItem.isEnabled = false
         Updater.install(r, progress: { msg in self.updateItem.title = msg },
-                        failed: { msg in self.updateItem.isEnabled = true; self.fail(msg); NSWorkspace.shared.open(r.page) })
+                        failed: { msg, _ in self.updateItem.isEnabled = true; self.fail(msg); NSWorkspace.shared.open(r.page) })
     }
 
     @objc private func chooseHotkey(_ sender: NSMenuItem) {

@@ -49,13 +49,33 @@ windows_cross() {
     "${NICE[@]}" go vet ./... && "${NICE[@]}" go build -o /dev/null .
 }
 
-# Tests that need numpy and the like skip themselves when it is missing
+# The Python tests run in a venv under ~/.cache/koe-ci with eval/ci_requirements.txt
+# (numpy and the like), made with $CI_PYTHON on first use and reused after; it is
+# reinstalled when the requirements change. The system and repo Python are not touched.
+# Without $CI_PYTHON it falls back to python3, and tests that need numpy skip themselves
 # (unittest prints "skipped=N" with the reasons under -v).
+CI_VENV=${CI_VENV:-$HOME/.cache/koe-ci/venv}
+CI_PYTHON=${CI_PYTHON:-/opt/homebrew/bin/python3.13}
+
+ci_venv() {
+  local req="$ROOT/eval/ci_requirements.txt" stamp="$CI_VENV/.koe-ci-requirements" want
+  want=$(shasum -a 256 "$req" | cut -d' ' -f1)
+  if [ ! -x "$CI_VENV/bin/python" ]; then
+    [ -x "$CI_PYTHON" ] || { echo "note: $CI_PYTHON not found; using python3 without the venv"; return 1; }
+    "$CI_PYTHON" -m venv "$CI_VENV" || return 1
+  fi
+  [ "$(cat "$stamp" 2>/dev/null)" = "$want" ] && return 0
+  "$CI_VENV/bin/python" -m pip install -q --disable-pip-version-check --require-hashes -r "$req" || return 1
+  echo "$want" >"$stamp"
+}
+
 python_tests() {
-  local d
+  local d py=python3
+  if ci_venv; then py="$CI_VENV/bin/python"; fi
+  echo "python: $py"
   for d in scripts scripts/release eval; do
     echo "-- $d"
-    "${NICE[@]}" python3 -m unittest discover -s "$d" -p 'test_*.py' || return 1
+    "${NICE[@]}" "$py" -m unittest discover -s "$d" -p 'test_*.py' || return 1
   done
 }
 
